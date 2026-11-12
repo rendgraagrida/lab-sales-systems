@@ -11,19 +11,27 @@ import uuid
 import database
 
 
+def postgres_bin():
+    config = shutil.which('pg_config')
+    if not config:
+        raise database.OperationError('The hosted runner PostgreSQL client configuration is required.')
+    config = database.checked_path(Path(config).resolve(strict=True))
+    directory = database.checked_path(Path(database.run([str(config), '--bindir'])))
+    database.executable(directory, 'psql')
+    return directory
+
+
 def main():
     if os.environ.get('GITHUB_ACTIONS') != 'true' or os.environ.get('RUNNER_ENVIRONMENT') != 'github-hosted':
         raise database.OperationError('This entrypoint is only for the isolated hosted quality runner, not a developer or production DB.')
-    psql = shutil.which('psql')
-    if not psql:
-        raise database.OperationError('The hosted runner PostgreSQL client is required; the app test gate cannot be skipped.')
+    pg_bin = postgres_bin()
     folder = database.checked_path(database.ROOT / '.runtime' / ('ci-' + uuid.uuid4().hex))
     folder.mkdir(parents=True)
     database.private(folder)
     (folder / 'private').mkdir()
     database.private(folder / 'private')
     suffix = uuid.uuid4().hex[:12]
-    state = {'folder': str(folder), 'port': 5432, 'pg_bin': str(Path(psql).parent),
+    state = {'folder': str(folder), 'port': 5432, 'pg_bin': str(pg_bin),
              'database': 'ls_' + suffix + '_test',
              'accounts': {'operator': {'user': 'postgres', 'password': ''},
                           'owner': {'user': 'ls_' + suffix + '_owner', 'password': ''},
