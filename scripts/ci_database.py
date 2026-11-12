@@ -4,26 +4,36 @@ import json
 import os
 from pathlib import Path
 import secrets
-import shutil
+import re
 import sys
 import uuid
 
 import database
 
 
+def postgres_bin():
+    root = database.checked_path(Path('/usr/lib/postgresql'))
+    versions = sorted((path for path in root.iterdir() if re.fullmatch(r'[1-9][0-9]*', path.name)),
+                      key=lambda path: int(path.name), reverse=True)
+    for version in versions:
+        directory = database.checked_path(version / 'bin')
+        if (directory / 'psql').is_file():
+            database.executable(directory, 'psql')
+            return directory
+    raise database.OperationError('The Ubuntu hosted runner requires a native PostgreSQL client.')
+
+
 def main():
     if os.environ.get('GITHUB_ACTIONS') != 'true' or os.environ.get('RUNNER_ENVIRONMENT') != 'github-hosted':
         raise database.OperationError('This entrypoint is only for the isolated hosted quality runner, not a developer or production DB.')
-    psql = shutil.which('psql')
-    if not psql:
-        raise database.OperationError('The hosted runner PostgreSQL client is required; the app test gate cannot be skipped.')
+    pg_bin = postgres_bin()
     folder = database.checked_path(database.ROOT / '.runtime' / ('ci-' + uuid.uuid4().hex))
     folder.mkdir(parents=True)
     database.private(folder)
     (folder / 'private').mkdir()
     database.private(folder / 'private')
     suffix = uuid.uuid4().hex[:12]
-    state = {'folder': str(folder), 'port': 5432, 'pg_bin': str(Path(psql).parent),
+    state = {'folder': str(folder), 'port': 5432, 'pg_bin': str(pg_bin),
              'database': 'ls_' + suffix + '_test',
              'accounts': {'operator': {'user': 'postgres', 'password': ''},
                           'owner': {'user': 'ls_' + suffix + '_owner', 'password': ''},
