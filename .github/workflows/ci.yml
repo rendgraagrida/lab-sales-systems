@@ -1,0 +1,247 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [local, main]
+  push:
+    branches: [local, main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'quality'
+        type: choice
+        options:
+          - quality
+          - staging
+          - production
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17.11-bookworm@sha256:665dc7b37ac52a17e298511414c21d23ffa4e6a6ef6225b3e5d59c7afb35e994
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 127.0.0.1:5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      release-artifact-id: ${{ steps.upload-release.outputs.artifact-id }}
+      manifest-sha: ${{ steps.manifest.outputs.manifest-sha }}
+    env:
+      REVISION: ${{ github.sha }}
+      RUN_ID: ${{ github.run_id }}
+    steps:
+      - name: Check out event revision
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.14.7'
+      - name: Set up Temurin
+        id: java
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: '21.0.13+9.0.LTS'
+      - name: Require exact JDK build
+        env:
+          JAVA_RELEASE: ${{ steps.java.outputs.version }}
+        run: '[[ "$JAVA_RELEASE" == "21.0.13+9.0.LTS" ]]'
+      - name: Check documentation
+        run: python scripts/ci.py check-docs
+      - name: Test CI tooling
+        run: python -m unittest discover -s tests -p 'test_*.py'
+      - name: Verify actual application with isolated PostgreSQL
+        run: python scripts/ci_database.py
+      - name: Package artifact
+        run: python scripts/ci.py package --jar target/lab-sales-systems-1.0.0.jar --output ".artifacts/$REVISION" --revision "$REVISION" --run-id "$RUN_ID"
+      - name: Verify artifact before upload
+        run: python scripts/ci.py verify --artifact-dir ".artifacts/$REVISION" --revision "$REVISION" --run-id "$RUN_ID"
+      - name: Upload verified artifact
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: lab-sales-systems-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .artifacts/${{ github.sha }}/
+          if-no-files-found: error
+          include-hidden-files: true
+      - name: Package release from verified application artifact
+        run: python scripts/release.py package --application-dir ".artifacts/$REVISION" --output ".releases/$REVISION" --revision "$REVISION" --run-id "$RUN_ID"
+      - name: Extract release manifest digest
+        id: manifest
+        run: |
+          MANIFEST_SHA=$(python -c 'import hashlib, sys; from pathlib import Path; p = Path(".releases") / sys.argv[1] / "release.json"; print(hashlib.sha256(p.read_bytes()).hexdigest())' "$REVISION")
+          echo "manifest-sha=$MANIFEST_SHA" >> "$GITHUB_OUTPUT"
+      - name: Verify release before upload
+        env:
+          MANIFEST_SHA: ${{ steps.manifest.outputs.manifest-sha }}
+        run: python scripts/release.py verify --release-dir ".releases/$REVISION" --revision "$REVISION" --run-id "$RUN_ID" --manifest-sha256 "$MANIFEST_SHA"
+      - name: Upload verified release
+        id: upload-release
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: lab-sales-systems-release-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .releases/${{ github.sha }}/
+          if-no-files-found: error
+          include-hidden-files: true
+
+  verify-artifact:
+    needs: quality
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      REVISION: ${{ github.sha }}
+      RUN_ID: ${{ github.run_id }}
+      ARTIFACT_ID: ${{ needs.quality.outputs.artifact-id }}
+      RELEASE_ARTIFACT_ID: ${{ needs.quality.outputs.release-artifact-id }}
+      MANIFEST_SHA: ${{ needs.quality.outputs.manifest-sha }}
+    steps:
+      - name: Check out event revision
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.14.7'
+      - name: Require uploaded artifact IDs
+        run: |
+          [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$RELEASE_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$MANIFEST_SHA" =~ ^[0-9a-f]{64}$ ]]
+      - name: Download application artifact from this run
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.quality.outputs.artifact-id }}
+          path: downloaded-artifact
+          merge-multiple: true
+      - name: Verify downloaded application artifact
+        run: python scripts/ci.py verify --artifact-dir downloaded-artifact --revision "$REVISION" --run-id "$RUN_ID"
+      - name: Download release artifact from this run
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.quality.outputs.release-artifact-id }}
+          path: downloaded-release
+          merge-multiple: true
+      - name: Verify downloaded release artifact
+        run: python scripts/release.py verify --release-dir downloaded-release --revision "$REVISION" --run-id "$RUN_ID" --manifest-sha256 "$MANIFEST_SHA"
+
+  deploy:
+    needs: [quality, verify-artifact]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    if: >-
+      vars.DEPLOYMENT_ENABLED == 'true' &&
+      (
+        (github.event_name == 'push' && github.ref == 'refs/heads/local') ||
+        (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'staging' && github.ref == 'refs/heads/local') ||
+        (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production' && github.ref == 'refs/heads/main')
+      )
+    environment: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production') && 'production' || 'staging' }}
+    concurrency:
+      group: deploy-${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production') && 'production' || 'staging' }}
+      cancel-in-progress: false
+    env:
+      REVISION: ${{ github.sha }}
+      RUN_ID: ${{ github.run_id }}
+      RELEASE_ARTIFACT_ID: ${{ needs.quality.outputs.release-artifact-id }}
+      MANIFEST_SHA: ${{ needs.quality.outputs.manifest-sha }}
+      TARGET_ENV: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production') && 'production' || 'staging' }}
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+      SSH_USER: ${{ secrets.SSH_USER }}
+      SSH_PORT: ${{ secrets.SSH_PORT }}
+      SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+      SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+      REMOTE_CONFIG: ${{ secrets.REMOTE_CONFIG }}
+    steps:
+      - name: Check out event revision
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.14.7'
+      - name: Download release artifact from this run
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.quality.outputs.release-artifact-id }}
+          path: downloaded-release
+          merge-multiple: true
+      - name: Verify downloaded release before transport
+        run: python scripts/release.py verify --release-dir downloaded-release --revision "$REVISION" --run-id "$RUN_ID" --manifest-sha256 "$MANIFEST_SHA"
+      - name: Execute transport deployment
+        run: |
+          set -euo pipefail
+          if [[ -z "${SSH_HOST:-}" || -z "${REMOTE_CONFIG:-}" || -z "${SSH_KEY:-}" || -z "${SSH_KNOWN_HOSTS:-}" ]]; then
+            echo "error: deployment secrets are incomplete; fail closed" >&2
+            exit 1
+          fi
+          SSH_TMP_DIR=$(mktemp -d -t crm-ssh-XXXXXXXXXX)
+          chmod 700 "$SSH_TMP_DIR"
+          cleanup_keys() {
+            rm -rf "$SSH_TMP_DIR"
+          }
+          trap cleanup_keys EXIT
+
+          KEY_FILE="$SSH_TMP_DIR/id_ed25519"
+          KNOWN_HOSTS_FILE="$SSH_TMP_DIR/known_hosts"
+
+          printf "%s\n" "$SSH_KEY" > "$KEY_FILE"
+          chmod 600 "$KEY_FILE"
+
+          printf "%s\n" "$SSH_KNOWN_HOSTS" > "$KNOWN_HOSTS_FILE"
+          chmod 600 "$KNOWN_HOSTS_FILE"
+
+          USER_ARG=()
+          if [[ -n "${SSH_USER:-}" ]]; then
+            USER_ARG=(--ssh-user "$SSH_USER")
+          fi
+          PORT_ARG=()
+          if [[ -n "${SSH_PORT:-}" ]]; then
+            PORT_ARG=(--ssh-port "$SSH_PORT")
+          fi
+
+          python scripts/deploy.py migrate \
+            --environment "$TARGET_ENV" \
+            --remote-config "$REMOTE_CONFIG" \
+            --ssh-host "$SSH_HOST" \
+            "${USER_ARG[@]}" \
+            "${PORT_ARG[@]}" \
+            --ssh-identity "$KEY_FILE" \
+            --ssh-known-hosts "$KNOWN_HOSTS_FILE" \
+            --release-dir downloaded-release \
+            --revision "$REVISION" \
+            --run-id "$RUN_ID" \
+            --manifest-sha256 "$MANIFEST_SHA"
+
+          python scripts/deploy.py deploy \
+            --environment "$TARGET_ENV" \
+            --remote-config "$REMOTE_CONFIG" \
+            --ssh-host "$SSH_HOST" \
+            "${USER_ARG[@]}" \
+            "${PORT_ARG[@]}" \
+            --ssh-identity "$KEY_FILE" \
+            --ssh-known-hosts "$KNOWN_HOSTS_FILE" \
+            --release-dir downloaded-release \
+            --revision "$REVISION" \
+            --run-id "$RUN_ID" \
+            --manifest-sha256 "$MANIFEST_SHA"

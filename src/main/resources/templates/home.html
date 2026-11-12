@@ -1,0 +1,8 @@
+<!doctype html>
+<html lang="en" xmlns:th="http://www.thymeleaf.org"><head th:replace="~{fragments :: head('Working context')}"></head><body>
+<header th:replace="~{fragments :: header('Working context')}"></header>
+<main id="main" tabindex="-1"><p>Selected workspace and entity are checked against your current membership on every request. A context selection never grants access.</p>
+<h2>Current workspace roles</h2><ul><li th:each="role : ${roles}" th:text="${role}"></li></ul>
+<p th:if="${roles.isEmpty()}">No business role is granted. Ask the workspace administrator for the specific role and entity access you need.</p>
+<p>Use the navigation for master records and configuration. Access administration does not bypass business roles.</p></main>
+<footer th:replace="~{fragments :: footer()}"></footer></body></html>

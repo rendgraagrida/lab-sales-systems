@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en" xmlns:th="http://www.thymeleaf.org">
+<head th:fragment="head(title)">
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title th:text="${title + ' | Lab Sales Systems'}">Lab Sales Systems</title>
+  <link rel="stylesheet" th:href="@{/styles.css}">
+</head>
+<body>
+<header th:fragment="header(title)">
+  <a href="#main" class="skip">Skip to main content</a>
+  <div class="brand"><a th:href="@{/workspaces}">rendgraagrida <span>Lab Systems</span></a><strong>SYNTHETIC / LOCAL_SIMULATION</strong></div>
+  <div class="session"><span th:text="${currentLogin}"></span><form th:if="${currentLogin != null and currentLogin != ''}" th:action="@{/logout}" method="post"><button type="submit">Log out</button></form></div>
+  <nav aria-label="Workspace navigation">
+    <a th:href="@{/workspaces}">Workspaces</a>
+    <a th:if="${workspaceBase != null}" th:href="${workspaceBase}">Choose entity</a>
+    <a th:if="${workspaceBase != null}" th:href="${workspaceBase + '/admin'}">Access administration</a>
+    <a th:if="${contextBase != null}" th:href="${contextBase}">Context</a>
+    <a th:if="${contextBase != null}" th:href="${contextBase + '/masters/customers'}">Customers</a>
+    <a th:if="${contextBase != null}" th:href="${contextBase + '/masters/contacts'}">Contacts</a>
+    <a th:if="${contextBase != null}" th:href="${contextBase + '/masters/suppliers'}">Suppliers</a>
+    <a th:if="${contextBase != null}" th:href="${contextBase + '/masters/products'}">Products</a>
+    <a th:if="${contextBase != null}" th:href="${contextBase + '/configuration'}">Configuration</a>
+    <a th:if="${contextBase != null}" th:href="${contextBase + '/finance'}">Finance setup</a>
+  </nav>
+  <p class="context" th:if="${workspaceId != null}">Workspace <b th:text="${workspaceId}"></b><span th:if="${entityId != null}"> / Entity <b th:text="${entityId}"></b></span></p>
+  <h1 th:text="${title}">Lab Sales Systems</h1>
+</header>
+<th:block th:fragment="formErrors(form)">
+  <input type="hidden" name="_form" th:value="${form.formId()}">
+  <section th:if="${form.hasErrors()}" class="form-errors" th:id="${form.summaryId()}" role="alert" tabindex="-1" autofocus aria-label="Form validation errors">
+    <h2>Review this form</h2>
+    <p th:text="${form.message()}"></p>
+    <ul th:unless="${#lists.isEmpty(form.issues())}"><li th:each="issue : ${form.issues()}"><a th:href="${'#' + issue.target}" th:text="${issue.field + ': ' + issue.message}"></a></li></ul>
+  </section>
+</th:block>
+<p th:fragment="fieldError(form,field,index)" th:if="${form.invalid(field,index)}" class="field-error" th:id="${form.errorId(field,index)}" th:text="${form.errorMessage(field,index)}"></p>
+<section th:fragment="formFallback(feedback)" th:if="${feedback.hasErrors() and !feedback.matched()}" class="form-errors" role="alert" tabindex="-1" autofocus aria-label="Form validation errors">
+  <h2>Review the submitted form</h2><p th:text="${feedback.message()}"></p>
+  <p>The submitted form or record reference is missing or no longer matches. Open the current form and review its values before submitting again. No action is replayed.</p>
+</section>
+<footer th:fragment="footer()">Fictional lab data. No real payments, shipments or external messaging. Business role and entity permission are enforced for every operation.</footer>
+</body></html>

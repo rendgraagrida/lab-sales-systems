@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en" xmlns:th="http://www.thymeleaf.org">
+<head th:replace="~{fragments :: head('Configuration')}"></head>
+<body>
+<header th:replace="~{fragments :: header('Configuration')}"></header>
+<main id="main">
+  <h1>Configuration</h1>
+  <p><a th:href="@{${'/w/' + workspaceId + '/e/' + entityId}}">Back to entity</a></p>
+  <nav aria-label="Configuration categories"><a th:each="option : ${kinds}" th:href="@{${base}(kind=${option.key})}" th:text="${option.title}"></a></nav>
+  <p><a th:href="@{${'/w/' + workspaceId + '/e/' + entityId + '/masters/price-books'}}">Price books</a></p>
+  <h2 th:text="${kind.title}"></h2>
+  <form method="get" th:action="@{${base}}">
+    <input type="hidden" name="kind" th:value="${kind.key}">
+    <label for="search">Search</label><input id="search" name="q" th:value="${q}" maxlength="200">
+    <button type="submit">Search</button>
+  </form>
+  <p><a th:href="@{${base + '/export'}(kind=${kind.key},q=${q})}">Export displayed results as CSV</a></p>
+  <table><thead><tr><th>Code</th><th>Name</th><th th:if="${kind.terms}">Days</th><th>Status</th><th>Actions</th></tr></thead>
+    <tbody><tr th:each="row : ${entries}"><td th:text="${row.code}"></td><td th:text="${row.name}"></td><td th:if="${kind.terms}" th:text="${row.days}"></td><td th:text="${row.active ? 'Active' : 'Inactive'}"></td>
+      <td><a th:href="@{${base}(kind=${kind.key},edit=${row.id})}">Edit</a>
+        <form th:if="${row.active}" method="post" th:action="@{${base + '/deactivate'}}" th:with="form=${feedback.form('config-deactivate-'+row.id,base+'/deactivate','id',row.id)}">
+          <section th:replace="~{fragments :: formErrors(${form})}"></section>
+          <input type="hidden" name="kind" th:value="${form.value('kind',kind.key)}"><input type="hidden" name="id" th:value="${form.value('id',row.id)}"><input type="hidden" name="version" th:value="${form.value('version',row.version)}"><button type="submit">Deactivate</button>
+        </form></td></tr></tbody>
+  </table>
+  <h2 th:text="${entry == null ? 'Create' : 'Edit'}"></h2>
+  <form method="post" th:action="@{${base + '/save'}}" th:with="form=${feedback.form(entry == null ? 'config-new' : 'config-edit-'+entry.id,base+'/save','id',entry == null ? '' : entry.id)}">
+    <section th:replace="~{fragments :: formErrors(${form})}"></section>
+    <input type="hidden" name="kind" th:value="${form.value('kind',kind.key)}">
+    <input th:if="${entry != null}" type="hidden" name="id" th:value="${form.value('id',entry.id)}">
+    <input th:if="${entry != null}" type="hidden" name="version" th:value="${form.value('version',entry.version)}">
+    <label th:for="${form.id('code')}">Code</label><input th:id="${form.id('code')}" name="code" maxlength="80" required th:value="${form.value('code',entry == null ? '' : entry.code)}" th:attr="aria-invalid=${form.invalid('code') ? 'true' : null},aria-describedby=${form.invalid('code') ? form.errorId('code') : null}"><p th:replace="~{fragments :: fieldError(${form}, 'code', 0)}"></p>
+    <label th:for="${form.id('name')}">Name</label><input th:id="${form.id('name')}" name="name" maxlength="200" required th:value="${form.value('name',entry == null ? '' : entry.name)}" th:attr="aria-invalid=${form.invalid('name') ? 'true' : null},aria-describedby=${form.invalid('name') ? form.errorId('name') : null}"><p th:replace="~{fragments :: fieldError(${form}, 'name', 0)}"></p>
+    <div th:if="${kind.terms}"><label th:for="${form.id('days')}">Days</label><input th:id="${form.id('days')}" name="days" type="number" min="0" max="3650" required th:value="${form.value('days',entry == null ? 0 : entry.days)}" th:attr="aria-invalid=${form.invalid('days') ? 'true' : null},aria-describedby=${form.invalid('days') ? form.errorId('days') : null}"><p th:replace="~{fragments :: fieldError(${form}, 'days', 0)}"></p></div>
+    <button type="submit">Save</button><a th:if="${entry != null}" th:href="@{${base}(kind=${kind.key})}">Cancel edit</a>
+  </form>
+  <section th:replace="~{fragments :: formFallback(${feedback})}"></section>
+</main>
+<footer th:replace="~{fragments :: footer()}"></footer>
+</body></html>

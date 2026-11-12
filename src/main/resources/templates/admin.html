@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en" xmlns:th="http://www.thymeleaf.org">
+<head th:replace="~{fragments :: head('Administration')}"></head>
+<body><header th:replace="~{fragments :: header('Administration')}"></header>
+<main id="main">
+<p>LOCAL_SIMULATION - synthetic data only. Administrator access does not grant business access.</p>
+<p><a th:href="@{/w/{w}(w=${workspaceId})}">Back to workspace</a></p>
+<section><h2>Workspace settings</h2>
+<form method="post" th:action="@{/w/{w}/admin/workspace-edit(w=${workspaceId})}" th:with="form=${feedback.form('workspace-settings','/w/'+workspaceId+'/admin/workspace-edit')}">
+  <section th:replace="~{fragments :: formErrors(${form})}"></section>
+  <input type="hidden" name="version" th:value="${form.value('version',workspace.version)}">
+  <label>Code <input name="code" th:id="${form.id('code')}" th:value="${form.value('code',workspace.code)}" maxlength="80" required th:attr="aria-invalid=${form.invalid('code') ? 'true' : null},aria-describedby=${form.invalid('code') ? form.errorId('code') : null}"></label><p th:replace="~{fragments :: fieldError(${form},'code',0)}"></p>
+  <label>Name <input name="name" th:id="${form.id('name')}" th:value="${form.value('name',workspace.name)}" maxlength="200" required th:attr="aria-invalid=${form.invalid('name') ? 'true' : null},aria-describedby=${form.invalid('name') ? form.errorId('name') : null}"></label><p th:replace="~{fragments :: fieldError(${form},'name',0)}"></p>
+  <label>Business date <input type="date" name="businessDate" th:id="${form.id('businessDate')}" th:value="${form.value('businessDate',workspace.business_date)}" required th:attr="aria-invalid=${form.invalid('businessDate') ? 'true' : null},aria-describedby=${form.invalid('businessDate') ? form.errorId('businessDate') : null}"></label><p th:replace="~{fragments :: fieldError(${form},'businessDate',0)}"></p>
+  <button>Save workspace</button>
+</form></section>
+<section><h2>Create user</h2>
+<form method="post" th:action="@{/w/{w}/admin/create-user(w=${workspaceId})}" th:with="form=${feedback.form('user-new','/w/'+workspaceId+'/admin/create-user')}">
+  <section th:replace="~{fragments :: formErrors(${form})}"></section>
+  <label>Login <input name="login" th:id="${form.id('login')}" th:value="${form.value('login','')}" maxlength="120" required th:attr="aria-invalid=${form.invalid('login') ? 'true' : null},aria-describedby=${form.invalid('login') ? form.errorId('login') : null}"></label><p th:replace="~{fragments :: fieldError(${form},'login',0)}"></p>
+  <label>Initial password <input name="password" th:id="${form.id('password')}" type="password" minlength="16" autocomplete="new-password" required th:attr="aria-invalid=${form.invalid('password') ? 'true' : null},aria-describedby=${form.invalid('password') ? form.errorId('password') : null}"></label><p th:replace="~{fragments :: fieldError(${form},'password',0)}"></p>
+  <button>Create user and workspace membership</button>
+</form>
+<h3>Add a user from a shared workspace</h3>
+<form method="post" th:action="@{/w/{w}/admin/invite(w=${workspaceId})}" th:with="form=${feedback.form('membership-new','/w/'+workspaceId+'/admin/invite')}">
+  <section th:replace="~{fragments :: formErrors(${form})}"></section>
+  <label>Login <input name="login" th:id="${form.id('login')}" th:value="${form.value('login','')}" maxlength="120" required th:attr="aria-invalid=${form.invalid('login') ? 'true' : null},aria-describedby=${form.invalid('login') ? form.errorId('login') : null}"></label><p th:replace="~{fragments :: fieldError(${form},'login',0)}"></p>
+  <button>Add membership</button>
+</form></section>
+<section><h2>Users and memberships</h2>
+<article th:each="u : ${users}">
+  <h3 th:text="${u.login}">User</h3><p>Account active: <span th:text="${u.active}"></span>; membership active: <span th:text="${u.membership_active}"></span></p>
+  <form method="post" th:action="@{/w/{w}/admin/user-active(w=${workspaceId})}" th:with="form=${feedback.form('user-state-'+u.id,'/w/'+workspaceId+'/admin/user-active','user',u.id)}">
+    <section th:replace="~{fragments :: formErrors(${form})}"></section>
+    <input type="hidden" name="user" th:value="${form.value('user',u.id)}"><input type="hidden" name="version" th:value="${form.value('version',u.version)}">
+    <label>Account state <select name="active" th:id="${form.id('active')}" required th:attr="aria-invalid=${form.invalid('active') ? 'true' : null},aria-describedby=${form.invalid('active') ? form.errorId('active') : null}"><option value="">Choose state</option><option value="true" th:selected="${form.selected('active',true,u.active)}">Active</option><option value="false" th:selected="${form.selected('active',false,u.active)}">Inactive</option></select></label><p th:replace="~{fragments :: fieldError(${form},'active',0)}"></p>
+    <button>Change account state</button>
+  </form>
+  <form method="post" th:action="@{/w/{w}/admin/password(w=${workspaceId})}" th:with="form=${feedback.form('user-password-'+u.id,'/w/'+workspaceId+'/admin/password','user',u.id)}">
+    <section th:replace="~{fragments :: formErrors(${form})}"></section>
+    <input type="hidden" name="user" th:value="${form.value('user',u.id)}"><input type="hidden" name="version" th:value="${form.value('version',u.version)}">
+    <label>New password <input name="password" th:id="${form.id('password')}" type="password" minlength="16" autocomplete="new-password" required th:attr="aria-invalid=${form.invalid('password') ? 'true' : null},aria-describedby=${form.invalid('password') ? form.errorId('password') : null}"></label><p th:replace="~{fragments :: fieldError(${form},'password',0)}"></p>
+    <button>Reset password</button>
+  </form>
+  <form method="post" th:action="@{/w/{w}/admin/membership(w=${workspaceId})}" th:with="form=${feedback.form('membership-state-'+u.id,'/w/'+workspaceId+'/admin/membership','user',u.id)}">
+    <section th:replace="~{fragments :: formErrors(${form})}"></section>
+    <input type="hidden" name="user" th:value="${form.value('user',u.id)}"><input type="hidden" name="version" th:value="${form.value('version',u.membership_version)}">
+    <label>Membership state <select name="active" th:id="${form.id('active')}" required th:attr="aria-invalid=${form.invalid('active') ? 'true' : null},aria-describedby=${form.invalid('active') ? form.errorId('active') : null}"><option value="">Choose state</option><option value="true" th:selected="${form.selected('active',true,u.membership_active)}">Active</option><option value="false" th:selected="${form.selected('active',false,u.membership_active)}">Inactive</option></select></label><p th:replace="~{fragments :: fieldError(${form},'active',0)}"></p>
+    <button>Change membership</button>
+  </form>
+</article></section>
+<section><h2>Workspace roles</h2>
+<form method="post" th:action="@{/w/{w}/admin/role(w=${workspaceId})}" th:with="form=${feedback.form('role-new','/w/'+workspaceId+'/admin/role','version',0)}">
+  <section th:replace="~{fragments :: formErrors(${form})}"></section>
+  <label>User <select name="user" th:id="${form.id('user')}" required th:attr="aria-invalid=${form.invalid('user') ? 'true' : null},aria-describedby=${form.invalid('user') ? form.errorId('user') : null}"><option value="">Choose user</option><option th:each="u : ${users}" th:value="${u.id}" th:selected="${form.selected('user',u.id,'')}" th:text="${u.login}"></option></select></label><p th:replace="~{fragments :: fieldError(${form},'user',0)}"></p>
+  <label>Role <select name="role" th:id="${form.id('role')}" required th:attr="aria-invalid=${form.invalid('role') ? 'true' : null},aria-describedby=${form.invalid('role') ? form.errorId('role') : null}"><option value="">Choose role</option><option th:each="r : ${ {'INSIDE_SALES','SALES_MANAGER','OPERATIONS','FINANCE','SYSTEM_ADMIN'} }" th:value="${r}" th:selected="${form.selected('role',r,'INSIDE_SALES')}" th:text="${r}"></option></select></label><p th:replace="~{fragments :: fieldError(${form},'role',0)}"></p>
+  <input type="hidden" name="version" th:value="${form.value('version',0)}"><input type="hidden" name="active" th:value="${form.value('active',true)}"><button>Grant new role</button>
+</form>
+<table><caption>Existing role grants</caption><thead><tr><th>User ID</th><th>Role</th><th>Active</th><th>Change</th></tr></thead><tbody>
+<tr th:each="r : ${roles}"><td th:text="${r.user_id}"></td><td th:text="${r.role_code}"></td><td th:text="${r.active}"></td><td>
+  <form method="post" th:action="@{/w/{w}/admin/role(w=${workspaceId})}" th:with="form=${feedback.form('role-state-'+r.user_id+'-'+r.role_code,'/w/'+workspaceId+'/admin/role','user',r.user_id,'role',r.role_code)}">
+    <section th:replace="~{fragments :: formErrors(${form})}"></section>
+    <input type="hidden" name="user" th:value="${form.value('user',r.user_id)}"><input type="hidden" name="role" th:value="${form.value('role',r.role_code)}"><input type="hidden" name="version" th:value="${form.value('version',r.version)}">
+    <label>State <select name="active" th:id="${form.id('active')}" required th:attr="aria-invalid=${form.invalid('active') ? 'true' : null},aria-describedby=${form.invalid('active') ? form.errorId('active') : null}"><option value="">Choose state</option><option value="true" th:selected="${form.selected('active',true,r.active)}">Active</option><option value="false" th:selected="${form.selected('active',false,r.active)}">Inactive</option></select></label><p th:replace="~{fragments :: fieldError(${form},'active',0)}"></p>
+    <button>Save role</button>
+  </form>
+</td></tr></tbody></table></section>
+<section><h2>Legal entities</h2>
+<form method="post" th:action="@{/w/{w}/admin/entity-create(w=${workspaceId})}" th:with="form=${feedback.form('entity-new','/w/'+workspaceId+'/admin/entity-create')}">
+  <section th:replace="~{fragments :: formErrors(${form})}"></section>
+  <label>Code <input name="code" th:id="${form.id('code')}" th:value="${form.value('code','')}" maxlength="80" required th:attr="aria-invalid=${form.invalid('code') ? 'true' : null},aria-describedby=${form.invalid('code') ? form.errorId('code') : null}"></label><p th:replace="~{fragments :: fieldError(${form},'code',0)}"></p>
+  <label>Name <input name="name" th:id="${form.id('name')}" th:value="${form.value('name','')}" maxlength="200" required th:attr="aria-invalid=${form.invalid('name') ? 'true' : null},aria-describedby=${form.invalid('name') ? form.errorId('name') : null}"></label><p th:replace="~{fragments :: fieldError(${form},'name',0)}"></p>
+  <label>Currency <select name="currency" th:id="${form.id('currency')}" required th:attr="aria-invalid=${form.invalid('currency') ? 'true' : null},aria-describedby=${form.invalid('currency') ? form.errorId('currency') : null}"><option value="">Choose currency</option><option value="EUR" th:selected="${form.selected('currency','EUR','EUR')}">EUR</option><option value="USD" th:selected="${form.selected('currency','USD','EUR')}">USD</option></select></label><p th:replace="~{fragments :: fieldError(${form},'currency',0)}"></p>
+  <input type="hidden" name="active" th:value="${form.value('active',true)}"><button>Create entity</button>
+</form>
+<article th:each="e : ${entities}"><h3 th:text="${e.code + ' - ' + e.name}"></h3><p>Active: <span th:text="${e.active}"></span></p>
+  <form method="post" th:action="@{/w/{w}/admin/entity-edit(w=${workspaceId})}" th:with="form=${feedback.form('entity-edit-'+e.id,'/w/'+workspaceId+'/admin/entity-edit','entity',e.id)}">
+    <section th:replace="~{fragments :: formErrors(${form})}"></section>
+    <input type="hidden" name="entity" th:value="${form.value('entity',e.id)}"><input type="hidden" name="version" th:value="${form.value('version',e.version)}"><input type="hidden" name="currency" th:value="${form.value('currency',e.base_currency)}">
+    <label>Code <input name="code" th:id="${form.id('code')}" th:value="${form.value('code',e.code)}" maxlength="80" required th:attr="aria-invalid=${form.invalid('code') ? 'true' : null},aria-describedby=${form.invalid('code') ? form.errorId('code') : null}"></label><p th:replace="~{fragments :: fieldError(${form},'code',0)}"></p>
+    <label>Name <input name="name" th:id="${form.id('name')}" th:value="${form.value('name',e.name)}" maxlength="200" required th:attr="aria-invalid=${form.invalid('name') ? 'true' : null},aria-describedby=${form.invalid('name') ? form.errorId('name') : null}"></label><p th:replace="~{fragments :: fieldError(${form},'name',0)}"></p>
+    <span th:text="${e.base_currency}"></span>
+    <label>State <select name="active" th:id="${form.id('active')}" required th:attr="aria-invalid=${form.invalid('active') ? 'true' : null},aria-describedby=${form.invalid('active') ? form.errorId('active') : null}"><option value="">Choose state</option><option value="true" th:selected="${form.selected('active',true,e.active)}">Active</option><option value="false" th:selected="${form.selected('active',false,e.active)}">Inactive</option></select></label><p th:replace="~{fragments :: fieldError(${form},'active',0)}"></p>
+    <button>Save entity</button>
+  </form>
+</article></section>
+<section><h2>Entity membership</h2>
+<form method="post" th:action="@{/w/{w}/admin/entity-grant(w=${workspaceId})}" th:with="form=${feedback.form('entity-grant-new','/w/'+workspaceId+'/admin/entity-grant','version',0)}">
+  <section th:replace="~{fragments :: formErrors(${form})}"></section>
+  <label>User <select name="user" th:id="${form.id('user')}" required th:attr="aria-invalid=${form.invalid('user') ? 'true' : null},aria-describedby=${form.invalid('user') ? form.errorId('user') : null}"><option value="">Choose user</option><option th:each="u : ${users}" th:value="${u.id}" th:selected="${form.selected('user',u.id,'')}" th:text="${u.login}"></option></select></label><p th:replace="~{fragments :: fieldError(${form},'user',0)}"></p>
+  <label>Entity <select name="entity" th:id="${form.id('entity')}" required th:attr="aria-invalid=${form.invalid('entity') ? 'true' : null},aria-describedby=${form.invalid('entity') ? form.errorId('entity') : null}"><option value="">Choose entity</option><option th:each="e : ${entities}" th:value="${e.id}" th:selected="${form.selected('entity',e.id,'')}" th:text="${e.code + ' - ' + e.name}"></option></select></label><p th:replace="~{fragments :: fieldError(${form},'entity',0)}"></p>
+  <input type="hidden" name="version" th:value="${form.value('version',0)}"><input type="hidden" name="active" th:value="${form.value('active',true)}"><button>Grant entity access</button>
+</form>
+<table><caption>Existing entity grants</caption><thead><tr><th>User ID</th><th>Entity ID</th><th>Active</th><th>Change</th></tr></thead><tbody>
+<tr th:each="g : ${grants}"><td th:text="${g.user_id}"></td><td th:text="${g.entity_id}"></td><td th:text="${g.active}"></td><td>
+  <form method="post" th:action="@{/w/{w}/admin/entity-grant(w=${workspaceId})}" th:with="form=${feedback.form('entity-grant-'+g.user_id+'-'+g.entity_id,'/w/'+workspaceId+'/admin/entity-grant','user',g.user_id,'entity',g.entity_id)}">
+    <section th:replace="~{fragments :: formErrors(${form})}"></section>
+    <input type="hidden" name="user" th:value="${form.value('user',g.user_id)}"><input type="hidden" name="entity" th:value="${form.value('entity',g.entity_id)}"><input type="hidden" name="version" th:value="${form.value('version',g.version)}">
+    <label>State <select name="active" th:id="${form.id('active')}" required th:attr="aria-invalid=${form.invalid('active') ? 'true' : null},aria-describedby=${form.invalid('active') ? form.errorId('active') : null}"><option value="">Choose state</option><option value="true" th:selected="${form.selected('active',true,g.active)}">Active</option><option value="false" th:selected="${form.selected('active',false,g.active)}">Inactive</option></select></label><p th:replace="~{fragments :: fieldError(${form},'active',0)}"></p>
+    <button>Save access</button>
+  </form>
+</td></tr></tbody></table></section>
+<section th:replace="~{fragments :: formFallback(${feedback})}"></section>
+</main><footer th:replace="~{fragments :: footer()}"></footer></body></html>

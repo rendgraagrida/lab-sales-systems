@@ -1,0 +1,13 @@
+.tools/
+.runtime/
+target/
+.env
+.env.*
+!.env.example
+*.log
+.idea/
+.vscode/
+.DS_Store
+.artifacts/
+__pycache__/
+*.py[cod]

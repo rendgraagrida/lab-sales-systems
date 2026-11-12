@@ -1,0 +1,8 @@
+<!doctype html>
+<html lang="en" xmlns:th="http://www.thymeleaf.org"><head th:replace="~{fragments :: head('Request could not be completed')}"></head><body>
+<header th:replace="~{fragments :: header('Request could not be completed')}"></header>
+<main id="main" tabindex="-1"><div role="alert" class="error"><h2 th:text="${status != null ? 'Status ' + status : 'Request error'}"></h2>
+<p th:text="${safeMessage != null ? safeMessage : 'The request was not applied. Review your access, inputs and the latest persisted state.'}"></p>
+<p th:if="${reference != null}">Reference: <code th:text="${reference}"></code></p></div>
+<p>No failed action is replayed automatically. <a th:href="@{/workspaces}">Return to your workspaces</a>.</p></main>
+<footer th:replace="~{fragments :: footer()}"></footer></body></html>

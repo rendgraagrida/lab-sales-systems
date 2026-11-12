@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en" xmlns:th="http://www.thymeleaf.org">
+<head th:replace="~{fragments :: head('Workspaces')}"></head>
+<body><header th:replace="~{fragments :: header('Workspaces')}"></header><main id="main">
+<h2>Your workspaces</h2><p>LOCAL_SIMULATION - synthetic data only</p>
+<ul><li th:each="w : ${workspaces}"><a th:href="@{/w/{id}(id=${w.id})}" th:text="${w.code + ' - ' + w.name}">Workspace</a> <span th:text="${w.state}"></span> <span th:text="${w.businessDate}"></span></li></ul>
+<h2>Create a workspace</h2><p>Choose a workspace where you are a system administrator. The new workspace grants you administrator access only.</p>
+<form method="post" th:action="@{/workspaces}" th:with="form=${feedback.form('workspace-new','/workspaces')}">
+  <section th:replace="~{fragments :: formErrors(${form})}"></section>
+  <label th:for="${form.id('source')}">Authorizing workspace</label><select name="source" th:id="${form.id('source')}" required th:attr="aria-invalid=${form.invalid('source') ? 'true' : null},aria-describedby=${form.invalid('source') ? form.errorId('source') : null}"><option value="">Choose workspace</option><option th:each="w : ${workspaces}" th:value="${w.id}" th:selected="${form.selected('source',w.id,'')}" th:text="${w.name}"></option></select><p th:replace="~{fragments :: fieldError(${form},'source',0)}"></p>
+  <label th:for="${form.id('code')}">Code</label><input name="code" th:id="${form.id('code')}" th:value="${form.value('code','')}" maxlength="80" required th:attr="aria-invalid=${form.invalid('code') ? 'true' : null},aria-describedby=${form.invalid('code') ? form.errorId('code') : null}"><p th:replace="~{fragments :: fieldError(${form},'code',0)}"></p>
+  <label th:for="${form.id('name')}">Name</label><input name="name" th:id="${form.id('name')}" th:value="${form.value('name','')}" maxlength="200" required th:attr="aria-invalid=${form.invalid('name') ? 'true' : null},aria-describedby=${form.invalid('name') ? form.errorId('name') : null}"><p th:replace="~{fragments :: fieldError(${form},'name',0)}"></p>
+  <label th:for="${form.id('businessDate')}">Business date</label><input name="businessDate" th:id="${form.id('businessDate')}" th:value="${form.value('businessDate','')}" type="date" required th:attr="aria-invalid=${form.invalid('businessDate') ? 'true' : null},aria-describedby=${form.invalid('businessDate') ? form.errorId('businessDate') : null}"><p th:replace="~{fragments :: fieldError(${form},'businessDate',0)}"></p>
+  <button>Create workspace</button>
+</form>
+<section th:replace="~{fragments :: formFallback(${feedback})}"></section>
+</main><footer th:replace="~{fragments :: footer()}"></footer></body></html>
