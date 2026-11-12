@@ -21,6 +21,9 @@
     <a th:if="${contextBase != null}" th:href="${contextBase + '/masters/products'}">Products</a>
     <a th:if="${contextBase != null}" th:href="${contextBase + '/configuration'}">Configuration</a>
     <a th:if="${contextBase != null}" th:href="${contextBase + '/finance'}">Finance setup</a>
+    <a th:if="${contextBase != null}" th:href="${contextBase + '/procurement'}">Procurement</a>
+    <a th:if="${contextBase != null}" th:href="${contextBase + '/inventory'}">Inventory</a>
+    <a th:if="${contextBase != null}" th:href="${contextBase + '/finance/ap'}">Supplier payables</a>
   </nav>
   <p class="context" th:if="${workspaceId != null}">Workspace <b th:text="${workspaceId}"></b><span th:if="${entityId != null}"> / Entity <b th:text="${entityId}"></b></span></p>
   <h1 th:text="${title}">Lab Sales Systems</h1>

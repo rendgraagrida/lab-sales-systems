@@ -26,19 +26,26 @@ REVISION = re.compile(r'(?:[0-9a-f]{40}|[0-9a-f]{64}|content:[0-9a-f]{64})\Z')
 PG_BIN = ROOT / '.tools' / 'postgres' / 'pgsql' / 'bin'
 JAVA_HOME = (Path(os.environ['JAVA_HOME']) if os.environ.get('GITHUB_ACTIONS') == 'true'
              else ROOT / '.tools' / 'jdk' / 'jdk-21.0.13+9')
+SCHEMA_VERSIONS = ('1', '2', '3', '4')
 READ_ONLY = ('roles', 'flyway_schema_history')
 INSERT_ONLY = ('setup_receipts', 'audit_events', 'journal_lines', 'stock_movements', 'scenario_baseline_versions',
-               'opening_balance_sources', 'inventory_balances', 'inventory_valuation_pools',
-               'instrument_serials', 'inventory_lots')
+               'opening_balance_sources', 'purchase_request_contributors', 'purchase_order_contributors',
+               'inventory_action_contributors', 'procurement_reversals')
 MUTABLE = ('app_users', 'scenario_workspaces', 'workspace_memberships', 'user_roles', 'legal_entities',
            'entity_memberships', 'customers', 'contacts', 'suppliers', 'uoms', 'products',
            'customer_contact_links', 'customer_entity_accounts', 'supplier_entity_accounts',
            'product_entity_settings', 'warehouses', 'payment_terms', 'price_books', 'price_book_lines',
            'chart_accounts', 'fiscal_periods', 'tax_codes', 'tax_versions', 'document_sequences',
-           'journal_entries', 'payment_posting_config')
+           'journal_entries', 'payment_posting_config', 'inventory_balances', 'inventory_valuation_pools',
+           'instrument_serials', 'inventory_lots', 'procurement_posting_config', 'inventory_lot_balances',
+           'purchase_requests', 'purchase_request_revisions', 'purchase_request_lines', 'purchase_orders',
+           'purchase_order_revisions', 'purchase_order_lines', 'procurement_receipts', 'procurement_receipt_lines',
+           'receipt_tracking', 'inventory_actions', 'inventory_action_tracking', 'vendor_invoices',
+           'vendor_invoice_lines', 'invoice_source_allocations', 'supplier_payments', 'supplier_payment_allocations')
 TRIGGER_FUNCTIONS = ('reject_audit_mutation', 'journal_entry_immutable', 'journal_line_immutable',
                      'journal_balance_guard', 'legal_entity_currency_guard',
-                     'protect_approved_price_book', 'protect_approved_price_lines')
+                     'protect_approved_price_book', 'protect_approved_price_lines',
+                     'm2_document_guard', 'm2_child_guard')
 
 
 class OperationError(Exception):
@@ -349,7 +356,7 @@ def grant_runtime(state, database):
             if sequence:
                 if not re.fullmatch(r'app\.[a-z_][a-z0-9_]*', sequence):
                     raise OperationError('Unexpected sequence identity; refusing grant.')
-                statements.append(f'GRANT USAGE ON SEQUENCE {sequence} TO {user};')
+                statements.append(f'GRANT USAGE,SELECT ON SEQUENCE {sequence} TO {user};')
     for function in TRIGGER_FUNCTIONS:
         statements.append(f'GRANT EXECUTE ON FUNCTION app.{identifier(function)}() TO {user};')
     sql(state, 'BEGIN;' + ''.join(statements) + 'COMMIT;', database)
@@ -362,12 +369,32 @@ def migrate(state, database):
                         "AND n.nspname NOT LIKE 'pg_toast%';", database)
     if foreign != '0':
         raise OperationError('Unknown/legacy schema lineage found; no automatic upgrade, repair or reset is permitted.')
+    history = sql(state, "SELECT to_regclass('app.flyway_schema_history') IS NOT NULL;", database)
+    versions = ''
+    if history == 't':
+        versions = sql(state, "SELECT COALESCE(string_agg(version,',' ORDER BY installed_rank),'') "
+                              "FROM app.flyway_schema_history WHERE success AND type='SQL';", database)
+        bad = sql(state, "SELECT count(*) FROM app.flyway_schema_history WHERE NOT success "
+                         "OR type NOT IN ('SQL','SCHEMA') OR (type='SQL' AND "
+                         "(version IS NULL OR version NOT IN ('1','2','3','4')));", database)
+        if versions not in ('1,2,3', '1,2,3,4') or bad != '0':
+            raise OperationError('Partial or unexpected Flyway history; refusing migration.')
+        if versions == '1,2,3':
+            maven(state, ['-Dflyway.target=3', 'flyway:validate'], database)
+        else:
+            maven(state, ['flyway:validate'], database)
+    else:
+        objects = sql(state, "SELECT (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='app') + "
+                             "(SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='app') + "
+                             "(SELECT count(*) FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace WHERE n.nspname='app' AND t.typrelid=0);", database)
+        if objects != '0':
+            raise OperationError('Fresh application schema is not empty; refusing migration.')
     secure_function_defaults(state, database)
     maven(state, ['flyway:migrate', 'flyway:validate'], database)
-    grant_runtime(state, database)
     version = sql(state, "SELECT string_agg(version,',' ORDER BY installed_rank) FROM app.flyway_schema_history WHERE success AND type='SQL';", database)
-    if version != '1,2,3':
+    if version != ','.join(SCHEMA_VERSIONS):
         raise OperationError('Unexpected migrated schema identity.')
+    grant_runtime(state, database)
 
 
 def application_env(state, revision):
@@ -422,7 +449,7 @@ def main(argv=None):
                     print('Stopped only the identity-verified project cluster; data retained.')
                 elif args.command == 'migrate':
                     migrate(state, state['database'])
-                    state['phase'] = 'M1_SCHEMA_MIGRATED'
+                    state['phase'] = 'M2_SCHEMA_MIGRATED'
                     save(state)
                 elif args.command == 'verify':
                     test_database = state['database'] + '_test_' + uuid.uuid4().hex[:8]

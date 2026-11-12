@@ -17,9 +17,18 @@ public final class FormFeedback {
             "accountVersion", "supplierVersion", "credit", "terms", "contact", "linkVersion", "productVersion",
             "settingVersion", "bookVersion", "product", "lineVersion", "amount", "kind", "days", "q", "status",
             "sourceKey", "revision", "date", "description", "accountId", "debit", "startsOn", "endsOn",
-            "accountType", "ratePct", "inclusive", "inputAccount", "outputAccount", "bankAccount", "baselineKey", "count");
+            "accountType", "ratePct", "inclusive", "inputAccount", "outputAccount", "bankAccount", "baselineKey", "count",
+            "quantityScale", "inventoryAccount", "apAccount", "grniAccount", "adjustmentGainAccount",
+            "adjustmentLossAccount", "serviceExpenseAccount", "purpose", "lineKey", "quantity", "productRef",
+            "reference", "invoiceDate", "receiptLineId", "unitCost", "discountPct", "discountAmount",
+            "subtotal", "discount", "net", "tax", "gross", "paymentKey", "supplierAccountId", "paymentDate",
+            "invoiceId", "allocationAmount", "reason", "reversalDate", "bankAccountVersion", "configVersion", "reversalKey",
+            "actionKey", "fromWarehouse", "toWarehouse", "value", "serial", "lot", "expiresOn", "trackingQuantity",
+            "supplierRef", "requestLineRef", "previousLineId", "taxRef", "serviceProfile", "orderRef", "orderLineRef",
+            "warehouseRef", "trackingLineKey", "intent");
     private static final Set<String> HIDDEN_FIELDS = Set.of("id", "version", "customerVersion", "accountVersion",
-            "supplierVersion", "linkVersion", "productVersion", "settingVersion", "bookVersion", "lineVersion");
+            "supplierVersion", "linkVersion", "productVersion", "settingVersion", "bookVersion", "lineVersion",
+            "bankAccountVersion", "configVersion", "previousLineId", "intent");
     private static final FormFeedback EMPTY = new FormFeedback(null, null, Map.of(), Map.of(), "");
     private final String action;
     private final String submittedForm;
@@ -48,7 +57,7 @@ public final class FormFeedback {
             if (submitted.length > 100) shortened = true;
             List<String> copy = new ArrayList<>(Math.min(submitted.length, 100));
             for (int i = 0; i < submitted.length && i < 100; i++) {
-                // Retain every valid M1 field intact; bound display of forged oversized payloads.
+                // Retain valid business fields intact; bound display of forged oversized payloads.
                 String value = submitted[i];
                 if (value.length() > 2000) shortened = true;
                 copy.add(value.length() <= 2000 ? value : value.substring(0, 2000));

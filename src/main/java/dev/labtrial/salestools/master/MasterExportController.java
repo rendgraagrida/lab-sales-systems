@@ -64,9 +64,11 @@ public class MasterExportController {
         ConfigurationService.Kind type=ConfigurationService.Kind.parse(kind);
         StringBuilder csv=new StringBuilder();
         if(type==ConfigurationService.Kind.TERMS) row(csv,"Code","Name","Days","Status");
+        else if(type==ConfigurationService.Kind.UOM) row(csv,"Code","Name","Quantity precision","Status");
         else row(csv,"Code","Name","Status");
         for(var r:configuration.list(workspaceId,entityId,type,q)) {
             if(type==ConfigurationService.Kind.TERMS) row(csv,r.code(),r.name(),r.days(),r.active()?"Active":"Inactive");
+            else if(type==ConfigurationService.Kind.UOM) row(csv,r.code(),r.name(),r.quantityScale(),r.active()?"Active":"Inactive");
             else row(csv,r.code(),r.name(),r.active()?"Active":"Inactive");
         }
         return download(type.getKey()+".csv",csv);

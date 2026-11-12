@@ -51,3 +51,337 @@ footer { border-top: 1px solid #b9c9cf; padding: 1rem 2rem; font-size: .85rem; c
 .skip { position: absolute; top: -6rem; background: #fff; padding: .5rem; z-index: 10; }
 .skip:focus { top: .25rem; }
 @media (max-width: 700px) { header, main, footer { padding-left: 1rem; padding-right: 1rem; } .session { justify-content: flex-start; margin-top: .75rem; } th, td { padding: .4rem; } }
+/* Navigation bar tab-like styling */
+nav[aria-label="Workspace navigation"] {
+  display: flex;
+  gap: .4rem;
+  flex-wrap: wrap;
+  margin: 1rem 0;
+  border-bottom: 2px solid #b9c9cf;
+  padding-bottom: .25rem;
+}
+nav[aria-label="Workspace navigation"] a {
+  padding: .35rem .75rem;
+  border-radius: .3rem .3rem 0 0;
+  text-decoration: none;
+  font-weight: 600;
+  color: #075d70;
+  background: #eef3f5;
+  border: 1px solid #b9c9cf;
+  border-bottom: none;
+  transition: background .15s, color .15s;
+}
+nav[aria-label="Workspace navigation"] a:hover {
+  background: #dfe9ed;
+  color: #003b4b;
+}
+
+/* Tabs container & buttons */
+.tab-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .35rem;
+  border-bottom: 2px solid #075d70;
+  margin: 1.25rem 0 1.5rem;
+  padding: 0;
+}
+.tab-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: .4rem;
+  padding: .65rem 1.15rem;
+  font-size: .95rem;
+  font-weight: 600;
+  color: #3b5059;
+  background: #e7eef1;
+  border: 1px solid #b9c9cf;
+  border-bottom: none;
+  border-radius: .35rem .35rem 0 0;
+  cursor: pointer;
+  margin: 0;
+  transition: background .12s, color .12s;
+}
+.tab-btn:hover {
+  background: #d8e5e9;
+  color: #18313c;
+}
+.tab-btn[aria-selected="true"], .tab-btn.active {
+  background: #075d70;
+  color: #fff;
+  border-color: #075d70;
+}
+.tab-btn[aria-selected="true"]:hover {
+  background: #003b4b;
+  color: #fff;
+}
+.tab-btn .badge-err {
+  display: inline-block;
+  background: #9b3527;
+  border-radius: 50%;
+  width: .6rem;
+  height: .6rem;
+}
+.tab-panel {
+  display: none;
+}
+.tab-panel.active, .tab-panel[aria-hidden="false"] {
+  display: block;
+}
+
+/* --- Universal Button & Functional Link System --- */
+.btn, a.btn, .btn-primary, a.btn-primary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: .4rem;
+  padding: .5rem 1rem;
+  border-radius: .25rem;
+  font-weight: 600;
+  font-size: .92rem;
+  text-decoration: none;
+  cursor: pointer;
+  transition: all .15s ease-in-out;
+  border: 1px solid #075d70;
+  background: #075d70;
+  color: #fff;
+}
+.btn:hover, a.btn:hover, .btn-primary:hover, a.btn-primary:hover {
+  background: #003b4b;
+  border-color: #003b4b;
+  color: #fff;
+}
+
+/* Secondary / Outline Button */
+.btn-secondary, a.btn-secondary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: .4rem;
+  padding: .45rem .9rem;
+  border-radius: .25rem;
+  font-weight: 600;
+  font-size: .9rem;
+  text-decoration: none;
+  cursor: pointer;
+  transition: all .15s ease-in-out;
+  border: 1px solid #637e89;
+  background: #fff;
+  color: #18313c;
+}
+.btn-secondary:hover, a.btn-secondary:hover {
+  background: #eef2f3;
+  color: #003b4b;
+  border-color: #075d70;
+}
+
+/* Back Button (styled as clean outline button with arrow icon) */
+.btn-back, a.btn-back,
+main > p:first-child > a:only-child,
+main > p:first-of-type > a:only-child,
+p > a[href*="/w/"]:only-child,
+p > a[href*="/e/"]:only-child,
+p > a[href$="/finance"]:only-child,
+p > a[href$="/inventory"]:only-child,
+p > a[href$="/orders"]:only-child,
+p > a[href*="/masters/"]:only-child {
+  display: inline-flex;
+  align-items: center;
+  gap: .4rem;
+  padding: .42rem .95rem;
+  background: #fff;
+  color: #075d70;
+  border: 1px solid #075d70;
+  border-radius: .25rem;
+  text-decoration: none;
+  font-weight: 600;
+  font-size: .88rem;
+  margin: .4rem 0;
+  transition: all .15s ease-in-out;
+}
+.btn-back::before, a.btn-back::before,
+main > p:first-child > a:only-child::before,
+main > p:first-of-type > a:only-child::before,
+p > a[href*="/w/"]:only-child::before,
+p > a[href*="/e/"]:only-child::before,
+p > a[href$="/finance"]:only-child::before,
+p > a[href$="/inventory"]:only-child::before,
+p > a[href$="/orders"]:only-child::before,
+p > a[href*="/masters/"]:only-child::before {
+  content: "←";
+  font-weight: bold;
+  font-size: 1rem;
+  line-height: 1;
+}
+.btn-back:hover, a.btn-back:hover,
+main > p:first-child > a:only-child:hover,
+main > p:first-of-type > a:only-child:hover,
+p > a[href*="/w/"]:only-child:hover,
+p > a[href*="/e/"]:only-child:hover,
+p > a[href$="/finance"]:only-child:hover,
+p > a[href$="/inventory"]:only-child:hover,
+p > a[href$="/orders"]:only-child:hover,
+p > a[href*="/masters/"]:only-child:hover {
+  background: #075d70;
+  color: #fff;
+}
+
+/* Action Creation Links (Create / New / Add) */
+a[href$="/new"], a[href*="/create"], .btn-create, a.btn-create {
+  display: inline-flex;
+  align-items: center;
+  gap: .35rem;
+  padding: .5rem 1rem;
+  background: #075d70;
+  color: #fff;
+  border: 1px solid #075d70;
+  border-radius: .25rem;
+  text-decoration: none;
+  font-weight: 600;
+  font-size: .9rem;
+  margin: .5rem 0;
+}
+a[href$="/new"]::before, a[href*="/create"]::before, .btn-create::before, a.btn-create::before {
+  content: "+";
+  font-size: 1.15rem;
+  font-weight: bold;
+  line-height: 1;
+}
+a[href$="/new"]:hover, a[href*="/create"]:hover, .btn-create:hover, a.btn-create:hover {
+  background: #003b4b;
+  border-color: #003b4b;
+  color: #fff;
+}
+
+/* Export Links (CSV / Data Download) */
+a[href*="/export"] {
+  display: inline-flex;
+  align-items: center;
+  gap: .4rem;
+  padding: .45rem .9rem;
+  background: #eff8f4;
+  color: #267356;
+  border: 1px solid #267356;
+  border-radius: .25rem;
+  text-decoration: none;
+  font-weight: 600;
+  font-size: .88rem;
+  margin: .35rem 0;
+}
+a[href*="/export"]::before {
+  content: "⭳";
+  font-size: 1rem;
+  font-weight: bold;
+}
+a[href*="/export"]:hover {
+  background: #267356;
+  color: #fff;
+}
+
+/* Edit Actions in Tables & Details */
+a[href*="/edit"], a[href*="edit="] {
+  display: inline-flex;
+  align-items: center;
+  gap: .25rem;
+  padding: .25rem .65rem;
+  background: #e7eef1;
+  color: #075d70;
+  border: 1px solid #b9c9cf;
+  border-radius: .2rem;
+  text-decoration: none;
+  font-weight: 600;
+  font-size: .84rem;
+}
+a[href*="/edit"]::before, a[href*="edit="]::before {
+  content: "✎";
+  font-size: .9rem;
+}
+a[href*="/edit"]:hover, a[href*="edit="]:hover {
+  background: #075d70;
+  color: #fff;
+  border-color: #075d70;
+}
+
+/* Sub-navigation & Categories styled as horizontal Tab Bar */
+nav[aria-label*="categories"],
+main > nav:not([aria-label="Workspace navigation"]) {
+  display: flex;
+  gap: .35rem;
+  flex-wrap: wrap;
+  border-bottom: 2px solid #075d70;
+  margin: 1.25rem 0;
+  padding: 0;
+}
+nav[aria-label*="categories"] a,
+main > nav:not([aria-label="Workspace navigation"]) a {
+  padding: .5rem 1rem;
+  background: #e7eef1;
+  color: #3b5059;
+  border: 1px solid #b9c9cf;
+  border-bottom: none;
+  border-radius: .3rem .3rem 0 0;
+  text-decoration: none;
+  font-weight: 600;
+  font-size: .9rem;
+}
+nav[aria-label*="categories"] a:hover,
+main > nav:not([aria-label="Workspace navigation"]) a:hover {
+  background: #d8e5e9;
+  color: #18313c;
+}
+
+/* Table Code/ID Columns as clickable badges */
+table td:first-child a {
+  display: inline-block;
+  font-weight: 600;
+  color: #075d70;
+  background: #eef3f5;
+  padding: .2rem .55rem;
+  border-radius: .25rem;
+  text-decoration: none;
+  border: 1px solid #b9c9cf;
+}
+table td:first-child a:hover {
+  background: #075d70;
+  color: #fff;
+  border-color: #075d70;
+}
+
+/* Workspace & Entity Lists as Interactive Tiles/Cards */
+main > ul {
+  list-style: none;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 1rem;
+  margin: 1.25rem 0;
+}
+main > ul > li {
+  background: #fff;
+  border: 1px solid #b9c9cf;
+  border-radius: .35rem;
+  padding: 1rem 1.25rem;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+  display: flex;
+  flex-direction: column;
+  gap: .5rem;
+  transition: transform .12s ease, box-shadow .12s ease, border-color .12s ease;
+}
+main > ul > li:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 10px rgba(0,0,0,0.08);
+  border-color: #075d70;
+}
+main > ul > li > a {
+  font-size: 1.05rem;
+  font-weight: 700;
+  color: #075d70;
+  text-decoration: none;
+}
+main > ul > li > a:hover {
+  color: #003b4b;
+  text-decoration: underline;
+}
+main > ul > li > span {
+  font-size: .85rem;
+  color: #627d88;
+}

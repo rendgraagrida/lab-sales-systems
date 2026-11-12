@@ -5,6 +5,14 @@
 <main id="main">
 <p>LOCAL_SIMULATION - synthetic data only. Administrator access does not grant business access.</p>
 <p><a th:href="@{/w/{w}(w=${workspaceId})}">Back to workspace</a></p>
+<nav class="tab-list" role="tablist" aria-label="Administration Sections">
+  <button type="button" class="tab-btn active" role="tab" id="tab-workspace" aria-selected="true" aria-controls="panel-workspace">⚙ Workspace</button>
+  <button type="button" class="tab-btn" role="tab" id="tab-users" aria-selected="false" aria-controls="panel-users">👤 Users &amp; Accounts</button>
+  <button type="button" class="tab-btn" role="tab" id="tab-roles" aria-selected="false" aria-controls="panel-roles">🛡 Workspace Roles</button>
+  <button type="button" class="tab-btn" role="tab" id="tab-entities" aria-selected="false" aria-controls="panel-entities">🏢 Legal Entities</button>
+  <button type="button" class="tab-btn" role="tab" id="tab-grants" aria-selected="false" aria-controls="panel-grants">🔑 Entity Access</button>
+</nav>
+<div id="panel-workspace" class="tab-panel active" role="tabpanel" aria-labelledby="tab-workspace">
 <section><h2>Workspace settings</h2>
 <form method="post" th:action="@{/w/{w}/admin/workspace-edit(w=${workspaceId})}" th:with="form=${feedback.form('workspace-settings','/w/'+workspaceId+'/admin/workspace-edit')}">
   <section th:replace="~{fragments :: formErrors(${form})}"></section>
@@ -14,6 +22,8 @@
   <label>Business date <input type="date" name="businessDate" th:id="${form.id('businessDate')}" th:value="${form.value('businessDate',workspace.business_date)}" required th:attr="aria-invalid=${form.invalid('businessDate') ? 'true' : null},aria-describedby=${form.invalid('businessDate') ? form.errorId('businessDate') : null}"></label><p th:replace="~{fragments :: fieldError(${form},'businessDate',0)}"></p>
   <button>Save workspace</button>
 </form></section>
+</div>
+<div id="panel-users" class="tab-panel" role="tabpanel" aria-labelledby="tab-users">
 <section><h2>Create user</h2>
 <form method="post" th:action="@{/w/{w}/admin/create-user(w=${workspaceId})}" th:with="form=${feedback.form('user-new','/w/'+workspaceId+'/admin/create-user')}">
   <section th:replace="~{fragments :: formErrors(${form})}"></section>
@@ -49,6 +59,8 @@
     <button>Change membership</button>
   </form>
 </article></section>
+</div>
+<div id="panel-roles" class="tab-panel" role="tabpanel" aria-labelledby="tab-roles">
 <section><h2>Workspace roles</h2>
 <form method="post" th:action="@{/w/{w}/admin/role(w=${workspaceId})}" th:with="form=${feedback.form('role-new','/w/'+workspaceId+'/admin/role','version',0)}">
   <section th:replace="~{fragments :: formErrors(${form})}"></section>
@@ -65,6 +77,8 @@
     <button>Save role</button>
   </form>
 </td></tr></tbody></table></section>
+</div>
+<div id="panel-entities" class="tab-panel" role="tabpanel" aria-labelledby="tab-entities">
 <section><h2>Legal entities</h2>
 <form method="post" th:action="@{/w/{w}/admin/entity-create(w=${workspaceId})}" th:with="form=${feedback.form('entity-new','/w/'+workspaceId+'/admin/entity-create')}">
   <section th:replace="~{fragments :: formErrors(${form})}"></section>
@@ -84,6 +98,8 @@
     <button>Save entity</button>
   </form>
 </article></section>
+</div>
+<div id="panel-grants" class="tab-panel" role="tabpanel" aria-labelledby="tab-grants">
 <section><h2>Entity membership</h2>
 <form method="post" th:action="@{/w/{w}/admin/entity-grant(w=${workspaceId})}" th:with="form=${feedback.form('entity-grant-new','/w/'+workspaceId+'/admin/entity-grant','version',0)}">
   <section th:replace="~{fragments :: formErrors(${form})}"></section>
@@ -100,5 +116,59 @@
     <button>Save access</button>
   </form>
 </td></tr></tbody></table></section>
+</div>
+<noscript>
+  <style>
+    .tab-panel { display: block !important; }
+    .tab-list { display: none !important; }
+  </style>
+</noscript>
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+  const tabs = document.querySelectorAll('[role="tab"]');
+  const panels = document.querySelectorAll('[role="tabpanel"]');
+  function switchTab(targetId) {
+    tabs.forEach(t => {
+      const isTarget = t.getAttribute('aria-controls') === targetId;
+      t.setAttribute('aria-selected', isTarget ? 'true' : 'false');
+      t.classList.toggle('active', isTarget);
+    });
+    panels.forEach(p => {
+      const isTarget = p.id === targetId;
+      p.setAttribute('aria-hidden', isTarget ? 'false' : 'true');
+      p.classList.toggle('active', isTarget);
+    });
+    if (history.replaceState) {
+      history.replaceState(null, '', '#' + targetId);
+    }
+  }
+  tabs.forEach(tab => {
+    tab.addEventListener('click', function(e) {
+      e.preventDefault();
+      switchTab(tab.getAttribute('aria-controls'));
+    });
+  });
+  let initialTab = null;
+  panels.forEach(panel => {
+    if (panel.querySelector('.form-errors, [aria-invalid="true"]')) {
+      if (!initialTab) initialTab = panel.id;
+      const matchingTab = document.querySelector('[aria-controls="' + panel.id + '"]');
+      if (matchingTab && !matchingTab.querySelector('.badge-err')) {
+        const badge = document.createElement('span');
+        badge.className = 'badge-err';
+        badge.title = 'Contains input errors';
+        matchingTab.appendChild(badge);
+      }
+    }
+  });
+  const hash = window.location.hash.replace('#', '');
+  if (hash && document.getElementById(hash)) {
+    initialTab = hash;
+  }
+  if (initialTab) {
+    switchTab(initialTab);
+  }
+});
+</script>
 <section th:replace="~{fragments :: formFallback(${feedback})}"></section>
 </main><footer th:replace="~{fragments :: footer()}"></footer></body></html>
