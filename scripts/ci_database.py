@@ -4,7 +4,7 @@ import json
 import os
 from pathlib import Path
 import secrets
-import shutil
+import re
 import sys
 import uuid
 
@@ -12,13 +12,15 @@ import database
 
 
 def postgres_bin():
-    config = shutil.which('pg_config')
-    if not config:
-        raise database.OperationError('The hosted runner PostgreSQL client configuration is required.')
-    config = database.checked_path(Path(config).resolve(strict=True))
-    directory = database.checked_path(Path(database.run([str(config), '--bindir'])))
-    database.executable(directory, 'psql')
-    return directory
+    root = database.checked_path(Path('/usr/lib/postgresql'))
+    versions = sorted((path for path in root.iterdir() if re.fullmatch(r'[1-9][0-9]*', path.name)),
+                      key=lambda path: int(path.name), reverse=True)
+    for version in versions:
+        directory = database.checked_path(version / 'bin')
+        if (directory / 'psql').is_file():
+            database.executable(directory, 'psql')
+            return directory
+    raise database.OperationError('The Ubuntu hosted runner requires a native PostgreSQL client.')
 
 
 def main():
