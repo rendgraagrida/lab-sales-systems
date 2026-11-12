@@ -46,7 +46,7 @@ public class ConfigurationController implements FormController {
     @PostMapping("/save")
     public String save(@PathVariable long workspaceId, @PathVariable long entityId,
                        @RequestParam Map<String,String> params) {
-        rejectUnknown(params, Set.of("_csrf","kind","id","version","code","name","days"));
+        rejectUnknown(params, Set.of("_csrf","kind","id","version","code","name","days","quantityScale"));
         ConfigurationService.Kind kind = ConfigurationService.Kind.parse(required(params, "kind"));
         Long id = number(params.get("id"));
         Long version = number(params.get("version"));
@@ -54,7 +54,11 @@ public class ConfigurationController implements FormController {
         try { days = number(params.get("days")); }
         catch (DomainException ex) { throw new DomainException(400, "Invalid days", "days"); }
         if (days != null && (days < Integer.MIN_VALUE || days > Integer.MAX_VALUE)) throw new DomainException(400, "Invalid days", "days");
-        service.save(workspaceId, entityId, kind, id, version, params.get("code"), params.get("name"), days == null ? null : days.intValue());
+        Long scale;
+        try { scale = number(params.get("quantityScale")); }
+        catch (DomainException ex) { throw new DomainException(400, "Invalid quantity precision", "quantityScale"); }
+        if (scale != null && (scale < 0 || scale > 6)) throw new DomainException(400, "Invalid quantity precision", "quantityScale");
+        service.save(workspaceId, entityId, kind, id, version, params.get("code"), params.get("name"), days == null ? null : days.intValue(), scale == null ? null : scale.intValue());
         return "redirect:" + base(workspaceId, entityId) + "?kind=" + kind.getKey();
     }
     @PostMapping("/deactivate")

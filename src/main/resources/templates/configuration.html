@@ -15,8 +15,8 @@
     <button type="submit">Search</button>
   </form>
   <p><a th:href="@{${base + '/export'}(kind=${kind.key},q=${q})}">Export displayed results as CSV</a></p>
-  <table><thead><tr><th>Code</th><th>Name</th><th th:if="${kind.terms}">Days</th><th>Status</th><th>Actions</th></tr></thead>
-    <tbody><tr th:each="row : ${entries}"><td th:text="${row.code}"></td><td th:text="${row.name}"></td><td th:if="${kind.terms}" th:text="${row.days}"></td><td th:text="${row.active ? 'Active' : 'Inactive'}"></td>
+  <table><thead><tr><th>Code</th><th>Name</th><th th:if="${kind.terms}">Days</th><th th:if="${kind.uom}">Quantity precision</th><th>Status</th><th>Actions</th></tr></thead>
+    <tbody><tr th:each="row : ${entries}"><td th:text="${row.code}"></td><td th:text="${row.name}"></td><td th:if="${kind.terms}" th:text="${row.days}"></td><td th:if="${kind.uom}" th:text="${row.quantityScale}"></td><td th:text="${row.active ? 'Active' : 'Inactive'}"></td>
       <td><a th:href="@{${base}(kind=${kind.key},edit=${row.id})}">Edit</a>
         <form th:if="${row.active}" method="post" th:action="@{${base + '/deactivate'}}" th:with="form=${feedback.form('config-deactivate-'+row.id,base+'/deactivate','id',row.id)}">
           <section th:replace="~{fragments :: formErrors(${form})}"></section>
@@ -32,6 +32,7 @@
     <label th:for="${form.id('code')}">Code</label><input th:id="${form.id('code')}" name="code" maxlength="80" required th:value="${form.value('code',entry == null ? '' : entry.code)}" th:attr="aria-invalid=${form.invalid('code') ? 'true' : null},aria-describedby=${form.invalid('code') ? form.errorId('code') : null}"><p th:replace="~{fragments :: fieldError(${form}, 'code', 0)}"></p>
     <label th:for="${form.id('name')}">Name</label><input th:id="${form.id('name')}" name="name" maxlength="200" required th:value="${form.value('name',entry == null ? '' : entry.name)}" th:attr="aria-invalid=${form.invalid('name') ? 'true' : null},aria-describedby=${form.invalid('name') ? form.errorId('name') : null}"><p th:replace="~{fragments :: fieldError(${form}, 'name', 0)}"></p>
     <div th:if="${kind.terms}"><label th:for="${form.id('days')}">Days</label><input th:id="${form.id('days')}" name="days" type="number" min="0" max="3650" required th:value="${form.value('days',entry == null ? 0 : entry.days)}" th:attr="aria-invalid=${form.invalid('days') ? 'true' : null},aria-describedby=${form.invalid('days') ? form.errorId('days') : null}"><p th:replace="~{fragments :: fieldError(${form}, 'days', 0)}"></p></div>
+    <div th:if="${kind.uom}"><label th:for="${form.id('quantityScale')}">Quantity precision (0–6)</label><input th:id="${form.id('quantityScale')}" name="quantityScale" type="number" min="0" max="6" required th:value="${form.value('quantityScale',entry == null ? 0 : entry.quantityScale)}" th:attr="aria-invalid=${form.invalid('quantityScale') ? 'true' : null},aria-describedby=${form.invalid('quantityScale') ? form.errorId('quantityScale') : null}"><p th:replace="~{fragments :: fieldError(${form}, 'quantityScale', 0)}"></p></div>
     <button type="submit">Save</button><a th:if="${entry != null}" th:href="@{${base}(kind=${kind.key})}">Cancel edit</a>
   </form>
   <section th:replace="~{fragments :: formFallback(${feedback})}"></section>

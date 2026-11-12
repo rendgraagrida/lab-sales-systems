@@ -41,7 +41,7 @@ public class FinanceController implements FormController {
             return openingForm(w,e,Math.min(count,100),model);
         }
         if(path.endsWith("/initialize")) return initializeForm(w,e,model);
-        if(path.endsWith("/finance/accounts") || path.endsWith("/finance/taxes") || path.endsWith("/finance/payment-config")
+        if(path.endsWith("/finance/accounts") || path.endsWith("/finance/taxes") || path.endsWith("/finance/payment-config") || path.endsWith("/finance/procurement-config")
                 || path.matches(".*/finance/accounts/[0-9]+") || path.matches(".*/finance/periods/[0-9]+/(state|edit)")
                 || path.matches(".*/finance/taxes/[0-9]+/versions") || path.matches(".*/finance/tax-versions/[0-9]+/end"))
             return finance(w,e,model);
@@ -61,6 +61,7 @@ public class FinanceController implements FormController {
         else if(path.matches(".*/finance/taxes/[0-9]+/versions")) allowed=java.util.Set.of("version","validFrom","validTo","ratePct","inclusive","inputAccount","outputAccount");
         else if(path.matches(".*/finance/tax-versions/[0-9]+/end")) allowed=java.util.Set.of("version","validTo");
         else if(path.endsWith("/finance/payment-config")) allowed=java.util.Set.of("version","bankAccount");
+        else if(path.endsWith("/finance/procurement-config")) allowed=java.util.Set.of("version","inventoryAccount","apAccount","grniAccount","adjustmentGainAccount","adjustmentLossAccount","serviceExpenseAccount");
         else if(path.endsWith("/finance/openings/new")) allowed=java.util.Set.of("sourceKey","revision","date","currency","description","accountId","debit","credit");
         else if(path.endsWith("/initialize")) allowed=java.util.Set.of("baselineKey","version");
         else throw new DomainException(400,"Unexpected request");
@@ -77,6 +78,7 @@ public class FinanceController implements FormController {
         model.addAttribute("taxes",db.queryForList("select t.code,t.name,v.* from tax_codes t join tax_versions v on v.tax_code_id=t.id where t.workspace_id=? and t.entity_id=? order by t.code,v.valid_from",workspaceId,entityId));
         model.addAttribute("taxCodes",db.queryForList("select * from tax_codes where workspace_id=? and entity_id=? order by code",workspaceId,entityId));
         model.addAttribute("paymentConfig",db.queryForList("select * from payment_posting_config where workspace_id=? and entity_id=?",workspaceId,entityId));
+        model.addAttribute("procurementConfig",db.queryForList("select * from procurement_posting_config where workspace_id=? and entity_id=?",workspaceId,entityId));
         model.addAttribute("journals",db.queryForList("select id,number,posting_date,currency,description,state from journal_entries where workspace_id=? and entity_id=? order by id desc",workspaceId,entityId));
         return "finance";
     }
@@ -136,6 +138,10 @@ public class FinanceController implements FormController {
             var period=db.queryForList("select starts_on,ends_on from fiscal_periods where workspace_id=? and entity_id=? and id=? and version=? for update",workspaceId,entityId,id,version);
             if(period.size()!=1) throw new DomainException(409,"Period changed or not found");
             if(db.queryForObject("select count(*) from journal_entries where workspace_id=? and entity_id=? and posting_date between ? and ? and state='POSTED'",Integer.class,workspaceId,entityId,period.get(0).get("starts_on"),period.get(0).get("ends_on"))>0) throw new DomainException(409,"Period contains posted entries");
+            if(db.queryForObject("select count(*) from procurement_receipts where workspace_id=? and entity_id=? and posting_date between ? and ? and status='POSTED'",Integer.class,workspaceId,entityId,period.get(0).get("starts_on"),period.get(0).get("ends_on"))>0) throw new DomainException(409,"Period contains posted receipts");
+            if(db.queryForObject("select count(*) from vendor_invoices where workspace_id=? and entity_id=? and invoice_date between ? and ? and status='POSTED'",Integer.class,workspaceId,entityId,period.get(0).get("starts_on"),period.get(0).get("ends_on"))>0) throw new DomainException(409,"Period contains posted invoices");
+            if(db.queryForObject("select count(*) from procurement_reversals where workspace_id=? and entity_id=? and reversal_date between ? and ?",Integer.class,workspaceId,entityId,period.get(0).get("starts_on"),period.get(0).get("ends_on"))>0) throw new DomainException(409,"Period contains posted reversals");
+            if(db.queryForObject("select count(*) from stock_movements where workspace_id=? and entity_id=? and posting_date between ? and ?",Integer.class,workspaceId,entityId,period.get(0).get("starts_on"),period.get(0).get("ends_on"))>0) throw new DomainException(409,"Period contains posted stock movements");
             db.update("update fiscal_periods set starts_on=?,ends_on=?,version=version+1 where workspace_id=? and entity_id=? and id=?",startsOn,endsOn,workspaceId,entityId,id);
         } catch(DataIntegrityViolationException ex) { throw new DomainException(409,"Period overlaps another period"); }
         audit.record(scope.actor(),workspaceId,entityId,"UPDATE","PERIOD",Long.toString(id),version+1,"SUCCESS","dates");
@@ -169,13 +175,69 @@ public class FinanceController implements FormController {
     @PostMapping("/finance/payment-config") @Transactional
     public String paymentConfig(@PathVariable long workspaceId,@PathVariable long entityId,@RequestParam long version,@RequestParam long bankAccount) {
         var scope=access.requireContext(workspaceId,entityId,true,"FINANCE");
-        Integer valid=db.queryForObject("select count(*) from chart_accounts where workspace_id=? and entity_id=? and id=? and active and account_type='ASSET'",Integer.class,workspaceId,entityId,bankAccount);
-        if(valid==null || valid!=1) throw new DomainException(400,"Select an active asset account","bankAccount");
+        Integer valid=db.queryForObject("""
+            select count(*) from chart_accounts a
+            where a.workspace_id=? and a.entity_id=? and a.id=? and a.active and a.account_type='ASSET'
+              and not exists(select 1 from procurement_posting_config p where p.workspace_id=a.workspace_id and p.entity_id=a.entity_id and p.inventory_account_id=a.id)
+            """,Integer.class,workspaceId,entityId,bankAccount);
+        if(valid==null || valid!=1) throw new DomainException(400,"Select an active non-inventory asset account","bankAccount");
         int updated;
         if(version==0) updated=db.update("insert into payment_posting_config(workspace_id,entity_id,bank_account_id,updated_by) values (?,?,?,?) on conflict do nothing",workspaceId,entityId,bankAccount,scope.actor().id());
         else updated=db.update("update payment_posting_config set bank_account_id=?,updated_by=?,version=version+1 where workspace_id=? and entity_id=? and version=?",bankAccount,scope.actor().id(),workspaceId,entityId,version);
         if(updated!=1) throw new DomainException(409,"Payment configuration changed");
         audit.record(scope.actor(),workspaceId,entityId,"UPDATE","PAYMENT_CONFIG",Long.toString(entityId),version+1,"SUCCESS","bank account");
+        return "redirect:"+base(workspaceId,entityId)+"/finance";
+    }
+    @PostMapping("/finance/procurement-config") @Transactional
+    public String procurementConfig(@PathVariable long workspaceId,@PathVariable long entityId,@RequestParam long version,
+            @RequestParam String inventoryAccount,@RequestParam String apAccount,@RequestParam String grniAccount,
+            @RequestParam String adjustmentGainAccount,@RequestParam String adjustmentLossAccount,@RequestParam String serviceExpenseAccount) {
+        var scope=access.requireContext(workspaceId,entityId,true,"FINANCE");
+        String[] refs={inventoryAccount,apAccount,grniAccount,adjustmentGainAccount,adjustmentLossAccount,serviceExpenseAccount};
+        long[] ids=new long[refs.length];
+        String[] types={"ASSET","LIABILITY","LIABILITY","INCOME","EXPENSE","EXPENSE"};
+        String[] fields={"inventoryAccount","apAccount","grniAccount","adjustmentGainAccount","adjustmentLossAccount","serviceExpenseAccount"};
+        for(int i=0;i<ids.length;i++) {
+            String[] parts=refs[i].split(":",-1);
+            long accountVersion;
+            try {
+                if(parts.length!=2) throw new NumberFormatException();
+                ids[i]=Long.parseLong(parts[0]); accountVersion=Long.parseLong(parts[1]);
+            } catch(NumberFormatException ex) { throw new DomainException(400,"Select an account",fields[i]); }
+            Integer count=db.queryForObject("select count(*) from chart_accounts where workspace_id=? and entity_id=? and id=? and version=? and active and account_type=?",Integer.class,workspaceId,entityId,ids[i],accountVersion,types[i]);
+            if(count==null || count!=1) throw new DomainException(400,"Account changed or is unavailable",fields[i]);
+        }
+        if(ids[0]==ids[1] || ids[0]==ids[2] || ids[1]==ids[2])
+            throw new DomainException(400,"Control accounts must be distinct","inventoryAccount","apAccount","grniAccount");
+        Integer bankConflict=db.queryForObject("select count(*) from payment_posting_config where workspace_id=? and entity_id=? and bank_account_id=?",Integer.class,workspaceId,entityId,ids[0]);
+        if(bankConflict!=null && bankConflict>0)
+            throw new DomainException(400,"Inventory and Bank accounts must differ","inventoryAccount");
+        var current=db.queryForList("select * from procurement_posting_config where workspace_id=? and entity_id=? for update",workspaceId,entityId);
+        if((version==0 && !current.isEmpty()) || (version!=0 && (current.isEmpty() || ((Number)current.get(0).get("version")).longValue()!=version))) throw new DomainException(409,"Procurement configuration changed");
+        if(!current.isEmpty()) {
+            String[] columns={"inventory_account_id","ap_account_id","grni_account_id"};
+            for(int i=0;i<3;i++) {
+                long previous=((Number)current.get(0).get(columns[i])).longValue();
+                if(previous!=ids[i]) {
+                    Integer sourced=db.queryForObject("select (select count(*) from purchase_order_revisions where workspace_id=? and entity_id=? and status='APPROVED')+(select count(*) from vendor_invoices where workspace_id=? and entity_id=? and status='POSTED')",Integer.class,workspaceId,entityId,workspaceId,entityId);
+                    if(sourced!=null && sourced>0) throw new DomainException(409,"Control mapping is referenced by approved or posted sources");
+                    BigDecimal balance=db.queryForObject("select coalesce(sum(l.debit-l.credit),0) from journal_lines l join journal_entries j on j.workspace_id=l.workspace_id and j.entity_id=l.entity_id and j.id=l.journal_id where l.workspace_id=? and l.entity_id=? and l.account_id=? and j.state='POSTED'",BigDecimal.class,workspaceId,entityId,previous);
+                    if(balance.signum()!=0) throw new DomainException(409,"Previous control account has a nonzero balance; existing entries were not changed");
+                }
+            }
+        }
+        BigDecimal inventory=db.queryForObject("select coalesce(sum(value),0) from inventory_valuation_pools where workspace_id=? and entity_id=?",BigDecimal.class,workspaceId,entityId);
+        BigDecimal ap=db.queryForObject("select coalesce((select sum(l.gross) from vendor_invoice_lines l join vendor_invoices i on i.workspace_id=l.workspace_id and i.entity_id=l.entity_id and i.id=l.invoice_id where l.active and i.workspace_id=? and i.entity_id=? and i.status='POSTED' and not exists(select 1 from procurement_reversals r where r.workspace_id=i.workspace_id and r.entity_id=i.entity_id and r.invoice_id=i.id)),0)-coalesce((select sum(a.amount) from supplier_payment_allocations a join supplier_payments p on p.workspace_id=a.workspace_id and p.entity_id=a.entity_id and p.id=a.payment_id where a.active and p.workspace_id=? and p.entity_id=? and p.status='POSTED' and not exists(select 1 from procurement_reversals r where r.workspace_id=p.workspace_id and r.entity_id=p.entity_id and r.payment_id=p.id)),0)",BigDecimal.class,workspaceId,entityId,workspaceId,entityId);
+        BigDecimal grni=db.queryForObject("select coalesce((select sum(l.net) from procurement_receipt_lines l join procurement_receipts r on r.workspace_id=l.workspace_id and r.entity_id=l.entity_id and r.id=l.receipt_id where l.active and r.workspace_id=? and r.entity_id=? and r.status='POSTED'),0)-coalesce((select sum(l.net) from vendor_invoice_lines l join vendor_invoices i on i.workspace_id=l.workspace_id and i.entity_id=l.entity_id and i.id=l.invoice_id where l.active and i.workspace_id=? and i.entity_id=? and i.status='POSTED' and not exists(select 1 from procurement_reversals r where r.workspace_id=i.workspace_id and r.entity_id=i.entity_id and r.invoice_id=i.id)),0)",BigDecimal.class,workspaceId,entityId,workspaceId,entityId);
+        BigDecimal[] expected={inventory,ap.negate(),grni.negate()};
+        for(int i=0;i<3;i++) {
+            BigDecimal actual=db.queryForObject("select coalesce(sum(l.debit-l.credit),0) from journal_lines l join journal_entries j on j.workspace_id=l.workspace_id and j.entity_id=l.entity_id and j.id=l.journal_id where l.workspace_id=? and l.entity_id=? and l.account_id=? and j.state='POSTED'",BigDecimal.class,workspaceId,entityId,ids[i]);
+            if(actual.compareTo(expected[i])!=0) throw new DomainException(409,"Control account does not reconcile with its source; existing entries were not changed");
+        }
+        int changed=version==0 ? db.update("insert into procurement_posting_config(workspace_id,entity_id,inventory_account_id,ap_account_id,grni_account_id,adjustment_gain_account_id,adjustment_loss_account_id,service_expense_account_id,updated_by) values (?,?,?,?,?,?,?,?,?) on conflict do nothing",workspaceId,entityId,ids[0],ids[1],ids[2],ids[3],ids[4],ids[5],scope.actor().id())
+                : db.update("update procurement_posting_config set inventory_account_id=?,ap_account_id=?,grni_account_id=?,adjustment_gain_account_id=?,adjustment_loss_account_id=?,service_expense_account_id=?,updated_by=?,version=version+1 where workspace_id=? and entity_id=? and version=?",ids[0],ids[1],ids[2],ids[3],ids[4],ids[5],scope.actor().id(),workspaceId,entityId,version);
+        if(changed!=1) throw new DomainException(409,"Procurement configuration changed");
+        audit.record(scope.actor(),workspaceId,entityId,"UPDATE","PROCUREMENT_CONFIG",Long.toString(entityId),version+1,"SUCCESS","procurement posting accounts");
         return "redirect:"+base(workspaceId,entityId)+"/finance";
     }
     @GetMapping("/finance/openings/new") public String openingForm(@PathVariable long workspaceId,@PathVariable long entityId,@RequestParam(defaultValue="2") int count,Model model) {

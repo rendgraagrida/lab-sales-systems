@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Create and verify a release bound to the executable JAR and candidate identity."""
 import argparse
+import io
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -9,6 +10,7 @@ import stat
 import sys
 import xml.etree.ElementTree as ET
 import zipfile
+import zlib
 
 import ci
 
@@ -19,7 +21,8 @@ class ReleaseError(Exception):
 
 POM = 'META-INF/maven/dev.labtrial/lab-sales-systems/pom.xml'
 SQL_PREFIX = 'BOOT-INF/classes/db/foundation/'
-SQL_NAMES = ('V1__identity.sql', 'V2__masters.sql', 'V3__finance.sql')
+LEGACY_SQL_NAMES = ('V1__identity.sql', 'V2__masters.sql', 'V3__finance.sql')
+SQL_NAMES = LEGACY_SQL_NAMES + ('V4__procurement_inventory_ap.sql',)
 NS = '{http://maven.apache.org/POM/4.0.0}'
 
 
@@ -44,8 +47,9 @@ def derived(jar):
                 if item.file_size > 4 * 1024 * 1024:
                     raise ReleaseError('migration entry too large')
                 selected[name] = archive.read(item)
-        expected = {POM} | {SQL_PREFIX + name for name in SQL_NAMES}
-        if set(selected) != expected:
+        names = tuple(name for name in SQL_NAMES if SQL_PREFIX + name in selected)
+        expected = {POM} | {SQL_PREFIX + name for name in names}
+        if set(selected) != expected or names not in (LEGACY_SQL_NAMES, SQL_NAMES):
             raise ReleaseError('unexpected embedded migration lineage or POM')
     data = selected[POM]
     if b'<!DOCTYPE' in data.upper() or b'<!ENTITY' in data.upper():
@@ -79,8 +83,25 @@ def derived(jar):
     ET.SubElement(new_build, NS + 'plugins').append(plugin)
     ET.register_namespace('', 'http://maven.apache.org/POM/4.0.0')
     result = {'migration/pom.xml': ET.tostring(minimal, encoding='utf-8', xml_declaration=True)}
-    result.update({'migration/sql/' + name: selected[SQL_PREFIX + name] for name in SQL_NAMES})
+    result.update({'migration/sql/' + name: selected[SQL_PREFIX + name] for name in names})
     return result
+
+
+def schema_identity(jar):
+    migrations = derived(jar)
+    rows = []
+    for index, name in enumerate(SQL_NAMES, 1):
+        data = migrations.get('migration/sql/' + name)
+        if data is None:
+            break
+        checksum = 0
+        with io.TextIOWrapper(io.BytesIO(data), encoding='utf-8-sig', newline=None) as lines:
+            for line in lines:
+                checksum = zlib.crc32(line.removesuffix('\n').encode('utf-8'), checksum)
+        if checksum >= 2 ** 31:
+            checksum -= 2 ** 32
+        rows.append(f'{index}|{name}|{checksum}')
+    return ','.join(rows)
 
 
 def inventory(directory):
@@ -106,6 +127,8 @@ def package_release(application_dir, output, revision, run_id):
         output = ci.checked_path(output)
         # Bound archive expansion before the existing generic JAR verifier reads it.
         migrations = derived(application_dir / 'application.jar')
+        if set(migrations) != {'migration/pom.xml'} | {'migration/sql/' + name for name in SQL_NAMES}:
+            raise ReleaseError('new releases must contain the current schema lineage')
         ci.verify(application_dir, revision, run_id)
         output.parent.mkdir(parents=True, exist_ok=True)
         ci.checked_path(output.parent)
@@ -126,7 +149,7 @@ def package_release(application_dir, output, revision, run_id):
         if derived(output / 'app/application.jar') != migrations:
             raise ReleaseError('application changed while packaging')
         manifest = {'schema': 1, 'project': 'lab-sales-systems', 'revision': revision,
-                    'run_id': run_id, 'schema_versions': ['1', '2', '3'], 'files': files}
+                    'run_id': run_id, 'schema_versions': [str(i) for i in range(1, len(SQL_NAMES) + 1)], 'files': files}
         with ci.checked_path(output / 'release.json').open('x', encoding='ascii', newline='\n') as target:
             json.dump(manifest, target, sort_keys=True, indent=2, ensure_ascii=True)
             target.write('\n')
@@ -151,9 +174,12 @@ def verify_release(directory, revision, run_id, manifest_sha256):
         if (not isinstance(manifest, dict) or set(manifest) != {'schema', 'project', 'revision', 'run_id', 'schema_versions', 'files'}
                 or type(manifest['schema']) is not int or manifest['schema'] != 1
                 or manifest['project'] != 'lab-sales-systems' or manifest['revision'] != revision
-                or manifest['run_id'] != run_id or manifest['schema_versions'] != ['1', '2', '3']):
+                or manifest['run_id'] != run_id or manifest['schema_versions'] not in
+                ([str(i) for i in range(1, len(LEGACY_SQL_NAMES) + 1)],
+                 [str(i) for i in range(1, len(SQL_NAMES) + 1)])):
             raise ReleaseError('invalid release manifest identity')
-        expected = {'app/application.jar', 'app/manifest.json', 'migration/pom.xml'} | {'migration/sql/' + name for name in SQL_NAMES}
+        names = LEGACY_SQL_NAMES if len(manifest['schema_versions']) == len(LEGACY_SQL_NAMES) else SQL_NAMES
+        expected = {'app/application.jar', 'app/manifest.json', 'migration/pom.xml'} | {'migration/sql/' + name for name in names}
         files = manifest['files']
         if not isinstance(files, dict) or set(files) != expected or inventory(directory) != expected | {'release.json'}:
             raise ReleaseError('invalid release inventory')

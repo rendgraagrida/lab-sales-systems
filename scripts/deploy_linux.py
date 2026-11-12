@@ -546,6 +546,8 @@ def action_migrate(cfg, release_dir, revision, run_id, manifest_sha):
 
     # Release validation
     rel_meta = release.verify_release(release_dir, revision, run_id, manifest_sha)
+    if rel_meta['schema_versions'] != list(database.SCHEMA_VERSIONS):
+        fail('Only the current exact schema lineage may be migrated')
 
     with target_lock(cfg):
         verify_db_cluster_and_ownership(cfg)
@@ -562,8 +564,8 @@ def action_migrate(cfg, release_dir, revision, run_id, manifest_sha):
         applied_versions = ''
         if history_exists == 't':
             applied_versions = run_psql(cfg, "SELECT COALESCE(string_agg(version, ',' ORDER BY installed_rank), '') FROM app.flyway_schema_history WHERE success AND type='SQL';", db_name=cfg['database'])
-            bad = run_psql(cfg, "SELECT count(*) FROM app.flyway_schema_history WHERE NOT success OR type NOT IN ('SQL','SCHEMA') OR (type='SQL' AND (version IS NULL OR version NOT IN ('1','2','3')));", db_name=cfg['database'])
-            if applied_versions != '1,2,3' or bad != '0':
+            bad = run_psql(cfg, "SELECT count(*) FROM app.flyway_schema_history WHERE NOT success OR type NOT IN ('SQL','SCHEMA') OR (type='SQL' AND (version IS NULL OR version NOT IN ('1','2','3','4')));", db_name=cfg['database'])
+            if applied_versions not in ('1,2,3', '1,2,3,4') or bad != '0':
                 fail('Partial or unexpected Flyway history')
         else:
             objects = run_psql(cfg, "SELECT (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='app') + (SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='app') + (SELECT count(*) FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace WHERE n.nspname='app' AND t.typrelid=0);", db_name=cfg['database'])
@@ -578,31 +580,20 @@ def action_migrate(cfg, release_dir, revision, run_id, manifest_sha):
         )
         if foreign_schemas != '0':
             fail("Foreign or unowned tables found in database; refusing migration")
-        if applied_versions != '1,2,3' and is_running:
-            fail('Service must be inactive for fresh migration')
+        if applied_versions != '1,2,3,4' and is_running:
+            fail('Service must be inactive for schema migration')
         dest = paths['releases'] / manifest_sha
         copy_release_immutable(Path(release_dir), dest)
         release.verify_release(str(dest), revision, run_id, manifest_sha)
         release_dir = str(dest)
 
-        if applied_versions == '1,2,3':
-            if is_running:
-                # Service is running and history is already applied; validate only
-                print(f"Service {paths['unit_name']} is running and schema 1,2,3 is already applied. Validating Flyway...")
+        if applied_versions == '1,2,3,4':
             run_flyway(cfg, Path(release_dir) / 'migration' / 'pom.xml', ['flyway:validate'])
         else:
-            # The empty lineage and inactive service were checked before installation.
-
-            # Run flyway:migrate and flyway:validate
+            if applied_versions == '1,2,3':
+                run_flyway(cfg, Path(release_dir) / 'migration' / 'pom.xml', ['-Dflyway.target=3', 'flyway:validate'])
             run_flyway(cfg, Path(release_dir) / 'migration' / 'pom.xml', ['flyway:migrate', 'flyway:validate'])
-
-            # Verify applied versions now 1,2,3
-            new_applied = run_psql(cfg,
-                "SELECT string_agg(version, ',' ORDER BY installed_rank) FROM app.flyway_schema_history WHERE success AND type='SQL';",
-                db_name=cfg['database']
-            )
-            if new_applied != '1,2,3':
-                fail(f"Flyway migration finished with unexpected schema versions: {new_applied}")
+        require_schema_compatible(cfg, release_dir)
 
         if not is_running:
             grant_runtime_privileges(cfg)
@@ -616,7 +607,7 @@ def action_migrate(cfg, release_dir, revision, run_id, manifest_sha):
             'manifest_sha256': manifest_sha,
             'revision': revision,
             'run_id': run_id,
-            'schema_versions': rel_meta.get('schema_versions', ['1', '2', '3']),
+            'schema_versions': rel_meta['schema_versions'],
             'system_identifier': str(cfg['system_identifier']),
             'migrated_at_ns': time.time_ns()
         }
@@ -674,7 +665,7 @@ def grant_runtime_privileges(cfg):
             if seq:
                 if not re.fullmatch(r'app\.[a-z_][a-z0-9_]*', seq):
                     fail(f"Unexpected sequence name: {seq}")
-                statements.append(f'GRANT USAGE ON SEQUENCE {seq} TO {user};')
+                statements.append(f'GRANT USAGE,SELECT ON SEQUENCE {seq} TO {user};')
     for function in database.TRIGGER_FUNCTIONS:
         statements.append(f'GRANT EXECUTE ON FUNCTION app."{function}"() TO {user};')
 
@@ -844,7 +835,7 @@ WantedBy=multi-user.target
 """
 
 
-def verify_functional_readiness(port, expected_revision, timeout=60):
+def verify_functional_readiness(port, expected_revision, expected_schema, timeout=60):
     start_time = time.monotonic()
     health_url = f"http://127.0.0.1:{port}/health"
     login_url = f"http://127.0.0.1:{port}/login"
@@ -862,7 +853,7 @@ def verify_functional_readiness(port, expected_revision, timeout=60):
                         body = json.loads(resp.read().decode('utf-8'))
                         if (body.get('status') == 'UP' and
                                 body.get('application') == 'lab-sales-systems' and
-                                body.get('schemaVersion') == 3 and
+                                body.get('schemaVersion') == expected_schema and
                                 body.get('revision') == expected_revision):
                             health_passed = True
             except Exception:
@@ -931,6 +922,18 @@ def previous_distinct_release(state):
     fail('No previous distinct compatible release in target history to roll back to')
 
 
+def require_schema_compatible(cfg, release_dir):
+    expected = release.schema_identity(Path(release_dir) / 'app' / 'application.jar')
+    actual = run_psql(cfg,
+        "SELECT COALESCE(string_agg(version || '|' || script || '|' || checksum::text, ',' ORDER BY installed_rank), '') "
+        "FROM app.flyway_schema_history WHERE success AND type='SQL';", db_name=cfg['database'])
+    bad = run_psql(cfg, "SELECT count(*) FROM app.flyway_schema_history "
+        "WHERE NOT success OR type NOT IN ('SQL','SCHEMA') OR (type='SQL' AND "
+        "(version IS NULL OR script IS NULL OR checksum IS NULL));", db_name=cfg['database'])
+    if bad != '0' or actual != expected:
+        fail('Release is incompatible with the applied database schema; refusing rollout or recovery')
+
+
 def copy_release_immutable(src_release_dir, dest_release_dir):
     if not dest_release_dir.exists():
         tmp_dest = dest_release_dir.with_name(f"{dest_release_dir.name}.tmp.{os.getpid()}")
@@ -957,8 +960,8 @@ def systemctl(*args):
     subprocess.run(['systemctl', *args], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def ready_owned(cfg, revision):
-    verify_functional_readiness(cfg['port'], revision)
+def ready_owned(cfg, revision, schema_version):
+    verify_functional_readiness(cfg['port'], revision, schema_version)
     pid, state = get_systemd_main_pid(get_target_paths(cfg)['unit_name'])
     if state != 'active' or not pid or find_pid_listening_on_port(cfg['port']) != pid:
         fail('Service and listener ownership mismatch')
@@ -971,7 +974,8 @@ def rollout_locked(cfg, release_dir, revision, run_id, manifest_sha):
     verify_db_cluster_and_ownership(cfg)
     if paths['pending_journal'].exists():
         fail('Pending rollout requires recovery')
-    release.verify_release(release_dir, revision, run_id, manifest_sha)
+    rel_meta = release.verify_release(release_dir, revision, run_id, manifest_sha)
+    require_schema_compatible(cfg, release_dir)
     check_receipt(cfg, 'migrate', manifest_sha, revision, run_id)
     verify_bootstrap_receipt(cfg)
     validate_file_security(paths['runtime_state'], name='Runtime state')
@@ -997,7 +1001,7 @@ def rollout_locked(cfg, release_dir, revision, run_id, manifest_sha):
         systemctl('daemon-reload')
         verify_unit_ownership(cfg, unit_sha)
         systemctl('restart', paths['unit_name'])
-        pid = ready_owned(cfg, revision)
+        pid = ready_owned(cfg, revision, int(rel_meta['schema_versions'][-1]))
         systemctl('enable', paths['unit_name'])
         accepted = {'manifest_sha256': manifest_sha, 'revision': revision, 'run_id': run_id,
                     'jar_sha256': compute_file_sha256(jar), 'main_pid': pid}
@@ -1034,7 +1038,8 @@ def rollback_on_failed_deploy(cfg, paths, journal):
     if previous:
         sha, revision, run_id = previous['manifest_sha256'], previous['revision'], previous['run_id']
         dest = paths['releases'] / sha
-        release.verify_release(str(dest), revision, run_id, sha)
+        previous_meta = release.verify_release(str(dest), revision, run_id, sha)
+        require_schema_compatible(cfg, dest)
         text = render_systemd_unit(cfg, dest / 'app' / 'application.jar', revision)
         if hashlib.sha256(text.encode()).hexdigest() != old_hash:
             fail('Previous unit identity mismatch')
@@ -1042,7 +1047,7 @@ def rollback_on_failed_deploy(cfg, paths, journal):
         systemctl('daemon-reload')
         verify_unit_ownership(cfg, old_hash)
         systemctl('restart', paths['unit_name'])
-        ready_owned(cfg, revision)
+        ready_owned(cfg, revision, int(previous_meta['schema_versions'][-1]))
     elif unit.exists():
         fragment = subprocess.run(['systemctl', 'show', paths['unit_name'], '--property=FragmentPath', '--value'], capture_output=True, text=True).stdout.strip()
         if fragment:
@@ -1092,10 +1097,10 @@ def action_status(cfg):
         if not accepted or listener_pid != main_pid or not main_pid or paths['pending_journal'].exists():
             fail('Active service identity does not match accepted state')
         rel = paths['releases'] / accepted['manifest_sha256']
-        release.verify_release(str(rel), accepted['revision'], accepted['run_id'], accepted['manifest_sha256'])
+        rel_meta = release.verify_release(str(rel), accepted['revision'], accepted['run_id'], accepted['manifest_sha256'])
         if compute_file_sha256(rel / 'app' / 'application.jar') != accepted['jar_sha256']:
             fail('Accepted application digest mismatch')
-        ready_owned(cfg, accepted['revision'])
+        ready_owned(cfg, accepted['revision'], int(rel_meta['schema_versions'][-1]))
         status_obj['ready'] = True
 
     print(json.dumps(status_obj, indent=2, sort_keys=True))

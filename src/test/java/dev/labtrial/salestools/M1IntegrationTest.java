@@ -3,6 +3,13 @@ package dev.labtrial.salestools;
 import dev.labtrial.salestools.baseline.BaselineService;
 import dev.labtrial.salestools.core.DomainException;
 import dev.labtrial.salestools.finance.Ledger;
+import dev.labtrial.salestools.finance.PostingService;
+import dev.labtrial.salestools.identity.AccessControl;
+import dev.labtrial.salestools.inventory.InventoryService;
+import dev.labtrial.salestools.finance.FinanceController;
+import dev.labtrial.salestools.finance.SupplierPaymentService;
+import dev.labtrial.salestools.procurement.ProcurementService;
+import dev.labtrial.salestools.procurement.VendorInvoiceService;
 import dev.labtrial.salestools.identity.BootstrapService;
 import dev.labtrial.salestools.identity.IdentityPrincipal;
 import dev.labtrial.salestools.identity.IdentityService;
@@ -46,6 +53,8 @@ import org.springframework.security.authentication.UsernamePasswordAuthenticatio
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 import static org.junit.jupiter.api.Assertions.*;
 
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
@@ -77,6 +86,14 @@ class M1IntegrationTest {
     @Autowired PriceBookService priceBooks;
     @Autowired BaselineService baseline;
     @Autowired Ledger ledger;
+    @Autowired PostingService businessPosting;
+    @Autowired AccessControl access;
+    @Autowired PlatformTransactionManager transactions;
+    @Autowired InventoryService inventory;
+    @Autowired FinanceController finance;
+    @Autowired ProcurementService procurement;
+    @Autowired VendorInvoiceService vendorInvoices;
+    @Autowired SupplierPaymentService supplierPayments;
     @Autowired Environment environment;
     private long administrator;
     private long initialWorkspace;
@@ -673,7 +690,7 @@ class M1IntegrationTest {
 
         actor(c.user());
         String tCode = "TERM-" + UUID.randomUUID().toString().substring(0, 6);
-        long termsId = configuration.save(c.workspace(), c.entity(), ConfigurationService.Kind.TERMS, null, null, tCode, "Net 30 Initial", 30);
+        long termsId = configuration.save(c.workspace(), c.entity(), ConfigurationService.Kind.TERMS, null, null, tCode, "Net 30 Initial", 30, null);
         assertEquals(1L, configuration.get(c.workspace(), c.entity(), ConfigurationService.Kind.TERMS, termsId).version());
 
         actor(c.user());
@@ -697,7 +714,7 @@ class M1IntegrationTest {
         assertEquals("true", form.get("active"));
 
         actor(c.user());
-        configuration.save(c.workspace(), c.entity(), ConfigurationService.Kind.TERMS, termsId, 1L, tCode, "Net 30 Extended", 35);
+        configuration.save(c.workspace(), c.entity(), ConfigurationService.Kind.TERMS, termsId, 1L, tCode, "Net 30 Extended", 35, null);
         assertEquals(2L, configuration.get(c.workspace(), c.entity(), ConfigurationService.Kind.TERMS, termsId).version());
 
         form.put("erpCode", "");
@@ -765,7 +782,7 @@ class M1IntegrationTest {
 
         actor(c.user());
         String tCode = "TERM-S-" + UUID.randomUUID().toString().substring(0, 5);
-        long termsId = configuration.save(c.workspace(), c.entity(), ConfigurationService.Kind.TERMS, null, null, tCode, "Net 45 Initial", 45);
+        long termsId = configuration.save(c.workspace(), c.entity(), ConfigurationService.Kind.TERMS, null, null, tCode, "Net 45 Initial", 45, null);
         assertEquals(1L, configuration.get(c.workspace(), c.entity(), ConfigurationService.Kind.TERMS, termsId).version());
 
         actor(c.user());
@@ -788,7 +805,7 @@ class M1IntegrationTest {
         assertEquals("true", form.get("active"));
 
         actor(c.user());
-        configuration.save(c.workspace(), c.entity(), ConfigurationService.Kind.TERMS, termsId, 1L, tCode, "Net 45 Extended", 50);
+        configuration.save(c.workspace(), c.entity(), ConfigurationService.Kind.TERMS, termsId, 1L, tCode, "Net 45 Extended", 50, null);
         assertEquals(2L, configuration.get(c.workspace(), c.entity(), ConfigurationService.Kind.TERMS, termsId).version());
 
         form.put("erpCode", "");
@@ -849,7 +866,7 @@ class M1IntegrationTest {
     @Test void existingPriceLineRetainsStaleProductAndInvalidAmountUntilExplicitRefresh() throws Exception {
         var c = context("EUR", "OPERATIONS", "SALES_MANAGER");
         long unit = configuration.save(c.workspace(), c.entity(), ConfigurationService.Kind.UOM,
-                null, null, "EA", "Each", null);
+                null, null, "EA", "Each", null, 0);
         long product = products.save(c.workspace(), c.entity(), null, null,
                 new ProductService.Input("LINE-A", "Original product", "LAB_SUPPLY", "TRANSFER", unit, 1, "NONE"));
         long otherProduct = products.save(c.workspace(), c.entity(), null, null,
@@ -923,7 +940,7 @@ class M1IntegrationTest {
     @Test void existingPriceLineRetainsRejectedInputWhenItsProductIsDeactivated() throws Exception {
         var c = context("EUR", "OPERATIONS", "SALES_MANAGER");
         long unit = configuration.save(c.workspace(), c.entity(), ConfigurationService.Kind.UOM,
-                null, null, "EA", "Each", null);
+                null, null, "EA", "Each", null, 0);
         long product = products.save(c.workspace(), c.entity(), null, null,
                 new ProductService.Input("INACTIVE-LINE", "Historical line product", "LAB_SUPPLY", "TRANSFER", unit, 1, "NONE"));
         products.assign(c.workspace(), c.entity(), product, 1, null, true);
@@ -1011,6 +1028,454 @@ class M1IntegrationTest {
         assertNull(dbCustomer.parentId(), "Foreign customer must not become parent");
         assertEquals(localCustomerName, dbCustomer.name(), "Customer name must remain unchanged");
         assertEquals(1L, dbCustomer.version(), "Customer version must remain 1");
+    }
+
+    @Test void concurrentBusinessPostingAndReversalHaveOneEffectAndRejectChangedIntent() throws Exception {
+        var c = context("EUR", "FINANCE");
+        baseline.initialize(c.workspace(), c.entity(), "O2C_GOODS", 1);
+        long bank = db.queryForObject("select id from chart_accounts where workspace_id=? and entity_id=? and code='BANK'", Long.class, c.workspace(), c.entity());
+        long equity = db.queryForObject("select id from chart_accounts where workspace_id=? and entity_id=? and code='EQUITY'", Long.class, c.workspace(), c.entity());
+        var lines = List.of(new Ledger.Line(bank, new BigDecimal("17.25"), BigDecimal.ZERO),
+                new Ledger.Line(equity, BigDecimal.ZERO, new BigDecimal("17.25")));
+        var transaction = new TransactionTemplate(transactions);
+        List<PostingService.Result> posted;
+        try (var executor = Executors.newFixedThreadPool(2)) {
+            Callable<PostingService.Result> post = () -> {
+                actor(c.user());
+                try {
+                    return transaction.execute(ignored -> businessPosting.post(
+                            access.requireContext(c.workspace(), c.entity(), true, "FINANCE"),
+                            "SYNTHETIC_TEST", "source-1", "BUSINESS-INTENT-1", DAY, "EUR", "Explicit synthetic intent", lines));
+                } finally { SecurityContextHolder.clearContext(); }
+            };
+            posted = new ArrayList<>();
+            for (var future : executor.invokeAll(List.of(post, post))) posted.add(future.get());
+        }
+        assertEquals(posted.get(0).journalId(), posted.get(1).journalId());
+        assertEquals(1, posted.stream().filter(result -> !result.replayed()).count());
+        assertEquals(new BigDecimal("17.25"), db.queryForObject(
+                "select sum(debit) from journal_lines where journal_id=?", BigDecimal.class, posted.get(0).journalId()));
+        denied(409, () -> transaction.execute(ignored -> businessPosting.post(
+                access.requireContext(c.workspace(), c.entity(), true, "FINANCE"),
+                "SYNTHETIC_TEST", "source-1", "BUSINESS-INTENT-1", DAY, "EUR", "Changed intent", lines)));
+        long journal = posted.get(0).journalId();
+        var reverse = transaction.execute(ignored -> businessPosting.reverse(
+                access.requireContext(c.workspace(), c.entity(), true, "FINANCE"),
+                journal, "REVERSE-INTENT-1", DAY.plusDays(1), "Whole original reversal"));
+        assertEquals(reverse.journalId(), transaction.execute(ignored -> businessPosting.reverse(
+                access.requireContext(c.workspace(), c.entity(), true, "FINANCE"),
+                journal, "REVERSE-INTENT-1", DAY.plusDays(1), "Whole original reversal")).journalId());
+        denied(409, () -> transaction.execute(ignored -> businessPosting.reverse(
+                access.requireContext(c.workspace(), c.entity(), true, "FINANCE"),
+                journal, "REVERSE-INTENT-2", DAY.plusDays(1), "Duplicate reversal")));
+        assertEquals(new BigDecimal("0.00"), db.queryForObject(
+                "select sum(debit-credit) from journal_lines where account_id=? and journal_id in (?,?)",
+                BigDecimal.class, bank, journal, reverse.journalId()));
+        assertEquals(1, db.queryForObject("select count(*) from journal_entries where reverse_of=?", Integer.class, journal));
+    }
+
+    @Test void zeroValueBusinessEffectRequiresAnOpenPeriodWithoutCreatingZeroJournal() {
+        var c = context("EUR", "FINANCE");
+        baseline.initialize(c.workspace(), c.entity(), "O2C_GOODS", 1);
+        int before = db.queryForObject("select count(*) from journal_entries where workspace_id=?", Integer.class, c.workspace());
+        var transaction = new TransactionTemplate(transactions);
+        var zero = transaction.execute(ignored -> businessPosting.post(
+                access.requireContext(c.workspace(), c.entity(), true, "FINANCE"),
+                "SYNTHETIC_TEST", "zero-source", "ZERO-INTENT", DAY, "EUR", "Explicit zero effect", List.of()));
+        assertNull(zero.journalId());
+        assertEquals(before, db.queryForObject("select count(*) from journal_entries where workspace_id=?", Integer.class, c.workspace()));
+        db.update("update fiscal_periods set status='CLOSED',version=version+1 where workspace_id=? and entity_id=?", c.workspace(), c.entity());
+        denied(409, () -> transaction.execute(ignored -> businessPosting.post(
+                access.requireContext(c.workspace(), c.entity(), true, "FINANCE"),
+                "SYNTHETIC_TEST", "zero-source-closed", "ZERO-CLOSED", DAY, "EUR", "Must not bypass period", List.of())));
+        assertEquals(before, db.queryForObject("select count(*) from journal_entries where workspace_id=?", Integer.class, c.workspace()));
+    }
+
+    @Test void warehouseTransferPreservesPoolValuePostsOnceAndPreventsBackdating() throws Exception {
+        var c = context("EUR", "FINANCE", "OPERATIONS");
+        baseline.initialize(c.workspace(), c.entity(), "O2C_GOODS", 1);
+        var source = db.queryForMap("""
+                select p.id,p.version,p.uom_id,u.version as uom_version,s.version as setting_version,
+                       b.warehouse_id,w.version as warehouse_version,b.on_hand,l.id as lot_id,l.lot
+                  from products p
+                  join product_entity_settings s on s.workspace_id=p.workspace_id and s.product_id=p.id and s.entity_id=?
+                  join uoms u on u.workspace_id=p.workspace_id and u.id=p.uom_id
+                  join inventory_balances b on b.workspace_id=p.workspace_id and b.entity_id=s.entity_id and b.product_id=p.id
+                  join warehouses w on w.workspace_id=b.workspace_id and w.entity_id=b.entity_id and w.id=b.warehouse_id
+                  join inventory_lots l on l.workspace_id=b.workspace_id and l.entity_id=b.entity_id and l.product_id=b.product_id and l.warehouse_id=b.warehouse_id
+                 where p.workspace_id=? and p.tracking='LOT' and b.on_hand-b.reserved>=2 order by p.id limit 1
+                """, c.entity(), c.workspace());
+        long product = ((Number) source.get("id")).longValue();
+        long from = ((Number) source.get("warehouse_id")).longValue();
+        long to = configuration.save(c.workspace(), c.entity(), ConfigurationService.Kind.WAREHOUSE,
+                null, null, "TRANSFER-DESTINATION", "Synthetic transfer destination", null, null);
+        var before = db.queryForMap("select quantity,value,pool_sequence from inventory_valuation_pools where workspace_id=? and entity_id=? and product_id=?",
+                c.workspace(), c.entity(), product);
+        int journals = db.queryForObject("select count(*) from journal_entries where workspace_id=?", Integer.class, c.workspace());
+        var input = new InventoryService.ActionInput("TRANSFER-ONE", "TRANSFER", product,
+                ((Number) source.get("version")).longValue(), ((Number) source.get("uom_id")).longValue(),
+                ((Number) source.get("uom_version")).longValue(), ((Number) source.get("setting_version")).longValue(),
+                from, ((Number) source.get("warehouse_version")).longValue(), to, 1L, new BigDecimal("2"),
+                null, DAY.plusDays(1), "Explicit synthetic warehouse transfer",
+                List.of(new InventoryService.TrackingInput(null, (String) source.get("lot"), null, new BigDecimal("2"))));
+        long action = inventory.saveAction(c.workspace(), c.entity(), null, null, input);
+        long version = inventory.action(c.workspace(), c.entity(), action).version();
+        List<InventoryService.ActionResult> results = new ArrayList<>();
+        try (var executor = Executors.newFixedThreadPool(2)) {
+            Callable<InventoryService.ActionResult> post = () -> {
+                actor(c.user());
+                try { return inventory.postAction(c.workspace(), c.entity(), action, version); }
+                finally { SecurityContextHolder.clearContext(); }
+            };
+            for (var future : executor.invokeAll(List.of(post, post))) results.add(future.get());
+        }
+        assertEquals(1, results.stream().filter(result -> !result.replayed()).count());
+        assertTrue(results.stream().allMatch(result -> result.journalId() == null));
+        var after = db.queryForMap("select quantity,value,pool_sequence,last_posting_date from inventory_valuation_pools where workspace_id=? and entity_id=? and product_id=?",
+                c.workspace(), c.entity(), product);
+        assertEquals(before.get("quantity"), after.get("quantity"));
+        assertEquals(before.get("value"), after.get("value"));
+        assertEquals(((Number) before.get("pool_sequence")).longValue()+1, ((Number) after.get("pool_sequence")).longValue());
+        assertEquals(DAY.plusDays(1), db.queryForObject("select last_posting_date from inventory_valuation_pools where workspace_id=? and entity_id=? and product_id=?",
+                LocalDate.class, c.workspace(), c.entity(), product));
+        assertEquals(new BigDecimal("2.000000"), db.queryForObject("select on_hand from inventory_balances where workspace_id=? and entity_id=? and product_id=? and warehouse_id=?",
+                BigDecimal.class, c.workspace(), c.entity(), product, to));
+        assertEquals(((BigDecimal) source.get("on_hand")).subtract(new BigDecimal("2")), db.queryForObject(
+                "select on_hand from inventory_balances where workspace_id=? and entity_id=? and product_id=? and warehouse_id=?",
+                BigDecimal.class, c.workspace(), c.entity(), product, from));
+        assertEquals(new BigDecimal("2.000000"), db.queryForObject(
+                "select quantity from inventory_lot_balances where workspace_id=? and entity_id=? and lot_id=? and warehouse_id=?",
+                BigDecimal.class, c.workspace(), c.entity(), ((Number) source.get("lot_id")).longValue(), to));
+        assertEquals(new BigDecimal("0.000000"), db.queryForObject(
+                "select sum(quantity_delta) from stock_movements where workspace_id=? and entity_id=? and source_type='INVENTORY_ACTION' and source_id=?",
+                BigDecimal.class, c.workspace(), c.entity(), Long.toString(action)));
+        assertEquals(new BigDecimal("0.00"), db.queryForObject(
+                "select sum(value_delta) from stock_movements where workspace_id=? and entity_id=? and source_type='INVENTORY_ACTION' and source_id=?",
+                BigDecimal.class, c.workspace(), c.entity(), Long.toString(action)));
+        assertEquals(2, db.queryForObject(
+                "select count(*) from stock_movements where workspace_id=? and entity_id=? and source_type='INVENTORY_ACTION' and source_id=?",
+                Integer.class, c.workspace(), c.entity(), Long.toString(action)));
+        assertEquals(journals, db.queryForObject("select count(*) from journal_entries where workspace_id=?", Integer.class, c.workspace()));
+        var backdated = new InventoryService.ActionInput("TRANSFER-BACKDATED", "TRANSFER", input.productId(),
+                input.productVersion(), input.uomId(), input.uomVersion(), input.settingVersion(),
+                input.fromWarehouseId(), input.fromWarehouseVersion(), input.toWarehouseId(), input.toWarehouseVersion(),
+                BigDecimal.ONE, null, DAY, "Must not cross pool watermark",
+                List.of(new InventoryService.TrackingInput(null, (String) source.get("lot"), null, BigDecimal.ONE)));
+        long rejected = inventory.saveAction(c.workspace(), c.entity(), null, null, backdated);
+        denied(409, () -> inventory.postAction(c.workspace(), c.entity(), rejected, 1));
+        assertEquals("DRAFT", inventory.action(c.workspace(), c.entity(), rejected).status());
+        assertEquals(0, db.queryForObject("select count(*) from stock_movements where workspace_id=? and entity_id=? and source_type='INVENTORY_ACTION' and source_id=?",
+                Integer.class, c.workspace(), c.entity(), Long.toString(rejected)));
+    }
+
+    @Test void arbitraryZeroValueStockRequiresIndependentCheckerAndOperationsCannotSeeValuation() {
+        var c = context("EUR", "FINANCE", "OPERATIONS");
+        baseline.initialize(c.workspace(), c.entity(), "O2C_GOODS", 1);
+        var unit = configuration.list(c.workspace(), c.entity(), ConfigurationService.Kind.UOM, "").get(0);
+        var warehouse = configuration.list(c.workspace(), c.entity(), ConfigurationService.Kind.WAREHOUSE, "").get(0);
+        long product = products.save(c.workspace(), c.entity(), null, null,
+                new ProductService.Input("ARBITRARY-" + UUID.randomUUID(), "Synthetic new component",
+                        "REPLACEMENT_PART", "TRANSFER", unit.id(), unit.version(), "NONE"));
+        products.assign(c.workspace(), c.entity(), product, 1, null, true);
+        var setting = products.setting(c.workspace(), c.entity(), product);
+        int journals = db.queryForObject("select count(*) from journal_entries where workspace_id=?", Integer.class, c.workspace());
+        var input = new InventoryService.ActionInput("ZERO-POSITIVE", "POSITIVE_ADJUSTMENT", product, 1,
+                unit.id(), unit.version(), setting.version(), null, null, warehouse.id(), warehouse.version(),
+                new BigDecimal("3"), new BigDecimal("0.00"), DAY.plusDays(1), "Approved zero-cost synthetic stock", List.of());
+        long action = inventory.saveAction(c.workspace(), c.entity(), null, null, input);
+        var editor = peer(c, "OPERATIONS", "FINANCE");
+        inventory.saveAction(c.workspace(), c.entity(), action, 1L, input);
+        actor(c.user());
+        inventory.submitAction(c.workspace(), c.entity(), action, 2);
+        denied(403, () -> inventory.postAction(c.workspace(), c.entity(), action, 3));
+        actor(editor.user());
+        denied(403, () -> inventory.postAction(c.workspace(), c.entity(), action, 3));
+        var checker = peer(c, "FINANCE");
+        var result = inventory.postAction(c.workspace(), c.entity(), action, 3);
+        assertNull(result.journalId());
+        assertFalse(result.replayed());
+        assertTrue(inventory.postAction(c.workspace(), c.entity(), action, 3).replayed());
+        assertEquals(checker.user(), db.queryForObject("select approved_by from inventory_actions where id=?", Long.class, action));
+        assertEquals(new BigDecimal("3.000000"), db.queryForObject(
+                "select quantity from inventory_valuation_pools where workspace_id=? and entity_id=? and product_id=?",
+                BigDecimal.class, c.workspace(), c.entity(), product));
+        assertEquals(new BigDecimal("0.00"), db.queryForObject(
+                "select value from inventory_valuation_pools where workspace_id=? and entity_id=? and product_id=?",
+                BigDecimal.class, c.workspace(), c.entity(), product));
+        assertEquals(journals, db.queryForObject("select count(*) from journal_entries where workspace_id=?", Integer.class, c.workspace()));
+        var operations = peer(c, "OPERATIONS");
+        var visibleBalance = inventory.balances(c.workspace(), c.entity(), "ARBITRARY-").stream()
+                .filter(row -> row.productId() == product && row.warehouseId() == warehouse.id()).findFirst().orElseThrow();
+        assertEquals(new BigDecimal("3.000000"), visibleBalance.onHand());
+        assertNull(visibleBalance.poolValue());
+        assertNull(inventory.movements(c.workspace(), c.entity(), product).get(0).value());
+        var issue = new InventoryService.ActionInput("ZERO-ISSUE", "NEGATIVE_ADJUSTMENT", product, 1,
+                unit.id(), unit.version(), setting.version(), warehouse.id(), warehouse.version(), null, null,
+                BigDecimal.ONE, null, DAY.plusDays(1), "Synthetic operational stock adjustment", List.of());
+        long outgoing = inventory.saveAction(c.workspace(), c.entity(), null, null, issue);
+        assertNull(inventory.postAction(c.workspace(), c.entity(), outgoing, 1).journalId());
+        assertEquals(operations.user(), db.queryForObject("select posted_by from inventory_actions where id=?", Long.class, outgoing));
+        assertEquals(new BigDecimal("2.000000"), db.queryForObject(
+                "select quantity from inventory_valuation_pools where workspace_id=? and entity_id=? and product_id=?",
+                BigDecimal.class, c.workspace(), c.entity(), product));
+        assertEquals(journals, db.queryForObject("select count(*) from journal_entries where workspace_id=?", Integer.class, c.workspace()));
+    }
+
+    @Test void supplierMismatchCannotConsumeEntitlementAndCashCorrectionsRestoreAsOfBalances() {
+        var fixture = purchase(new BigDecimal("10"), new BigDecimal("55.00"), null, null);
+        var c = fixture.creator();
+        var actual = new VendorInvoiceService.Line("ACTUAL-1", fixture.receiptLine(), new BigDecimal("10"),
+                new BigDecimal("55.00"), null, null, new BigDecimal("550.00"), new BigDecimal("0.00"),
+                new BigDecimal("550.00"), new BigDecimal("38.50"), new BigDecimal("588.51"));
+        int before = db.queryForObject("select count(*) from journal_entries where workspace_id=?", Integer.class, c.workspace());
+        long invoice = vendorInvoices.save(c.workspace(), c.entity(), null, 0,
+                new VendorInvoiceService.Draft("Synthetic Supplier Ref", DAY.plusDays(2), 1, 1, List.of(actual)));
+        assertTrue(vendorInvoices.post(c.workspace(), c.entity(), invoice, 1).held());
+        assertEquals("HELD_FOR_REVIEW", vendorInvoices.detail(c.workspace(), c.entity(), invoice).get("status"));
+        assertEquals(0, db.queryForObject("select count(*) from invoice_source_allocations where workspace_id=? and entity_id=?", Integer.class, c.workspace(), c.entity()));
+        assertEquals(before, db.queryForObject("select count(*) from journal_entries where workspace_id=?", Integer.class, c.workspace()));
+        assertEquals(new BigDecimal("550.00"), db.queryForObject(
+                "select value from inventory_valuation_pools where workspace_id=? and entity_id=? and product_id=?",
+                BigDecimal.class, c.workspace(), c.entity(), fixture.product()));
+        var corrected = new VendorInvoiceService.Line("ACTUAL-1", fixture.receiptLine(), new BigDecimal("10"),
+                new BigDecimal("55.00"), null, null, new BigDecimal("550.00"), new BigDecimal("0.00"),
+                new BigDecimal("550.00"), new BigDecimal("38.50"), new BigDecimal("588.50"));
+        vendorInvoices.save(c.workspace(), c.entity(), invoice, 2,
+                new VendorInvoiceService.Draft("Synthetic Supplier Ref", DAY.plusDays(2), 1, 1, List.of(corrected)));
+        assertFalse(vendorInvoices.post(c.workspace(), c.entity(), invoice, 3).held());
+        assertTrue(vendorInvoices.post(c.workspace(), c.entity(), invoice, 3).replayed());
+        assertEquals(DAY.plusDays(32), db.queryForObject("select due_date from vendor_invoices where id=?", LocalDate.class, invoice));
+        assertEquals(new BigDecimal("588.50"), supplierPayments.aging(c.workspace(), c.entity(), DAY.plusDays(2)).get(0).get("open_amount"));
+        var payment = new SupplierPaymentService.Draft("SYNTHETIC-PAYMENT", fixture.supplierAccount(), 1, 1, 1,
+                DAY.plusDays(3), "EUR", new BigDecimal("588.50"),
+                List.of(new SupplierPaymentService.Allocation(invoice, new BigDecimal("588.50"))));
+        long cash = supplierPayments.save(c.workspace(), c.entity(), null, 0, payment);
+        assertFalse(supplierPayments.post(c.workspace(), c.entity(), cash, 1));
+        assertTrue(supplierPayments.post(c.workspace(), c.entity(), cash, 1));
+        assertEquals(new BigDecimal("0.00"), supplierPayments.aging(c.workspace(), c.entity(), DAY.plusDays(3)).get(0).get("open_amount"));
+        denied(409, () -> vendorInvoices.reverse(c.workspace(), c.entity(), invoice, DAY.plusDays(3), "Cash still active", "EARLY-CORRECTION"));
+        supplierPayments.reverse(c.workspace(), c.entity(), cash, DAY.plusDays(4), "Synthetic whole cash correction", "CASH-REVERSAL");
+        supplierPayments.reverse(c.workspace(), c.entity(), cash, DAY.plusDays(4), "Synthetic whole cash correction", "CASH-REVERSAL");
+        vendorInvoices.reverse(c.workspace(), c.entity(), invoice, DAY.plusDays(5), "Synthetic invoice correction", "INVOICE-REVERSAL");
+        assertEquals(new BigDecimal("588.50"), supplierPayments.aging(c.workspace(), c.entity(), DAY.plusDays(2)).get(0).get("open_amount"));
+        assertEquals(new BigDecimal("0.00"), supplierPayments.aging(c.workspace(), c.entity(), DAY.plusDays(3)).get(0).get("open_amount"));
+        assertEquals(new BigDecimal("588.50"), supplierPayments.aging(c.workspace(), c.entity(), DAY.plusDays(4)).get(0).get("open_amount"));
+        assertTrue(supplierPayments.aging(c.workspace(), c.entity(), DAY.plusDays(5)).stream().noneMatch(row -> ((Number) row.get("id")).longValue() == invoice));
+        assertEquals(new BigDecimal("10.000000"), db.queryForObject(
+                "select quantity from inventory_valuation_pools where workspace_id=? and entity_id=? and product_id=?",
+                BigDecimal.class, c.workspace(), c.entity(), fixture.product()));
+        assertEquals(new BigDecimal("550.00"), db.queryForObject(
+                "select value from inventory_valuation_pools where workspace_id=? and entity_id=? and product_id=?",
+                BigDecimal.class, c.workspace(), c.entity(), fixture.product()));
+    }
+
+    @Test void payablePageClampsDaysOverdueBeforeAndOnDueDateAndCountsAfterwards() throws Exception {
+        var fixture = purchase(new BigDecimal("10"), new BigDecimal("55.00"), null, null);
+        var c = fixture.creator();
+        var line = new VendorInvoiceService.Line("AP-BOUNDARY-LINE", fixture.receiptLine(), new BigDecimal("10"),
+                new BigDecimal("55.00"), null, null, new BigDecimal("550.00"), new BigDecimal("0.00"),
+                new BigDecimal("550.00"), new BigDecimal("38.50"), new BigDecimal("588.50"));
+        long invoice = vendorInvoices.save(c.workspace(), c.entity(), null, 0,
+                new VendorInvoiceService.Draft("AP-BOUNDARY", DAY.plusDays(2), 1, 1, List.of(line)));
+        assertFalse(vendorInvoices.post(c.workspace(), c.entity(), invoice, 1).held());
+        LocalDate due = DAY.plusDays(32);
+        assertEquals(due, db.queryForObject("select due_date from vendor_invoices where id=?", LocalDate.class, invoice));
+        var client = signedIn(c.login());
+        for (var boundary : List.of(Map.entry(DAY.plusDays(2), "0"), Map.entry(due, "0"), Map.entry(due.plusDays(1), "1"))) {
+            var response = get(client, "/w/" + c.workspace() + "/e/" + c.entity() + "/finance/ap?asOf=" + boundary.getKey());
+            assertEquals(200, response.statusCode(), "Posted invoice must render at " + boundary.getKey());
+            assertTrue(response.body().contains("AP-BOUNDARY"));
+            var overdue = Pattern.compile("<td\\b[^>]*>\\s*" + due + "\\s*</td>\\s*<td\\b[^>]*>\\s*(-?\\d+)\\s*</td>")
+                    .matcher(response.body());
+            assertTrue(overdue.find(), "The invoice due date and displayed overdue value must be visible.");
+            assertEquals(boundary.getValue(), overdue.group(1), "Overdue boundary at " + boundary.getKey());
+            assertTrue(response.body().contains("588.50 EUR"), "Viewing aging must retain the unpaid invoice balance.");
+        }
+    }
+
+    @Test void bankAccountCannotBeMappedToInventoryControlAccountInEitherDirection() {
+        var fixture = purchase(new BigDecimal("1"), new BigDecimal("10.00"), null, null);
+        var c = fixture.creator();
+        long inventoryAccount = db.queryForObject("select id from chart_accounts where workspace_id=? and entity_id=? and code='INVENTORY'", Long.class, c.workspace(), c.entity());
+        long bankAccount = db.queryForObject("select id from chart_accounts where workspace_id=? and entity_id=? and code='BANK'", Long.class, c.workspace(), c.entity());
+        denied(400, () -> finance.paymentConfig(c.workspace(), c.entity(), 1, inventoryAccount));
+        denied(400, () -> finance.procurementConfig(c.workspace(), c.entity(), 1,
+                bankAccount + ":1", accountToken(c, "AP"), accountToken(c, "GRNI"),
+                accountToken(c, "GAIN"), accountToken(c, "LOSS"), accountToken(c, "SERVICE")));
+    }
+
+    @Test void middleInvoiceRebillReusesExactReleasedRoundingIntervalWithoutRewritingOtherInvoices() {
+        var fixture = purchase(new BigDecimal("3"), new BigDecimal("0.50"), null, new BigDecimal("0.50"));
+        var c = fixture.creator();
+        long first = partialInvoice(fixture, "PART-A", DAY.plusDays(2), "0.17", "0.33", "0.02", "0.35");
+        long middle = partialInvoice(fixture, "PART-B", DAY.plusDays(2), "0.16", "0.34", "0.03", "0.37");
+        long last = partialInvoice(fixture, "PART-C", DAY.plusDays(2), "0.17", "0.33", "0.02", "0.35");
+        var firstBefore = db.queryForList("select slice_start,slice_end,subtotal,discount,net,tax,gross from invoice_source_allocations where invoice_line_id in (select id from vendor_invoice_lines where invoice_id=?) order by id", first);
+        var lastBefore = db.queryForList("select slice_start,slice_end,subtotal,discount,net,tax,gross from invoice_source_allocations where invoice_line_id in (select id from vendor_invoice_lines where invoice_id=?) order by id", last);
+        vendorInvoices.reverse(c.workspace(), c.entity(), middle, DAY.plusDays(3), "Correct middle interval only", "MIDDLE-REVERSAL");
+        var replacement = new VendorInvoiceService.Line("REPLACEMENT-LINE", fixture.receiptLine(), BigDecimal.ONE,
+                new BigDecimal("0.50"), null, new BigDecimal("0.16"), new BigDecimal("0.50"), new BigDecimal("0.16"),
+                new BigDecimal("0.34"), new BigDecimal("0.03"), new BigDecimal("0.37"));
+        long rebill = vendorInvoices.save(c.workspace(), c.entity(), null, 0,
+                new VendorInvoiceService.Draft("PART-D", DAY.plusDays(2), 1, 1, List.of(replacement)));
+        assertTrue(vendorInvoices.post(c.workspace(), c.entity(), rebill, 1).held(),
+                "A future reversal must not release capacity into an earlier business date");
+        vendorInvoices.save(c.workspace(), c.entity(), rebill, 2,
+                new VendorInvoiceService.Draft("PART-D", DAY.plusDays(3), 1, 1, List.of(replacement)));
+        assertFalse(vendorInvoices.post(c.workspace(), c.entity(), rebill, 3).held());
+        var slice = db.queryForMap("select slice_start,slice_end,subtotal,discount,net,tax,gross from invoice_source_allocations where invoice_line_id in (select id from vendor_invoice_lines where invoice_id=?)", rebill);
+        assertEquals(new BigDecimal("1.000000"), slice.get("slice_start"));
+        assertEquals(new BigDecimal("2.000000"), slice.get("slice_end"));
+        assertEquals(new BigDecimal("0.34"), slice.get("net"));
+        assertEquals(new BigDecimal("0.03"), slice.get("tax"));
+        assertEquals(new BigDecimal("0.37"), slice.get("gross"));
+        assertEquals(firstBefore, db.queryForList("select slice_start,slice_end,subtotal,discount,net,tax,gross from invoice_source_allocations where invoice_line_id in (select id from vendor_invoice_lines where invoice_id=?) order by id", first));
+        assertEquals(lastBefore, db.queryForList("select slice_start,slice_end,subtotal,discount,net,tax,gross from invoice_source_allocations where invoice_line_id in (select id from vendor_invoice_lines where invoice_id=?) order by id", last));
+        assertEquals("POSTED", vendorInvoices.detail(c.workspace(), c.entity(), middle).get("status"));
+        assertEquals(new BigDecimal("1.07"), supplierPayments.aging(c.workspace(), c.entity(), DAY.plusDays(2)).stream()
+                .map(row -> (BigDecimal) row.get("open_amount")).reduce(BigDecimal.ZERO, BigDecimal::add));
+        assertEquals(new BigDecimal("1.07"), supplierPayments.aging(c.workspace(), c.entity(), DAY.plusDays(3)).stream()
+                .map(row -> (BigDecimal) row.get("open_amount")).reduce(BigDecimal.ZERO, BigDecimal::add));
+    }
+
+    private long partialInvoice(PurchaseFixture fixture, String reference, LocalDate date,
+                                String discount, String net, String tax, String gross) {
+        var c = fixture.creator();
+        var line = new VendorInvoiceService.Line("PARTIAL-LINE", fixture.receiptLine(), BigDecimal.ONE,
+                new BigDecimal("0.50"), null, new BigDecimal(discount), new BigDecimal("0.50"),
+                new BigDecimal(discount), new BigDecimal(net), new BigDecimal(tax), new BigDecimal(gross));
+        long id = vendorInvoices.save(c.workspace(), c.entity(), null, 0,
+                new VendorInvoiceService.Draft(reference, date, 1, 1, List.of(line)));
+        assertFalse(vendorInvoices.post(c.workspace(), c.entity(), id, 1).held());
+        return id;
+    }
+
+    @Test void finalInventoryIssueConsumesExactResidualValueWithoutLeavingStrandedCents() {
+        var fixture = purchase(new BigDecimal("3"), new BigDecimal("0.333333"), null, null);
+        var c = fixture.creator();
+        var product = products.get(c.workspace(), c.entity(), fixture.product());
+        var unit = configuration.get(c.workspace(), c.entity(), ConfigurationService.Kind.UOM, product.uomId());
+        var setting = products.setting(c.workspace(), c.entity(), product.id());
+        var warehouse = configuration.list(c.workspace(), c.entity(), ConfigurationService.Kind.WAREHOUSE, "").get(0);
+        assertEquals(new BigDecimal("1.00"), db.queryForObject(
+                "select value from inventory_valuation_pools where workspace_id=? and entity_id=? and product_id=?",
+                BigDecimal.class, c.workspace(), c.entity(), product.id()));
+        String[] costs = {"0.33", "0.34", "0.33"};
+        for (int i=0; i<costs.length; i++) {
+            long action = inventory.saveAction(c.workspace(), c.entity(), null, null,
+                    new InventoryService.ActionInput("RESIDUAL-" + i, "NEGATIVE_ADJUSTMENT", product.id(), product.version(),
+                            unit.id(), unit.version(), setting.version(), warehouse.id(), warehouse.version(), null, null,
+                            BigDecimal.ONE, null, DAY.plusDays(2), "Synthetic residual-cost issue", List.of()));
+            var posted = inventory.postAction(c.workspace(), c.entity(), action, 1);
+            assertEquals(new BigDecimal(costs[i]), db.queryForObject("select sum(debit) from journal_lines where journal_id=?",
+                    BigDecimal.class, posted.journalId()));
+            assertEquals(new BigDecimal(costs[i]).negate(), db.queryForObject(
+                    "select sum(value_delta) from stock_movements where workspace_id=? and entity_id=? and source_type='INVENTORY_ACTION' and source_id=?",
+                    BigDecimal.class, c.workspace(), c.entity(), Long.toString(action)));
+        }
+        assertEquals(new BigDecimal("0.000000"), db.queryForObject(
+                "select quantity from inventory_valuation_pools where workspace_id=? and entity_id=? and product_id=?",
+                BigDecimal.class, c.workspace(), c.entity(), product.id()));
+        assertEquals(new BigDecimal("0.00"), db.queryForObject(
+                "select value from inventory_valuation_pools where workspace_id=? and entity_id=? and product_id=?",
+                BigDecimal.class, c.workspace(), c.entity(), product.id()));
+    }
+
+    @Test void zeroValueInvoiceCorrectionIsTypedReplaySafeAndReleasesStockEntitlementWithoutZeroGl() {
+        var fixture = purchase(BigDecimal.ONE, BigDecimal.ZERO, null, null);
+        var c = fixture.creator();
+        int before = db.queryForObject("select count(*) from journal_entries where workspace_id=?", Integer.class, c.workspace());
+        var zero = new BigDecimal("0.00");
+        var line = new VendorInvoiceService.Line("FREE-LINE", fixture.receiptLine(), BigDecimal.ONE,
+                zero, null, null, zero, zero, zero, zero, zero);
+        long invoice = vendorInvoices.save(c.workspace(), c.entity(), null, 0,
+                new VendorInvoiceService.Draft("FREE-ORIGINAL", DAY.plusDays(2), 1, 1, List.of(line)));
+        assertFalse(vendorInvoices.post(c.workspace(), c.entity(), invoice, 1).held());
+        assertTrue(vendorInvoices.post(c.workspace(), c.entity(), invoice, 1).replayed());
+        assertNull(vendorInvoices.detail(c.workspace(), c.entity(), invoice).get("journal_id"));
+        vendorInvoices.reverse(c.workspace(), c.entity(), invoice, DAY.plusDays(3), "Free invoice correction", "FREE-REVERSAL");
+        vendorInvoices.reverse(c.workspace(), c.entity(), invoice, DAY.plusDays(3), "Free invoice correction", "FREE-REVERSAL");
+        denied(409, () -> vendorInvoices.reverse(c.workspace(), c.entity(), invoice, DAY.plusDays(3), "Changed reversal payload", "FREE-REVERSAL"));
+        var correction = db.queryForMap("select journal_id,source_type,invoice_id,payment_id from procurement_reversals where workspace_id=? and entity_id=? and reversal_key='FREE-REVERSAL'",
+                c.workspace(), c.entity());
+        assertNull(correction.get("journal_id"));
+        assertEquals("INVOICE", correction.get("source_type"));
+        assertEquals(invoice, ((Number) correction.get("invoice_id")).longValue());
+        assertNull(correction.get("payment_id"));
+        long rebill = vendorInvoices.save(c.workspace(), c.entity(), null, 0,
+                new VendorInvoiceService.Draft("FREE-REBILL", DAY.plusDays(3), 1, 1, List.of(line)));
+        assertFalse(vendorInvoices.post(c.workspace(), c.entity(), rebill, 1).held());
+        assertEquals(before, db.queryForObject("select count(*) from journal_entries where workspace_id=?", Integer.class, c.workspace()));
+        assertEquals(new BigDecimal("1.000000"), db.queryForObject(
+                "select quantity from inventory_valuation_pools where workspace_id=? and entity_id=? and product_id=?",
+                BigDecimal.class, c.workspace(), c.entity(), fixture.product()));
+        assertEquals(zero, db.queryForObject(
+                "select value from inventory_valuation_pools where workspace_id=? and entity_id=? and product_id=?",
+                BigDecimal.class, c.workspace(), c.entity(), fixture.product()));
+    }
+
+    private record PurchaseFixture(Context creator, Context checker, long product, long supplierAccount, long receiptLine) {}
+    private PurchaseFixture purchase(BigDecimal quantity, BigDecimal unitCost, BigDecimal discountPct, BigDecimal discountAmount) {
+        var c = context("EUR", "OPERATIONS", "FINANCE");
+        baseline.initialize(c.workspace(), c.entity(), "O2C_GOODS", 1);
+        for (var account : List.of(new String[]{"AP", "LIABILITY"}, new String[]{"GRNI", "LIABILITY"},
+                new String[]{"GAIN", "INCOME"}, new String[]{"LOSS", "EXPENSE"}, new String[]{"SERVICE", "EXPENSE"}))
+            finance.account(c.workspace(), c.entity(), account[0], "Synthetic " + account[0], account[1]);
+        finance.procurementConfig(c.workspace(), c.entity(), 0, accountToken(c, "INVENTORY"), accountToken(c, "AP"),
+                accountToken(c, "GRNI"), accountToken(c, "GAIN"), accountToken(c, "LOSS"), accountToken(c, "SERVICE"));
+        var unit = configuration.list(c.workspace(), c.entity(), ConfigurationService.Kind.UOM, "").get(0);
+        var warehouse = configuration.list(c.workspace(), c.entity(), ConfigurationService.Kind.WAREHOUSE, "").get(0);
+        long product = products.save(c.workspace(), c.entity(), null, null,
+                new ProductService.Input("P2P-" + UUID.randomUUID(), "Arbitrary synthetic purchased component",
+                        "REPLACEMENT_PART", "TRANSFER", unit.id(), unit.version(), "NONE"));
+        products.assign(c.workspace(), c.entity(), product, 1, null, true);
+        long setting = products.setting(c.workspace(), c.entity(), product).version();
+        long request = procurement.saveRequest(c.workspace(), c.entity(), null, null,
+                new ProcurementService.RequestInput(DAY, "Explicit synthetic purchase",
+                        List.of(new ProcurementService.RequestLineInput("REQUEST-LINE", product, 1, setting, unit.version(), quantity))));
+        procurement.submitRequest(c.workspace(), c.entity(), request, 1);
+        denied(403, () -> procurement.decideRequest(c.workspace(), c.entity(), request, 2, true, ""));
+        var checker = peer(c, "FINANCE");
+        procurement.decideRequest(c.workspace(), c.entity(), request, 2, true, "");
+        actor(c.user());
+        long requestLine = procurement.requestLines(c.workspace(), c.entity(), request).get(0).id();
+        var supplier = procurement.supplierChoices(c.workspace(), c.entity()).get(0);
+        long supplierId = ((Number) supplier.get("id")).longValue();
+        long supplierVersion = ((Number) supplier.get("version")).longValue();
+        var tax = procurement.taxChoices(c.workspace(), c.entity()).get(0);
+        long order = procurement.saveOrder(c.workspace(), c.entity(), null, null,
+                new ProcurementService.OrderInput(supplierId, supplierVersion, 1, DAY,
+                        List.of(new ProcurementService.OrderLineInput("ORDER-LINE", requestLine, null, quantity, unitCost,
+                                discountPct, discountAmount, ((Number) tax.get("id")).longValue(), ((Number) tax.get("version")).longValue(), null))));
+        procurement.submitOrder(c.workspace(), c.entity(), order, 1);
+        denied(403, () -> procurement.decideOrder(c.workspace(), c.entity(), order, 2, true, ""));
+        actor(checker.user());
+        procurement.decideOrder(c.workspace(), c.entity(), order, 2, true, "");
+        actor(c.user());
+        long orderLine = ((Number) procurement.orderLines(c.workspace(), c.entity(), order).get(0).get("id")).longValue();
+        long receipt = procurement.saveReceipt(c.workspace(), c.entity(), null, null,
+                new ProcurementService.ReceiptInput(order, 3, "GOODS", DAY.plusDays(1),
+                        List.of(new ProcurementService.ReceiptLineInput("RECEIPT-LINE", orderLine, quantity,
+                                warehouse.id(), warehouse.version(), List.of()))));
+        assertFalse(procurement.postReceipt(c.workspace(), c.entity(), receipt, 1, "SYNTHETIC-RECEIPT").replayed());
+        assertTrue(procurement.postReceipt(c.workspace(), c.entity(), receipt, 1, "SYNTHETIC-RECEIPT").replayed());
+        long receiptLine = ((Number) procurement.receiptLines(c.workspace(), c.entity(), receipt).get(0).get("id")).longValue();
+        return new PurchaseFixture(c, checker, product, supplierId, receiptLine);
+    }
+    private String accountToken(Context c, String code) {
+        var row = db.queryForMap("select id,version from chart_accounts where workspace_id=? and entity_id=? and code=?", c.workspace(), c.entity(), code);
+        return row.get("id") + ":" + row.get("version");
+    }
+
+    private Context peer(Context c, String... roles) {
+        actor(administrator);
+        String login = "peer-" + UUID.randomUUID();
+        identity.createUser(c.workspace(), login, PASSWORD);
+        long user = db.queryForObject("select id from app_users where login=?", Long.class, login);
+        identity.entityGrant(c.workspace(), c.entity(), user, 0, true);
+        for (String role : roles) identity.role(c.workspace(), user, role, 0, true);
+        actor(user);
+        return new Context(c.workspace(), c.entity(), user, login);
     }
 
     private HttpClient signedIn(String login) throws Exception {

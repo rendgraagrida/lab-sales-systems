@@ -93,7 +93,7 @@ def probe(port, revision, pid):
             health = json.loads(reply.read(16385))
             if (reply.status != 200 or not isinstance(health, dict)
                     or health.get('status') != 'UP' or health.get('application') != 'lab-sales-systems'
-                    or health.get('revision') != revision or health.get('schemaVersion') != 3):
+                    or health.get('revision') != revision or health.get('schemaVersion') not in (3, 4)):
                 return False
         with opener.open(Request(origin + '/login'), timeout=1) as reply:
             return (reply.status == 200 and b'Sign in | Lab Sales Systems' in reply.read(16384)

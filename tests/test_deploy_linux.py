@@ -1,7 +1,9 @@
 import copy
 from pathlib import Path
 import sys
+import tempfile
 import unittest
+from unittest import mock
 
 if sys.platform == 'linux':
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
@@ -51,6 +53,46 @@ class RollbackHistoryTests(unittest.TestCase):
                       {'accepted_release': current, 'history': [current, dict(current)]}):
             with self.subTest(state=state), self.assertRaises(deploy_linux.DeployError):
                 deploy_linux.previous_distinct_release(state)
+
+
+@unittest.skipUnless(sys.platform == 'linux', 'Native Linux deployment adapter')
+class SchemaCompatibilityTests(unittest.TestCase):
+    def test_exact_lineage_and_checksum_required(self):
+        cfg = {'database': 'lab'}
+        expected = '1|V1__identity.sql|10,2|V2__masters.sql|20,3|V3__finance.sql|30,4|V4__procurement_inventory_ap.sql|40'
+        for actual, bad, accepted in ((expected, '0', True), (expected.rsplit(',', 1)[0], '0', False),
+                                      (expected.replace('|40', '|41'), '0', False), (expected, '1', False)):
+            with self.subTest(actual=actual, bad=bad), \
+                    mock.patch.object(deploy_linux.release, 'schema_identity', return_value=expected), \
+                    mock.patch.object(deploy_linux, 'run_psql', side_effect=[actual, bad]):
+                if accepted:
+                    deploy_linux.require_schema_compatible(cfg, '/release')
+                else:
+                    with self.assertRaises(deploy_linux.DeployError):
+                        deploy_linux.require_schema_compatible(cfg, '/release')
+
+    def test_failed_rollout_does_not_restart_schema3_release_on_schema4(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            unit = root / 'unit'
+            unit.write_text('old unit', encoding='ascii')
+            previous = {'manifest_sha256': 'a' * 64, 'revision': 'b' * 40, 'run_id': '1'}
+            cfg = {'target_id': 'target', 'database': 'lab'}
+            old_hash = deploy_linux.compute_file_sha256(unit)
+            journal = {'target_id': 'target', 'config_digest': deploy_linux.digest_object(cfg),
+                       'candidate_unit_sha256': 'c' * 64,
+                       'previous_state': {'accepted_release': previous, 'accepted_unit_sha256': old_hash}}
+            paths = {'unit_file': unit, 'releases': root, 'unit_name': 'lab.service',
+                     'pending_journal': root / 'pending'}
+            with mock.patch.object(deploy_linux, 'verify_unit_ownership'), \
+                    mock.patch.object(deploy_linux.release, 'verify_release'), \
+                    mock.patch.object(deploy_linux.release, 'schema_identity', return_value='1|v1|1,2|v2|2,3|v3|3'), \
+                    mock.patch.object(deploy_linux, 'run_psql', side_effect=['1|v1|1,2|v2|2,3|v3|3,4|v4|4', '0']), \
+                    mock.patch.object(deploy_linux, 'systemctl') as systemctl:
+                with self.assertRaises(deploy_linux.DeployError):
+                    deploy_linux.rollback_on_failed_deploy(cfg, paths, journal)
+                systemctl.assert_not_called()
+            self.assertEqual('old unit', unit.read_text(encoding='ascii'))
 
 
 if __name__ == '__main__':

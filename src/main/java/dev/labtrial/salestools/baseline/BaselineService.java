@@ -133,9 +133,10 @@ public class BaselineService {
         db.update("insert into customer_contact_links(workspace_id,customer_id,contact_id,relationship_role) values (?,?,?,?)",w,customer,id,role);
     }
     private void stock(long w,long e,long a,long product,long warehouse,long source,BigDecimal q,BigDecimal v,String line,Long serial,Long lot) {
-        db.update("insert into inventory_balances(workspace_id,entity_id,product_id,warehouse_id,on_hand,value) values (?,?,?,?,?,?)",w,e,product,warehouse,q,v);
+        db.update("insert into inventory_balances(workspace_id,entity_id,product_id,warehouse_id,on_hand) values (?,?,?,?,?)",w,e,product,warehouse,q);
         db.update("insert into inventory_valuation_pools(workspace_id,entity_id,product_id,quantity,value,last_posting_date,pool_sequence) values (?,?,?,?,?,?,1)",w,e,product,q,v,GOODS.cutoff());
-        db.update("insert into stock_movements(workspace_id,entity_id,product_id,warehouse_id,opening_source_id,quantity_delta,value_delta,posting_date,source_line_key,serial_id,lot_id,created_by) values (?,?,?,?,?,?,?,?,?,?,?,?)",w,e,product,warehouse,source,q,v,GOODS.cutoff(),line,serial,lot,a);
+        db.update("insert into stock_movements(workspace_id,entity_id,product_id,warehouse_id,opening_source_id,source_type,source_id,pool_sequence,quantity_delta,value_delta,posting_date,source_line_key,serial_id,lot_id,created_by) values (?,?,?,?,?,'OPENING',?,1,?,?,?,?,?,?,?)",w,e,product,warehouse,source,Long.toString(source),q,v,GOODS.cutoff(),line,serial,lot,a);
+        if (lot != null) db.update("insert into inventory_lot_balances(workspace_id,entity_id,lot_id,warehouse_id,quantity) values (?,?,?,?,?)",w,e,lot,warehouse,q);
     }
     private long id(String sql,Object... args) { return db.queryForObject(sql,Long.class,args); }
 }

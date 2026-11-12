@@ -1,0 +1,4 @@
+<!doctype html><html lang="en" xmlns:th="http://www.thymeleaf.org"><body>
+<th:block th:fragment="input(form,name,index,label,value,type)"><label th:for="${form.id(name,index)}" th:text="${label}"></label><input th:id="${form.id(name,index)}" th:name="${name}" th:type="${type}" th:value="${form.value(name,index,value)}" th:attr="aria-invalid=${form.invalid(name,index) ? 'true' : null},aria-describedby=${form.invalid(name,index) ? form.errorId(name,index) : null}"><p th:replace="~{fragments :: fieldError(${form},${name},${index})}"></p></th:block>
+<th:block th:fragment="selectErrors(form,name,index)"><p th:replace="~{fragments :: fieldError(${form},${name},${index})}"></p></th:block>
+</body></html>

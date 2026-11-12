@@ -36,6 +36,39 @@ class ReleaseBoundaryTests(unittest.TestCase):
         release.package_release(self.app, self.output, REVISION, 'local')
         return hashlib.sha256((self.output / 'release.json').read_bytes()).hexdigest()
 
+    def test_release_requires_and_attests_current_schema_lineage(self):
+        digest = self.package()
+        manifest = release.verify_release(self.output, REVISION, 'local', digest)
+        self.assertEqual(['1', '2', '3', '4'], manifest['schema_versions'])
+        manifest['schema_versions'] = ['1', '2', '3']
+        manifest_path = self.output / 'release.json'
+        manifest_path.write_text(json.dumps(manifest), encoding='ascii')
+        replacement = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        with self.assertRaises(release.ReleaseError):
+            release.verify_release(self.output, REVISION, 'local', replacement)
+
+    def test_new_schema3_release_is_refused(self):
+        with zipfile.ZipFile(self.jar, 'w') as archive:
+            archive.writestr(release.POM, (SCRIPTS.parent / 'pom.xml').read_bytes())
+            for name in release.LEGACY_SQL_NAMES:
+                archive.writestr(release.SQL_PREFIX + name, 'SELECT 1;')
+        app = self.root / 'legacy-application'
+        ci.package(self.jar, app, REVISION, 'local')
+        with self.assertRaises(release.ReleaseError):
+            release.package_release(app, self.output, REVISION, 'local')
+        self.assertFalse(self.output.exists())
+
+    def test_schema_identity_follows_embedded_migrations(self):
+        current = release.schema_identity(self.jar)
+        legacy = self.root / 'legacy.jar'
+        with zipfile.ZipFile(legacy, 'w') as archive:
+            archive.writestr(release.POM, (SCRIPTS.parent / 'pom.xml').read_bytes())
+            for name in release.LEGACY_SQL_NAMES:
+                archive.writestr(release.SQL_PREFIX + name, 'CREATE TABLE example_' + name[:2].lower() + '(id integer);')
+        old_identity = release.schema_identity(legacy)
+        self.assertTrue(current.startswith(old_identity + ',4|'))
+        self.assertNotEqual(current, old_identity)
+
     def test_wrong_identity_digest_and_extra_file_are_rejected(self):
         digest = self.package()
         for revision, run_id, expected_digest in ((REVISION, 'local', '0' * 64), ('b' * 40, 'local', digest), (REVISION, '42', digest)):
