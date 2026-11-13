@@ -3,6 +3,17 @@
     "linear": {
       "type": "http",
       "url": "https://mcp.linear.app/mcp"
+    },
+    "slack": {
+      "type": "http",
+      "url": "https://mcp.slack.com/mcp",
+      "oauth": {
+        "clientId": "12560819386513.12592424612306",
+        "scope": "channels:history channels:read chat:write",
+        "redirectUri": "http://localhost:3334/oauth/callback",
+        "callbackPort": 3334,
+        "callbackPath": "/oauth/callback"
+      }
     }
   }
 }

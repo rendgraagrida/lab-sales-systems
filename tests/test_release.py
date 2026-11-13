@@ -39,7 +39,7 @@ class ReleaseBoundaryTests(unittest.TestCase):
     def test_release_requires_and_attests_current_schema_lineage(self):
         digest = self.package()
         manifest = release.verify_release(self.output, REVISION, 'local', digest)
-        self.assertEqual(['1', '2', '3', '4'], manifest['schema_versions'])
+        self.assertEqual(['1', '2', '3', '4', '5'], manifest['schema_versions'])
         manifest['schema_versions'] = ['1', '2', '3']
         manifest_path = self.output / 'release.json'
         manifest_path.write_text(json.dumps(manifest), encoding='ascii')
@@ -47,16 +47,18 @@ class ReleaseBoundaryTests(unittest.TestCase):
         with self.assertRaises(release.ReleaseError):
             release.verify_release(self.output, REVISION, 'local', replacement)
 
-    def test_new_schema3_release_is_refused(self):
-        with zipfile.ZipFile(self.jar, 'w') as archive:
-            archive.writestr(release.POM, (SCRIPTS.parent / 'pom.xml').read_bytes())
-            for name in release.LEGACY_SQL_NAMES:
-                archive.writestr(release.SQL_PREFIX + name, 'SELECT 1;')
-        app = self.root / 'legacy-application'
-        ci.package(self.jar, app, REVISION, 'local')
-        with self.assertRaises(release.ReleaseError):
-            release.package_release(app, self.output, REVISION, 'local')
-        self.assertFalse(self.output.exists())
+    def test_new_historical_release_is_refused(self):
+        for names in (release.LEGACY_SQL_NAMES, release.V4_SQL_NAMES):
+            with self.subTest(names=names):
+                with zipfile.ZipFile(self.jar, 'w') as archive:
+                    archive.writestr(release.POM, (SCRIPTS.parent / 'pom.xml').read_bytes())
+                    for name in names:
+                        archive.writestr(release.SQL_PREFIX + name, 'SELECT 1;')
+                app = self.root / ('legacy-application-' + str(len(names)))
+                ci.package(self.jar, app, REVISION, 'local')
+                with self.assertRaises(release.ReleaseError):
+                    release.package_release(app, self.output, REVISION, 'local')
+                self.assertFalse(self.output.exists())
 
     def test_schema_identity_follows_embedded_migrations(self):
         current = release.schema_identity(self.jar)
@@ -68,6 +70,39 @@ class ReleaseBoundaryTests(unittest.TestCase):
         old_identity = release.schema_identity(legacy)
         self.assertTrue(current.startswith(old_identity + ',4|'))
         self.assertNotEqual(current, old_identity)
+
+    def test_retained_historical_release_verifies_only_its_own_tuple(self):
+        for names in (release.LEGACY_SQL_NAMES, release.V4_SQL_NAMES):
+            with self.subTest(names=names):
+                jar = self.root / ('historical-' + str(len(names)) + '.jar')
+                with zipfile.ZipFile(jar, 'w') as archive:
+                    archive.writestr(release.POM, (SCRIPTS.parent / 'pom.xml').read_bytes())
+                    for name in names:
+                        archive.writestr(release.SQL_PREFIX + name, 'SELECT 1;')
+                directory = self.root / ('release-' + str(len(names)))
+                directory.mkdir()
+                ci.package(jar, directory / 'app', REVISION, 'local')
+                files = {}
+                for path in (directory / 'app').iterdir():
+                    with path.open('rb') as source:
+                        files['app/' + path.name] = ci.digest_file(source)
+                for relative, data in release.derived(jar).items():
+                    target = directory / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(data)
+                    with target.open('rb') as source:
+                        files[relative] = ci.digest_file(source)
+                manifest = {'schema': 1, 'project': 'lab-sales-systems', 'revision': REVISION,
+                            'run_id': 'local', 'schema_versions': [str(i) for i in range(1, len(names) + 1)],
+                            'files': files}
+                path = directory / 'release.json'
+                path.write_text(json.dumps(manifest), encoding='ascii')
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                self.assertEqual(manifest, release.verify_release(directory, REVISION, 'local', digest))
+                manifest['schema_versions'] = ['1', '2', '3', '4', '5']
+                path.write_text(json.dumps(manifest), encoding='ascii')
+                with self.assertRaises(release.ReleaseError):
+                    release.verify_release(directory, REVISION, 'local', hashlib.sha256(path.read_bytes()).hexdigest())
 
     def test_wrong_identity_digest_and_extra_file_are_rejected(self):
         digest = self.package()

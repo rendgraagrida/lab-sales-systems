@@ -412,8 +412,8 @@ public class InventoryService {
                     serialId=db.queryForObject("insert into instrument_serials(workspace_id,entity_id,product_id,warehouse_id,serial,status) values (?,?,?,?,?,'IN_STOCK') returning id",
                             Long.class,w,e,a.productId(),a.toWarehouseId(),t.serial());
                 } else {
-                    if(Boolean.TRUE.equals(db.queryForObject("select exists(select 1 from inventory_balances where workspace_id=? and entity_id=? and product_id=? and warehouse_id=? and reserved>0)",Boolean.class,w,e,a.productId(),a.fromWarehouseId())))
-                        throw new DomainException(409,"Serial reservations cannot be identified safely");
+                    if(Boolean.TRUE.equals(db.queryForObject("select exists(select 1 from inventory_reservations r join instrument_serials s on s.workspace_id=r.workspace_id and s.entity_id=r.entity_id and s.id=r.serial_id where r.workspace_id=? and r.entity_id=? and s.serial=? and r.released_qty+r.consumed_qty<r.quantity)",Boolean.class,w,e,t.serial())))
+                        throw new DomainException(409,"Serial is reserved for an order");
                     if(serials.size()!=1 || (long)serials.get(0)[1]!=a.productId() || (long)serials.get(0)[2]!=a.fromWarehouseId() || !"IN_STOCK".equals(serials.get(0)[3]))
                         throw new DomainException(409,"Serial is not available in the source warehouse");
                     serialId=(long)serials.get(0)[0];
@@ -556,5 +556,130 @@ public class InventoryService {
     private void movement(AccessControl.Scope scope,long receipt,LocalDate date,Source s,long sequence,String key,BigDecimal q,BigDecimal value,Long serial,Long lot) {
         db.update("insert into stock_movements(workspace_id,entity_id,product_id,warehouse_id,source_type,source_id,pool_sequence,quantity_delta,value_delta,posting_date,source_line_key,serial_id,lot_id,created_by) values (?,?,?,?,'RECEIPT',?,?,?,?,?,?,?,?,?)",scope.workspaceId(),scope.entityId(),s.product(),s.warehouse(),Long.toString(receipt),sequence,q,value,date,key,serial,lot,scope.actor().id());
     }
+    /** Reserve stock for one order line; the caller holds the order-line lock. */
+    @Transactional(propagation=Propagation.MANDATORY)
+    public long reserveOrderStock(AccessControl.Scope scope,long line,long product,long warehouse,String tracking,
+                                  Long serial,Long lot,BigDecimal quantity,String key,String hash) {
+        if(scope==null || scope.entityId()==null || scope.actor()==null) throw new DomainException(403,"Entity context required");
+        var current=access.requireContext(scope.workspaceId(),scope.entityId(),true,"OPERATIONS");
+        if(current.actor().id()!=scope.actor().id()) throw new DomainException(403,"Invalid actor");
+        if(quantity==null || quantity.signum()<=0) throw new DomainException(400,"Invalid reservation quantity");
+        long w=scope.workspaceId(),e=scope.entityId();
+        checkOrderStockShape(w,e,line,product,tracking);
+        LocalDate date=db.queryForObject("select business_date from scenario_workspaces where id=?",LocalDate.class,w);
+        if ("SERIAL".equals(tracking)) {
+            if(serial==null || lot!=null || quantity.compareTo(BigDecimal.ONE)!=0 ||
+               !Boolean.TRUE.equals(db.queryForObject("select exists(select 1 from instrument_serials s where s.workspace_id=? and s.entity_id=? and s.id=? and s.product_id=? and s.warehouse_id=? and s.status='IN_STOCK' and not exists(select 1 from inventory_reservations r where r.workspace_id=s.workspace_id and r.entity_id=s.entity_id and r.serial_id=s.id and r.released_qty+r.consumed_qty<r.quantity))",Boolean.class,w,e,serial,product,warehouse)))
+                throw new DomainException(409,"Serial is unavailable");
+        } else if ("LOT".equals(tracking) || "LOT_EXPIRY".equals(tracking)) {
+            if(lot==null || serial!=null || !Boolean.TRUE.equals(db.queryForObject("select exists(select 1 from inventory_lots where workspace_id=? and entity_id=? and id=? and product_id=? and (?='LOT' and expires_on is null or ?='LOT_EXPIRY' and expires_on>?))",Boolean.class,w,e,lot,product,tracking,tracking,date)))
+                throw new DomainException(409,"Lot is unavailable or expired");
+            if(db.update("update inventory_lot_balances set reserved=reserved+?,version=version+1 where workspace_id=? and entity_id=? and lot_id=? and warehouse_id=? and quantity-reserved>=?",quantity,w,e,lot,warehouse,quantity)!=1)
+                throw new DomainException(409,"Insufficient unreserved lot stock");
+        } else if (!"NONE".equals(tracking) || serial!=null || lot!=null) throw new DomainException(400,"Invalid tracking selection");
+        if(db.update("update inventory_balances set reserved=reserved+?,version=version+1 where workspace_id=? and entity_id=? and product_id=? and warehouse_id=? and on_hand-reserved>=?",quantity,w,e,product,warehouse,quantity)!=1)
+            throw new DomainException(409,"Insufficient unreserved warehouse stock");
+        long id=db.queryForObject("insert into inventory_reservations(workspace_id,entity_id,order_line_id,product_id,warehouse_id,serial_id,lot_id,quantity,intent_key,intent_hash,created_by) values (?,?,?,?,?,?,?,?,?,?,?) returning id",Long.class,w,e,line,product,warehouse,serial,lot,quantity,key,hash,scope.actor().id());
+        db.update("insert into inventory_reservation_events(workspace_id,entity_id,reservation_id,kind,quantity,intent_key,intent_hash,created_by) values (?,?,?,'RESERVE',?,?,?,?)",w,e,id,quantity,key,hash,scope.actor().id());
+        return id;
+    }
+
+    public record ReservationPart(long reservationId, BigDecimal quantity, String eventKey, String intentHash) {}
+
+    /** Price one shipment line from the current pool, then allocate its cost across exact tracking rows. */
+    @Transactional(propagation=Propagation.MANDATORY)
+    public BigDecimal issueOrderStock(AccessControl.Scope scope,long product,long warehouse,long orderLine,long shipment,
+                                      LocalDate date,List<ReservationPart> parts) {
+        if(scope==null || scope.entityId()==null || scope.actor()==null) throw new DomainException(403,"Entity context required");
+        var current=access.requireContext(scope.workspaceId(),scope.entityId(),true,"OPERATIONS");
+        if(current.actor().id()!=scope.actor().id()) throw new DomainException(403,"Invalid actor");
+        if(date==null || parts==null || parts.isEmpty()) throw new DomainException(400,"Shipment tracking required");
+        long w=scope.workspaceId(),e=scope.entityId();
+        checkOrderStockShape(w,e,orderLine,product,null);
+        BigDecimal total=BigDecimal.ZERO;
+        Set<Long> seen=new HashSet<>();
+        for(var part:parts) {
+            if(part==null || part.quantity()==null || part.quantity().signum()<=0 || !seen.add(part.reservationId())) throw new DomainException(400,"Invalid shipment reservation");
+            if(!Boolean.TRUE.equals(db.queryForObject("select exists(select 1 from inventory_reservations where workspace_id=? and entity_id=? and id=? and product_id=? and warehouse_id=? and order_line_id=?)",Boolean.class,w,e,part.reservationId(),product,warehouse,orderLine)))
+                throw new DomainException(409,"Reservation does not belong to shipment source");
+            total=total.add(part.quantity());
+        }
+        var pools=db.queryForList("select quantity,value,last_posting_date from inventory_valuation_pools where workspace_id=? and entity_id=? and product_id=? for update",w,e,product);
+        if(pools.size()!=1) throw new DomainException(409,"Stock pool unavailable");
+        var pool=pools.get(0); BigDecimal q=(BigDecimal)pool.get("quantity"),v=(BigDecimal)pool.get("value");
+        LocalDate watermark=pool.get("last_posting_date") instanceof java.sql.Date sd ? sd.toLocalDate() : (LocalDate)pool.get("last_posting_date");
+        if(q.compareTo(total)<0 || date.isBefore(watermark)) throw new DomainException(409,"Insufficient stock or posting before stock watermark");
+        BigDecimal cost=q.compareTo(total)==0?v:v.multiply(total).divide(q,2,RoundingMode.HALF_UP);
+        BigDecimal cumulative=BigDecimal.ZERO,assigned=BigDecimal.ZERO;
+        for(var part:parts) {
+            cumulative=cumulative.add(part.quantity());
+            BigDecimal allocated=cost.multiply(cumulative).divide(total,2,RoundingMode.HALF_UP).subtract(assigned);
+            assigned=assigned.add(allocated);
+            applyOrderReservationInternal(scope,part.reservationId(),part.quantity(),true,date,shipment,part.eventKey(),part.intentHash(),allocated);
+        }
+        return cost;
+    }
+    private void checkOrderStockShape(long w,long e,long line,long product,String expectedTracking) {
+        var sources=db.query("select tracking,uom_id,quantity_scale from sales_order_lines where workspace_id=? and entity_id=? and id=? and product_id=? for update",
+                (r,n)->new Object[]{r.getString(1),r.getLong(2),r.getInt(3)},w,e,line,product);
+        if(sources.size()!=1 || (expectedTracking!=null && !expectedTracking.equals(sources.get(0)[0])))
+            throw new DomainException(409,"Order stock source changed");
+        var source=sources.get(0);
+        ensureHistoricalShape(w,e,product,(String)source[0],(long)source[1],(int)source[2]);
+    }
+
+    /** Release or consume a persisted reservation, updating the corresponding exact tracking balance. */
+    @Transactional(propagation=Propagation.MANDATORY)
+    public BigDecimal applyOrderReservation(AccessControl.Scope scope,long reservation,BigDecimal quantity,
+                                            boolean consume,LocalDate date,long shipment,String eventKey,String hash) {
+        if(consume) throw new DomainException(400,"Shipment issue requires complete tracking allocation");
+        return applyOrderReservationInternal(scope,reservation,quantity,false,date,shipment,eventKey,hash,null);
+    }
+    private BigDecimal applyOrderReservationInternal(AccessControl.Scope scope,long reservation,BigDecimal quantity,
+                                            boolean consume,LocalDate date,long shipment,String eventKey,String hash,BigDecimal allocatedCost) {
+        if(scope==null || scope.entityId()==null || scope.actor()==null) throw new DomainException(403,"Entity context required");
+        var current=access.requireContext(scope.workspaceId(),scope.entityId(),true,"OPERATIONS");
+        if(current.actor().id()!=scope.actor().id()) throw new DomainException(403,"Invalid actor");
+        long w=scope.workspaceId(),e=scope.entityId();
+        var rows=db.queryForList("select * from inventory_reservations where workspace_id=? and entity_id=? and id=? for update",w,e,reservation);
+        if(rows.size()!=1 || quantity==null || quantity.signum()<=0) throw new DomainException(409,"Reservation unavailable");
+        var r=rows.get(0);
+        BigDecimal remaining=((BigDecimal)r.get("quantity")).subtract((BigDecimal)r.get("released_qty")).subtract((BigDecimal)r.get("consumed_qty"));
+        if(remaining.compareTo(quantity)<0) throw new DomainException(409,"Reservation quantity changed");
+        long product=((Number)r.get("product_id")).longValue(), warehouse=((Number)r.get("warehouse_id")).longValue();
+        Long serial=(Long)r.get("serial_id"),lot=(Long)r.get("lot_id");
+        if(serial!=null && quantity.compareTo(BigDecimal.ONE)!=0) throw new DomainException(400,"Serial quantity must be one");
+        BigDecimal cost=BigDecimal.ZERO.setScale(2);
+        if(consume) {
+            if(date==null) throw new DomainException(400,"Shipment date required");
+            var pool=db.queryForList("select quantity,value,last_posting_date,pool_sequence from inventory_valuation_pools where workspace_id=? and entity_id=? and product_id=? for update",w,e,product);
+            if(pool.size()!=1) throw new DomainException(409,"Stock pool unavailable");
+            var p=pool.get(0); BigDecimal q=(BigDecimal)p.get("quantity"),v=(BigDecimal)p.get("value");
+            LocalDate watermark=p.get("last_posting_date") instanceof java.sql.Date sd ? sd.toLocalDate() : (LocalDate)p.get("last_posting_date");
+            if(q.compareTo(quantity)<0 || date.isBefore(watermark)) throw new DomainException(409,"Insufficient stock or posting before stock watermark");
+            cost=allocatedCost;
+            if(cost==null || cost.signum()<0 || cost.compareTo(v)>0) throw new DomainException(409,"Invalid allocated stock value");
+            long seq=Math.addExact(((Number)p.get("pool_sequence")).longValue(),1);
+            if(lot!=null && !Boolean.TRUE.equals(db.queryForObject("select exists(select 1 from inventory_lots where workspace_id=? and entity_id=? and id=? and (expires_on is null or expires_on>? and expires_on>(select business_date from scenario_workspaces where id=?)))",Boolean.class,w,e,lot,date,w)))
+                throw new DomainException(409,"Lot expired");
+            if(serial!=null && db.update("update instrument_serials set status='ISSUED' where workspace_id=? and entity_id=? and id=? and product_id=? and warehouse_id=? and status='IN_STOCK'",w,e,serial,product,warehouse)!=1)
+                throw new DomainException(409,"Serial unavailable");
+            db.update("update inventory_valuation_pools set quantity=quantity-?,value=value-?,last_posting_date=?,pool_sequence=? where workspace_id=? and entity_id=? and product_id=?",quantity,cost,date,seq,w,e,product);
+            db.update("insert into stock_movements(workspace_id,entity_id,product_id,warehouse_id,source_type,source_id,pool_sequence,quantity_delta,value_delta,posting_date,source_line_key,serial_id,lot_id,created_by) values (?,?,?,?,'SHIPMENT',?,?,?,?,?,?,?,?,?)",w,e,product,warehouse,Long.toString(shipment),seq,quantity.negate(),cost.negate(),date,eventKey,serial,lot,scope.actor().id());
+        }
+        String balance=consume?"on_hand=on_hand-?,reserved=reserved-?":"reserved=reserved-?";
+        int changed=consume?db.update("update inventory_balances set "+balance+",version=version+1 where workspace_id=? and entity_id=? and product_id=? and warehouse_id=? and reserved>=? and on_hand>=?",quantity,quantity,w,e,product,warehouse,quantity,quantity):
+            db.update("update inventory_balances set "+balance+",version=version+1 where workspace_id=? and entity_id=? and product_id=? and warehouse_id=? and reserved>=?",quantity,w,e,product,warehouse,quantity);
+        if(changed!=1) throw new DomainException(409,"Reservation balance changed");
+        if(lot!=null) {
+            changed=consume?db.update("update inventory_lot_balances set quantity=quantity-?,reserved=reserved-?,version=version+1 where workspace_id=? and entity_id=? and lot_id=? and warehouse_id=? and reserved>=? and quantity>=?",quantity,quantity,w,e,lot,warehouse,quantity,quantity):
+                db.update("update inventory_lot_balances set reserved=reserved-?,version=version+1 where workspace_id=? and entity_id=? and lot_id=? and warehouse_id=? and reserved>=?",quantity,w,e,lot,warehouse,quantity);
+            if(changed!=1) throw new DomainException(409,"Lot reservation balance changed");
+        }
+        db.update("update inventory_reservations set "+(consume?"consumed_qty":"released_qty")+"="+(consume?"consumed_qty":"released_qty")+"+?,version=version+1 where workspace_id=? and entity_id=? and id=?",quantity,w,e,reservation);
+        db.update("insert into inventory_reservation_events(workspace_id,entity_id,reservation_id,kind,quantity,intent_key,intent_hash,created_by) values (?,?,?,?,?,?,?,?)",w,e,reservation,consume?"CONSUME":"RELEASE",quantity,eventKey,hash,scope.actor().id());
+        return cost;
+    }
+
     private static boolean equal(BigDecimal a,BigDecimal b) { return a!=null && b!=null && a.compareTo(b)==0; }
 }

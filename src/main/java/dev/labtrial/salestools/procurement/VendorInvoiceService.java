@@ -37,13 +37,19 @@ public class VendorInvoiceService {
     private Map<String,Object> source(long w,long e,long id) {
         var rows=db.queryForList("""
             select rl.*,ol.quantity as source_quantity,ol.quantity_scale,ol.tracking,ol.unit_cost,ol.subtotal as source_subtotal,ol.discount as source_discount,ol.net as source_net,ol.tax as source_tax,ol.gross as source_gross,ol.tax_rate_pct,ol.input_account_id,ol.discount_pct as source_discount_pct,
-                   r.supplier_account_id,rev.currency,rev.terms_days,rev.grni_account_id,rev.ap_account_id,rev.config_version,rc.posting_date as receipt_date
+                   r.supplier_account_id,rev.currency,rev.terms_days,rev.grni_account_id,rev.ap_account_id,rev.inventory_account_id,rev.config_version,rc.posting_date as receipt_date,
+                   exists(select 1 from payment_posting_config p where p.workspace_id=ol.workspace_id and p.entity_id=ol.entity_id and p.bank_account_id=ol.input_account_id) as bank_role_conflict
             from procurement_receipt_lines rl join procurement_receipts rc on rc.workspace_id=rl.workspace_id and rc.entity_id=rl.entity_id and rc.id=rl.receipt_id
             join purchase_orders r on r.workspace_id=rc.workspace_id and r.entity_id=rc.entity_id and r.id=rc.order_id
             join purchase_order_lines ol on ol.workspace_id=rl.workspace_id and ol.entity_id=rl.entity_id and ol.id=rl.order_line_id
             join purchase_order_revisions rev on rev.workspace_id=ol.workspace_id and rev.entity_id=ol.entity_id and rev.id=ol.revision_id
             where rl.workspace_id=? and rl.entity_id=? and rl.id=? and rl.active and rc.status='POSTED' and rev.status='APPROVED'
-            """,w,e,id); if(rows.isEmpty()) throw new DomainException(404,"Receipt source not found"); return rows.get(0);
+            """,w,e,id);
+        if(rows.isEmpty()) throw new DomainException(404,"Receipt source not found");
+        var source=rows.get(0);
+        if(n(source.get("input_account_id"))==n(source.get("inventory_account_id")) || Boolean.TRUE.equals(source.get("bank_role_conflict")))
+            throw new DomainException(409,"Receipt Input Tax snapshot conflicts with Inventory or Bank; source correction is required");
+        return source;
     }
     @Transactional(readOnly=true) public List<Map<String,Object>> list(long w,long e,String q,String status) { access.requireContext(w,e,false,"OPERATIONS","FINANCE"); if(!List.of("","DRAFT","HELD_FOR_REVIEW","POSTED").contains(status)) throw new DomainException(400,"Invalid invoice status"); return db.queryForList("select * from vendor_invoices where workspace_id=? and entity_id=? and reference like ? and (?='' or status=?) order by id desc",w,e,"%"+(q==null?"":q)+"%",status,status); }
     @Transactional(readOnly=true) public Map<String,Object> detail(long w,long e,long id) { access.requireContext(w,e,false,"OPERATIONS","FINANCE"); return invoice(w,e,id); }

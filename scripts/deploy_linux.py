@@ -559,13 +559,15 @@ def action_migrate(cfg, release_dir, revision, run_id, manifest_sha):
         # Check service status:
         main_pid, state = get_systemd_main_pid(paths['unit_name'])
         is_running = (state == 'active' and main_pid > 0)
+        if not is_running and (main_pid or state not in ('inactive', 'failed')):
+            fail('Service state is not safely inactive')
 
         history_exists = run_psql(cfg, "SELECT to_regclass('app.flyway_schema_history') IS NOT NULL;", db_name=cfg['database'])
         applied_versions = ''
         if history_exists == 't':
             applied_versions = run_psql(cfg, "SELECT COALESCE(string_agg(version, ',' ORDER BY installed_rank), '') FROM app.flyway_schema_history WHERE success AND type='SQL';", db_name=cfg['database'])
-            bad = run_psql(cfg, "SELECT count(*) FROM app.flyway_schema_history WHERE NOT success OR type NOT IN ('SQL','SCHEMA') OR (type='SQL' AND (version IS NULL OR version NOT IN ('1','2','3','4')));", db_name=cfg['database'])
-            if applied_versions not in ('1,2,3', '1,2,3,4') or bad != '0':
+            bad = run_psql(cfg, "SELECT count(*) FROM app.flyway_schema_history WHERE NOT success OR type NOT IN ('SQL','SCHEMA') OR (type='SQL' AND (version IS NULL OR script IS NULL OR checksum IS NULL OR (version,script) NOT IN (('1','V1__identity.sql'),('2','V2__masters.sql'),('3','V3__finance.sql'),('4','V4__procurement_inventory_ap.sql'),('5','V5__local_crm_goods_o2c.sql'))));", db_name=cfg['database'])
+            if applied_versions not in ('1,2,3,4', '1,2,3,4,5') or bad != '0':
                 fail('Partial or unexpected Flyway history')
         else:
             objects = run_psql(cfg, "SELECT (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='app') + (SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='app') + (SELECT count(*) FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace WHERE n.nspname='app' AND t.typrelid=0);", db_name=cfg['database'])
@@ -580,18 +582,18 @@ def action_migrate(cfg, release_dir, revision, run_id, manifest_sha):
         )
         if foreign_schemas != '0':
             fail("Foreign or unowned tables found in database; refusing migration")
-        if applied_versions != '1,2,3,4' and is_running:
+        if applied_versions != '1,2,3,4,5' and (main_pid or state not in ('inactive', 'failed')):
             fail('Service must be inactive for schema migration')
         dest = paths['releases'] / manifest_sha
         copy_release_immutable(Path(release_dir), dest)
         release.verify_release(str(dest), revision, run_id, manifest_sha)
         release_dir = str(dest)
 
-        if applied_versions == '1,2,3,4':
+        if applied_versions == '1,2,3,4,5':
             run_flyway(cfg, Path(release_dir) / 'migration' / 'pom.xml', ['flyway:validate'])
         else:
-            if applied_versions == '1,2,3':
-                run_flyway(cfg, Path(release_dir) / 'migration' / 'pom.xml', ['-Dflyway.target=3', 'flyway:validate'])
+            if applied_versions == '1,2,3,4':
+                run_flyway(cfg, Path(release_dir) / 'migration' / 'pom.xml', ['-Dflyway.target=4', 'flyway:validate'])
             run_flyway(cfg, Path(release_dir) / 'migration' / 'pom.xml', ['flyway:migrate', 'flyway:validate'])
         require_schema_compatible(cfg, release_dir)
 
@@ -1038,6 +1040,14 @@ def rollback_on_failed_deploy(cfg, paths, journal):
     if previous:
         sha, revision, run_id = previous['manifest_sha256'], previous['revision'], previous['run_id']
         dest = paths['releases'] / sha
+        # Never leave a failed candidate running when its predecessor cannot use the migrated schema.
+        if unit.exists() and compute_file_sha256(unit) == journal['candidate_unit_sha256']:
+            pid, status = get_systemd_main_pid(paths['unit_name'])
+            if pid or status not in ('inactive', 'failed'):
+                systemctl('stop', paths['unit_name'])
+                pid, status = get_systemd_main_pid(paths['unit_name'])
+            if pid or status not in ('inactive', 'failed'):
+                fail('Cannot prove failed candidate service is stopped')
         previous_meta = release.verify_release(str(dest), revision, run_id, sha)
         require_schema_compatible(cfg, dest)
         text = render_systemd_unit(cfg, dest / 'app' / 'application.jar', revision)

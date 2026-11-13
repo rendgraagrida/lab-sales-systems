@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en" xmlns:th="http://www.thymeleaf.org">
+<head th:replace="~{fragments :: head('Sales posting accounts')}"></head>
+<body>
+<header th:replace="~{fragments :: header('Sales posting accounts')}"></header>
+<main id="main">
+<p>Finance defines the accounting roles used by accepted orders, goods shipment, billing and customer receipts. Inventory and Bank reuse the procurement and payment mappings; they are not duplicated here.</p>
+<p><a th:href="${contextBase + '/finance'}">Back to Finance setup</a></p>
+<form method="post" th:action="${action}" th:with="form=${feedback.form('sales-config',action)}">
+<section th:replace="~{fragments :: formErrors(${form})}"></section>
+<input type="hidden" name="version" th:value="${form.value('version',configuration == null ? 0 : configuration.version)}">
+<div th:each="i : ${#numbers.sequence(0,3)}" th:with="fields=${ {'arAccount','unbilledAccount','revenueAccount','cogsAccount'} }, labels=${ {'Accounts receivable (asset)','Unbilled receivable (asset)','Goods revenue (income)','Cost of goods sold (expense)'} }, columns=${ {'ar_account_id','unbilled_account_id','revenue_account_id','cogs_account_id'} }, field=${fields[i]}, missing=${form.submitted() and form.missingChoice(field,accounts.![id + ':' + version])}">
+<label th:for="${form.id(field)}" th:text="${labels[i]}"></label>
+<select th:id="${form.id(field)}" th:name="${field}" required th:attr="aria-invalid=${form.invalid(field) or missing ? 'true' : null},aria-describedby=${form.invalid(field) ? form.errorId(field) : (missing ? form.id(field)+'-reference' : null)}">
+<option value="">Choose account</option>
+<option th:if="${missing}" th:value="${form.value(field,'')}" selected>Previously submitted selection (changed or unavailable)</option>
+<option th:each="account : ${accounts}" th:value="${account.id + ':' + account.version}" th:selected="${form.selected(field,account.id + ':' + account.version,configuration != null and account.id == configuration.get(columns[i]) ? account.id + ':' + account.version : '')}" th:text="${account.code + ' - ' + account.name + ' (' + account.account_type + (account.active ? ')' : ', inactive)')}"></option>
+</select>
+<p th:replace="~{fragments :: fieldError(${form},${field},0)}"></p>
+<p th:if="${missing}" th:id="${form.id(field)+'-reference'}" role="note">The original reference and version are retained. Choose a current authorized account explicitly before saving.</p>
+</div>
+<p>All four roles must be distinct. AR and Unbilled cannot share Bank, Inventory or Input Tax. Goods revenue and COGS cannot be adjustment or service-expense accounts. Booked source mappings cannot be rewritten.</p>
+<button type="submit">Save sales posting accounts</button>
+</form>
+<section th:replace="~{fragments :: formFallback(${feedback})}"></section>
+</main>
+<footer th:replace="~{fragments :: footer()}"></footer>
+</body>
+</html>

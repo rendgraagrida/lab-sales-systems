@@ -54,6 +54,8 @@ public class Ledger {
             if (count == null || count != 1) throw new DomainException(400, "Invalid account", "accountId["+i+"]");
             Integer controls = db.queryForObject("select count(*) from procurement_posting_config where workspace_id=? and entity_id=? and ? in (inventory_account_id,ap_account_id,grni_account_id)", Integer.class, workspaceId, entityId, line.accountId());
             if (controls != null && controls > 0) throw new DomainException(400, "Control accounts require a typed opening source", "accountId["+i+"]");
+            Integer salesControls=db.queryForObject("select count(*) from sales_posting_config where workspace_id=? and entity_id=? and ? in (ar_account_id,unbilled_account_id)",Integer.class,workspaceId,entityId,line.accountId());
+            if(salesControls!=null&&salesControls>0) throw new DomainException(400,"AR and Unbilled require typed opening sources","accountId["+i+"]");
         }
         db.update("insert into document_sequences(workspace_id,entity_id,document_type,next_value) values (?,?,'OPENING',1) on conflict (workspace_id,entity_id,document_type) do nothing", workspaceId, entityId);
         Long sequence = db.queryForObject("update document_sequences set next_value=next_value+1,version=version+1 where workspace_id=? and entity_id=? and document_type='OPENING' returning next_value-1", Long.class, workspaceId, entityId);

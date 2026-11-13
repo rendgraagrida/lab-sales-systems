@@ -28,7 +28,7 @@ public class PriceBookController implements FormController {
             return id==null ? create(ws,entity,model) : edit(ws,entity,id,model);
         }
         long id=FormController.path(request,"id");
-        if(path.equals(root+"/"+id+"/deactivate") || path.equals(root+"/"+id+"/line"))
+        if(path.equals(root+"/"+id+"/deactivate") || path.equals(root+"/"+id+"/line") || path.equals(root+"/"+id+"/approve"))
             return detail(ws,entity,id,model);
         throw new DomainException(400,"Unknown form");
     }
@@ -43,6 +43,13 @@ public class PriceBookController implements FormController {
     @PostMapping("/save") public String save(@PathVariable long workspaceId,@PathVariable long entityId,@RequestParam Map<String,String> p){allowed(p,Set.of("_csrf","id","version","code","name","currency","validFrom","validTo"));long id=service.save(workspaceId,entityId,number(p.get("id")),number(p.get("version")),p.get("code"),p.get("name"),p.get("currency"),date(p.get("validFrom"), "Valid from","validFrom"),date(p.get("validTo"), "Valid to","validTo"));return "redirect:"+base(workspaceId,entityId)+"/"+id;}
     @PostMapping("/{id}/line") public String line(@PathVariable long workspaceId,@PathVariable long entityId,@PathVariable long id,@RequestParam Map<String,String> p){allowed(p,Set.of("_csrf","bookVersion","product","lineVersion","amount"));Long bv=number(p.get("bookVersion")),lv=number(p.get("lineVersion"));String raw=p.get("product");String[] parts=raw==null?new String[0]:raw.split(":",-1);if (bv == null) throw new DomainException(400,"Versions required"); else if (parts.length != 2) throw new DomainException(400,"Product required","product");Long product=number(parts[0], "product"),pv=number(parts[1], "product");if(product==null||pv==null)throw new DomainException(400,"Product required","product");String a=p.get("amount");BigDecimal amount;try{if(a==null||a.length()>40)throw new NumberFormatException();amount=new BigDecimal(a);}catch(NumberFormatException e){throw new DomainException(400,"Invalid amount","amount");}service.line(workspaceId,entityId,id,bv,product,pv,lv,amount);return "redirect:"+base(workspaceId,entityId)+"/"+id;}
     @PostMapping("/{id}/deactivate") public String deactivate(@PathVariable long workspaceId,@PathVariable long entityId,@PathVariable long id,@RequestParam Map<String,String> p){allowed(p,Set.of("_csrf","version"));Long v=number(p.get("version"));if(v==null)throw new DomainException(400,"Version required");service.deactivate(workspaceId,entityId,id,v);return "redirect:"+base(workspaceId,entityId)+"/"+id;}
+    @PostMapping("/{id}/approve") public String approve(@PathVariable long workspaceId,@PathVariable long entityId,@PathVariable long id,@RequestParam Map<String,String> p) {
+        allowed(p,Set.of("_csrf","version"));
+        Long version=number(p.get("version"));
+        if(version==null) throw new DomainException(400,"Version required");
+        service.approve(workspaceId,entityId,id,version);
+        return "redirect:"+base(workspaceId,entityId)+"/"+id;
+    }
     private static void allowed(Map<String,String> p,Set<String> fields){if(p.keySet().stream().anyMatch(key -> !key.equals("_form") && !fields.contains(key)))throw new DomainException(400,"Unexpected field");}
     private static Long number(String v,String field){try{return number(v);}catch(DomainException e){throw new DomainException(400,"Invalid number",field);}}
     private static Long number(String v){if(v==null||v.isBlank())return null;try{return Long.valueOf(v);}catch(NumberFormatException e){throw new DomainException(400,"Invalid number");}}

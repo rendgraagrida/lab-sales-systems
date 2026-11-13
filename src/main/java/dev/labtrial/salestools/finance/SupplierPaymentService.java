@@ -78,7 +78,8 @@ public class SupplierPaymentService {
         }
         var config=db.queryForList("""
             select p.bank_account_id,p.version as config_version,a.version as bank_version,a.active as bank_active,
-                   (select c.inventory_account_id from procurement_posting_config c where c.workspace_id=p.workspace_id and c.entity_id=p.entity_id) as inventory_account_id
+                   (select c.inventory_account_id from procurement_posting_config c where c.workspace_id=p.workspace_id and c.entity_id=p.entity_id) as inventory_account_id,
+                   exists(select 1 from tax_versions t where t.workspace_id=p.workspace_id and t.entity_id=p.entity_id and t.input_account_id=p.bank_account_id) as tax_role_conflict
             from payment_posting_config p join chart_accounts a on a.workspace_id=p.workspace_id and a.entity_id=p.entity_id and a.id=p.bank_account_id
             where p.workspace_id=? and p.entity_id=?
             """,w,e);
@@ -88,6 +89,7 @@ public class SupplierPaymentService {
         Long mappedInventory=config.get(0).get("inventory_account_id")==null ? null : number(config.get(0).get("inventory_account_id"));
         if(bank==ap) throw new DomainException(400,"Bank and AP accounts must differ");
         if(mappedInventory!=null && bank==mappedInventory.longValue()) throw new DomainException(400,"Bank and Inventory accounts must differ");
+        if(Boolean.TRUE.equals(config.get(0).get("tax_role_conflict"))) throw new DomainException(400,"Bank and Input Tax accounts must differ");
         boolean creating=id==null;
         if(creating) {
             if(!db.queryForList("select id from supplier_payments where workspace_id=? and entity_id=? and payment_key=?",w,e,draft.paymentKey().trim()).isEmpty()) throw new DomainException(409,"Payment reference already exists");
@@ -111,7 +113,8 @@ public class SupplierPaymentService {
         var current=db.queryForList("""
             select s.version as supplier_version,s.active as supplier_active,
                    a.version as bank_version,a.active as bank_active,p.version as config_version,p.bank_account_id,
-                   (select c.inventory_account_id from procurement_posting_config c where c.workspace_id=s.workspace_id and c.entity_id=s.entity_id) as inventory_account_id
+                   (select c.inventory_account_id from procurement_posting_config c where c.workspace_id=s.workspace_id and c.entity_id=s.entity_id) as inventory_account_id,
+                   exists(select 1 from tax_versions t where t.workspace_id=s.workspace_id and t.entity_id=s.entity_id and t.input_account_id=p.bank_account_id) as tax_role_conflict
             from supplier_entity_accounts s join payment_posting_config p on p.workspace_id=s.workspace_id and p.entity_id=s.entity_id
             join chart_accounts a on a.workspace_id=p.workspace_id and a.entity_id=p.entity_id and a.id=p.bank_account_id
             where s.workspace_id=? and s.entity_id=? and s.id=?
@@ -125,6 +128,7 @@ public class SupplierPaymentService {
         Long currentInventory=current.get(0).get("inventory_account_id")==null ? null : number(current.get(0).get("inventory_account_id"));
         if(currentInventory!=null && number(p.get("bank_account_id"))==currentInventory.longValue())
             throw new DomainException(400,"Bank and Inventory accounts must differ");
+        if(Boolean.TRUE.equals(current.get(0).get("tax_role_conflict"))) throw new DomainException(400,"Bank and Input Tax accounts must differ");
         var allocations=db.queryForList("select invoice_id,amount from supplier_payment_allocations where workspace_id=? and entity_id=? and payment_id=? and active order by invoice_id",w,e,id);
         if(allocations.isEmpty() || allocations.size()>100) throw new DomainException(400,"Allocation required");
         BigDecimal sum=BigDecimal.ZERO; LocalDate date=((java.sql.Date)p.get("payment_date")).toLocalDate();
