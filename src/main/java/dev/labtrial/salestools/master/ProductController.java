@@ -26,7 +26,7 @@ public class ProductController implements FormController {
             return edit(ws,entity,id,model);
         }
         long id=FormController.path(request,"id");
-        if(path.equals(root+"/"+id+"/deactivate") || path.equals(root+"/"+id+"/setting"))
+        if(path.equals(root+"/"+id+"/deactivate") || path.equals(root+"/"+id+"/setting") || path.equals(root+"/"+id+"/publish"))
             return detail(ws,entity,id,model);
         throw new DomainException(400,"Unknown form");
     }
@@ -49,6 +49,13 @@ public class ProductController implements FormController {
     @PostMapping("/save") public String save(@PathVariable long workspaceId,@PathVariable long entityId,@RequestParam Map<String,String> p){allowed(p,Set.of("_csrf","id","version","sku","name","category","productLine","unit","tracking"));String unit=p.get("unit");String[] u=unit==null?new String[0]:unit.split(":",-1);if(u.length!=2)throw new DomainException(400,"Unit is required","unit");Long uid=number(u[0], "unit"),uv=number(u[1], "unit");if(uid==null||uv==null)throw new DomainException(400,"Unit is required","unit");long id=service.save(workspaceId,entityId,number(p.get("id")),number(p.get("version")),new ProductService.Input(p.get("sku"),p.get("name"),p.get("category"),p.get("productLine"),uid,uv,p.get("tracking")));return "redirect:"+base(workspaceId,entityId)+"/"+id;}
     @PostMapping("/{id}/deactivate") public String deactivate(@PathVariable long workspaceId,@PathVariable long entityId,@PathVariable long id,@RequestParam Map<String,String> p){allowed(p,Set.of("_csrf","version"));Long v=number(p.get("version"));if(v==null)throw new DomainException(400,"Version required");service.deactivate(workspaceId,entityId,id,v);return "redirect:"+base(workspaceId,entityId)+"/"+id;}
     @PostMapping("/{id}/setting") public String setting(@PathVariable long workspaceId,@PathVariable long entityId,@PathVariable long id,@RequestParam Map<String,String> p){allowed(p,Set.of("_csrf","productVersion","settingVersion","active"));Long pv=number(p.get("productVersion")),sv=number(p.get("settingVersion"));if(pv==null)throw new DomainException(400,"Version required");String active=p.get("active");if(!"true".equals(active)&&!"false".equals(active))throw new DomainException(400,"Invalid active state","active");service.assign(workspaceId,entityId,id,pv,sv,Boolean.parseBoolean(active));return "redirect:"+base(workspaceId,entityId)+"/"+id;}
+    @PostMapping("/{id}/publish") public String publish(@PathVariable long workspaceId,@PathVariable long entityId,@PathVariable long id,@RequestParam Map<String,String> p) {
+        allowed(p,Set.of("_csrf","version"));
+        Long version=number(p.get("version"));
+        if(version==null) throw new DomainException(400,"Version required");
+        service.publish(workspaceId,entityId,id,version);
+        return "redirect:"+base(workspaceId,entityId)+"/"+id;
+    }
     private static void allowed(Map<String,String> p,Set<String> fields){if(p.keySet().stream().anyMatch(key -> !key.equals("_form") && !fields.contains(key)))throw new DomainException(400,"Unexpected field");}
     private static Long number(String v,String field){try{return number(v);}catch(DomainException e){throw new DomainException(400,"Invalid number",field);}}
     private static Long number(String v){if(v==null||v.isBlank())return null;try{return Long.valueOf(v);}catch(NumberFormatException e){throw new DomainException(400,"Invalid number");}}

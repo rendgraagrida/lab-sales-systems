@@ -70,6 +70,7 @@ public class PostingService {
         if (!currency.equals(entities.get(0).get("base_currency"))) throw new DomainException(400, "Currency must match entity");
         var periods = db.queryForList("select status from fiscal_periods where workspace_id=? and entity_id=? and ? between starts_on and ends_on for update", scope.workspaceId(), scope.entityId(), date);
         if (periods.size() != 1 || !"OPEN".equals(periods.get(0).get("status"))) throw new DomainException(409, "Posting requires an open fiscal period");
+        if (reverseOf == null) validateMappedAccountRoles(scope);
         if (debit.signum()==0) return new Result(null, false);
         if (reverseOf != null && !db.queryForList("select id from journal_entries where workspace_id=? and entity_id=? and reverse_of=?", scope.workspaceId(), scope.entityId(), reverseOf).isEmpty())
             throw new DomainException(409, "Journal already reversed");
@@ -84,6 +85,28 @@ public class PostingService {
         for (Ledger.Line line : lines) if (line.debit().signum()!=0 || line.credit().signum()!=0) db.update("insert into journal_lines(workspace_id,entity_id,journal_id,account_id,debit,credit) values (?,?,?,?,?,?)", scope.workspaceId(), scope.entityId(), journal, line.accountId(), line.debit(), line.credit());
         db.update("update journal_entries set state='POSTED',posted_at=now(),version=version+1 where id=?", journal);
         return new Result(journal, false);
+    }
+    private void validateMappedAccountRoles(AccessControl.Scope scope) {
+        Boolean conflict = db.queryForObject("""
+            select exists(
+                select 1 from procurement_posting_config c
+                where c.workspace_id=? and c.entity_id=?
+                  and (exists(select 1 from payment_posting_config p where p.workspace_id=c.workspace_id and p.entity_id=c.entity_id and p.bank_account_id=c.inventory_account_id)
+                    or exists(select 1 from tax_versions t where t.workspace_id=c.workspace_id and t.entity_id=c.entity_id
+                        and (t.input_account_id=c.inventory_account_id or t.output_account_id in (c.ap_account_id,c.grni_account_id)))))
+                or exists(select 1 from payment_posting_config p join tax_versions t
+                    on t.workspace_id=p.workspace_id and t.entity_id=p.entity_id and t.input_account_id=p.bank_account_id
+                    where p.workspace_id=? and p.entity_id=?)
+              or exists(select 1 from sales_posting_config s
+                where s.workspace_id=? and s.entity_id=?
+                  and (exists(select 1 from payment_posting_config p where p.workspace_id=s.workspace_id and p.entity_id=s.entity_id and p.bank_account_id in (s.ar_account_id,s.unbilled_account_id))
+                    or exists(select 1 from tax_versions t where t.workspace_id=s.workspace_id and t.entity_id=s.entity_id and t.input_account_id in (s.ar_account_id,s.unbilled_account_id))
+                    or exists(select 1 from procurement_posting_config p where p.workspace_id=s.workspace_id and p.entity_id=s.entity_id
+                      and (p.inventory_account_id in (s.ar_account_id,s.unbilled_account_id) or p.adjustment_gain_account_id=s.revenue_account_id
+                        or p.adjustment_loss_account_id=s.cogs_account_id or p.service_expense_account_id=s.cogs_account_id))))
+            """, Boolean.class, scope.workspaceId(), scope.entityId(), scope.workspaceId(), scope.entityId(), scope.workspaceId(), scope.entityId());
+        if (Boolean.TRUE.equals(conflict))
+            throw new DomainException(409, "Posting account roles conflict; correct configuration before creating new effects");
     }
     private AccessControl.Scope checkedScope(AccessControl.Scope scope) {
         if (scope == null || scope.entityId() == null) throw new DomainException(400, "Entity scope required");

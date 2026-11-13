@@ -118,6 +118,7 @@ public class FinanceController implements FormController {
         if(name.isBlank() || name.length()>200) throw new DomainException(400,"Invalid tax configuration","name");
         if(ratePct.signum()<0 || ratePct.compareTo(new BigDecimal("100"))>0 || ratePct.scale()>4) throw new DomainException(400,"Invalid tax configuration","ratePct");
         if(validTo!=null && !validTo.isAfter(validFrom)) throw new DomainException(400,"Invalid tax configuration","validFrom","validTo");
+        validateTaxAccounts(workspaceId,entityId,inputAccount,outputAccount);
         try { Long id=db.queryForObject("insert into tax_codes(workspace_id,entity_id,code,name,created_by) values (?,?,?,?,?) returning id",Long.class,workspaceId,entityId,code,name,scope.actor().id()); db.update("insert into tax_versions(workspace_id,entity_id,tax_code_id,valid_from,valid_to,rate_pct,price_inclusive,rounding_mode,input_account_id,output_account_id,created_by) values (?,?,?,?,?,?,?,'HALF_UP',?,?,?)",workspaceId,entityId,id,validFrom,validTo,ratePct,inclusive,inputAccount,outputAccount,scope.actor().id()); audit.record(scope.actor(),workspaceId,entityId,"CREATE","TAX",Long.toString(id),1,"SUCCESS",""); }
         catch(DataIntegrityViolationException ex) { throw new DomainException(409,"Invalid or conflicting tax configuration"); }
         return "redirect:"+base(workspaceId,entityId)+"/finance";
@@ -142,6 +143,10 @@ public class FinanceController implements FormController {
             if(db.queryForObject("select count(*) from vendor_invoices where workspace_id=? and entity_id=? and invoice_date between ? and ? and status='POSTED'",Integer.class,workspaceId,entityId,period.get(0).get("starts_on"),period.get(0).get("ends_on"))>0) throw new DomainException(409,"Period contains posted invoices");
             if(db.queryForObject("select count(*) from procurement_reversals where workspace_id=? and entity_id=? and reversal_date between ? and ?",Integer.class,workspaceId,entityId,period.get(0).get("starts_on"),period.get(0).get("ends_on"))>0) throw new DomainException(409,"Period contains posted reversals");
             if(db.queryForObject("select count(*) from stock_movements where workspace_id=? and entity_id=? and posting_date between ? and ?",Integer.class,workspaceId,entityId,period.get(0).get("starts_on"),period.get(0).get("ends_on"))>0) throw new DomainException(409,"Period contains posted stock movements");
+            if(db.queryForObject("select count(*) from shipments where workspace_id=? and entity_id=? and shipment_date between ? and ? and status='POSTED'",Integer.class,workspaceId,entityId,period.get(0).get("starts_on"),period.get(0).get("ends_on"))>0) throw new DomainException(409,"Period contains posted shipments");
+            if(db.queryForObject("select count(*) from sales_invoices where workspace_id=? and entity_id=? and invoice_date between ? and ? and status='POSTED'",Integer.class,workspaceId,entityId,period.get(0).get("starts_on"),period.get(0).get("ends_on"))>0) throw new DomainException(409,"Period contains posted customer invoices");
+            if(db.queryForObject("select count(*) from customer_receipts where workspace_id=? and entity_id=? and payment_date between ? and ? and status='POSTED'",Integer.class,workspaceId,entityId,period.get(0).get("starts_on"),period.get(0).get("ends_on"))>0) throw new DomainException(409,"Period contains posted customer receipts");
+            if(db.queryForObject("select count(*) from sales_reversals where workspace_id=? and entity_id=? and reversal_date between ? and ?",Integer.class,workspaceId,entityId,period.get(0).get("starts_on"),period.get(0).get("ends_on"))>0) throw new DomainException(409,"Period contains posted customer reversals");
             db.update("update fiscal_periods set starts_on=?,ends_on=?,version=version+1 where workspace_id=? and entity_id=? and id=?",startsOn,endsOn,workspaceId,entityId,id);
         } catch(DataIntegrityViolationException ex) { throw new DomainException(409,"Period overlaps another period"); }
         audit.record(scope.actor(),workspaceId,entityId,"UPDATE","PERIOD",Long.toString(id),version+1,"SUCCESS","dates");
@@ -152,6 +157,7 @@ public class FinanceController implements FormController {
         var scope=access.requireContext(workspaceId,entityId,true,"FINANCE");
         if(ratePct.signum()<0 || ratePct.compareTo(new BigDecimal("100"))>0 || ratePct.scale()>4) throw new DomainException(400,"Invalid tax version","ratePct");
         if(validTo!=null && !validTo.isAfter(validFrom)) throw new DomainException(400,"Invalid tax version","validFrom","validTo");
+        validateTaxAccounts(workspaceId,entityId,inputAccount,outputAccount);
         try {
             if(db.update("update tax_codes set version=version+1 where workspace_id=? and entity_id=? and id=? and version=? and active",workspaceId,entityId,id,version)!=1) throw new DomainException(409,"Tax code changed or not found");
             db.update("insert into tax_versions(workspace_id,entity_id,tax_code_id,valid_from,valid_to,rate_pct,price_inclusive,rounding_mode,input_account_id,output_account_id,created_by) values (?,?,?,?,?,?,?,'HALF_UP',?,?,?)",workspaceId,entityId,id,validFrom,validTo,ratePct,inclusive,inputAccount,outputAccount,scope.actor().id());
@@ -179,8 +185,10 @@ public class FinanceController implements FormController {
             select count(*) from chart_accounts a
             where a.workspace_id=? and a.entity_id=? and a.id=? and a.active and a.account_type='ASSET'
               and not exists(select 1 from procurement_posting_config p where p.workspace_id=a.workspace_id and p.entity_id=a.entity_id and p.inventory_account_id=a.id)
+              and not exists(select 1 from tax_versions t where t.workspace_id=a.workspace_id and t.entity_id=a.entity_id and t.input_account_id=a.id)
+              and not exists(select 1 from sales_posting_config s where s.workspace_id=a.workspace_id and s.entity_id=a.entity_id and a.id in (s.ar_account_id,s.unbilled_account_id))
             """,Integer.class,workspaceId,entityId,bankAccount);
-        if(valid==null || valid!=1) throw new DomainException(400,"Select an active non-inventory asset account","bankAccount");
+        if(valid==null || valid!=1) throw new DomainException(400,"Select an active asset account distinct from Inventory, Input Tax, AR and Unbilled","bankAccount");
         int updated;
         if(version==0) updated=db.update("insert into payment_posting_config(workspace_id,entity_id,bank_account_id,updated_by) values (?,?,?,?) on conflict do nothing",workspaceId,entityId,bankAccount,scope.actor().id());
         else updated=db.update("update payment_posting_config set bank_account_id=?,updated_by=?,version=version+1 where workspace_id=? and entity_id=? and version=?",bankAccount,scope.actor().id(),workspaceId,entityId,version);
@@ -212,6 +220,15 @@ public class FinanceController implements FormController {
         Integer bankConflict=db.queryForObject("select count(*) from payment_posting_config where workspace_id=? and entity_id=? and bank_account_id=?",Integer.class,workspaceId,entityId,ids[0]);
         if(bankConflict!=null && bankConflict>0)
             throw new DomainException(400,"Inventory and Bank accounts must differ","inventoryAccount");
+        Integer taxConflict=db.queryForObject("select count(*) from tax_versions where workspace_id=? and entity_id=? and (input_account_id=? or output_account_id in (?,?))",Integer.class,workspaceId,entityId,ids[0],ids[1],ids[2]);
+        if(taxConflict!=null && taxConflict>0)
+            throw new DomainException(400,"Procurement control accounts must differ from tax accounts","inventoryAccount","apAccount","grniAccount");
+        Boolean salesConflict=db.queryForObject("""
+            select exists(select 1 from sales_posting_config s where s.workspace_id=? and s.entity_id=?
+              and (? in (s.ar_account_id,s.unbilled_account_id) or ?=s.revenue_account_id
+                or ?=s.cogs_account_id or ?=s.cogs_account_id))
+            """,Boolean.class,workspaceId,entityId,ids[0],ids[3],ids[4],ids[5]);
+        if(Boolean.TRUE.equals(salesConflict)) throw new DomainException(400,"Procurement roles must be distinct from AR, Unbilled, goods revenue and COGS","inventoryAccount","adjustmentGainAccount","adjustmentLossAccount","serviceExpenseAccount");
         var current=db.queryForList("select * from procurement_posting_config where workspace_id=? and entity_id=? for update",workspaceId,entityId);
         if((version==0 && !current.isEmpty()) || (version!=0 && (current.isEmpty() || ((Number)current.get(0).get("version")).longValue()!=version))) throw new DomainException(409,"Procurement configuration changed");
         if(!current.isEmpty()) {
@@ -219,6 +236,8 @@ public class FinanceController implements FormController {
             for(int i=0;i<3;i++) {
                 long previous=((Number)current.get(0).get(columns[i])).longValue();
                 if(previous!=ids[i]) {
+                    if(i==0&&Boolean.TRUE.equals(db.queryForObject("select exists(select 1 from sales_orders where workspace_id=? and entity_id=?)",Boolean.class,workspaceId,entityId)))
+                        throw new DomainException(409,"Inventory mapping is referenced by an immutable booked sales order");
                     Integer sourced=db.queryForObject("select (select count(*) from purchase_order_revisions where workspace_id=? and entity_id=? and status='APPROVED')+(select count(*) from vendor_invoices where workspace_id=? and entity_id=? and status='POSTED')",Integer.class,workspaceId,entityId,workspaceId,entityId);
                     if(sourced!=null && sourced>0) throw new DomainException(409,"Control mapping is referenced by approved or posted sources");
                     BigDecimal balance=db.queryForObject("select coalesce(sum(l.debit-l.credit),0) from journal_lines l join journal_entries j on j.workspace_id=l.workspace_id and j.entity_id=l.entity_id and j.id=l.journal_id where l.workspace_id=? and l.entity_id=? and l.account_id=? and j.state='POSTED'",BigDecimal.class,workspaceId,entityId,previous);
@@ -239,6 +258,22 @@ public class FinanceController implements FormController {
         if(changed!=1) throw new DomainException(409,"Procurement configuration changed");
         audit.record(scope.actor(),workspaceId,entityId,"UPDATE","PROCUREMENT_CONFIG",Long.toString(entityId),version+1,"SUCCESS","procurement posting accounts");
         return "redirect:"+base(workspaceId,entityId)+"/finance";
+    }
+    private void validateTaxAccounts(long w,long e,long input,long output) {
+        Integer validInput=db.queryForObject("""
+            select count(*) from chart_accounts a
+            where a.workspace_id=? and a.entity_id=? and a.id=? and a.active and a.account_type='ASSET'
+              and not exists(select 1 from procurement_posting_config p where p.workspace_id=a.workspace_id and p.entity_id=a.entity_id and p.inventory_account_id=a.id)
+              and not exists(select 1 from payment_posting_config p where p.workspace_id=a.workspace_id and p.entity_id=a.entity_id and p.bank_account_id=a.id)
+              and not exists(select 1 from sales_posting_config s where s.workspace_id=a.workspace_id and s.entity_id=a.entity_id and a.id in (s.ar_account_id,s.unbilled_account_id))
+            """,Integer.class,w,e,input);
+        if(validInput==null || validInput!=1) throw new DomainException(400,"Input Tax must be an active asset account distinct from Bank, Inventory, AR and Unbilled","inputAccount");
+        Integer validOutput=db.queryForObject("""
+            select count(*) from chart_accounts a
+            where a.workspace_id=? and a.entity_id=? and a.id=? and a.active and a.account_type='LIABILITY'
+              and not exists(select 1 from procurement_posting_config p where p.workspace_id=a.workspace_id and p.entity_id=a.entity_id and a.id in (p.ap_account_id,p.grni_account_id))
+            """,Integer.class,w,e,output);
+        if(validOutput==null || validOutput!=1) throw new DomainException(400,"Output Tax must be an active liability account distinct from AP and GRNI","outputAccount");
     }
     @GetMapping("/finance/openings/new") public String openingForm(@PathVariable long workspaceId,@PathVariable long entityId,@RequestParam(defaultValue="2") int count,Model model) {
         access.requireContext(workspaceId,entityId,false,"FINANCE"); context(model,workspaceId,entityId);

@@ -25,10 +25,21 @@ public final class FormFeedback {
             "invoiceId", "allocationAmount", "reason", "reversalDate", "bankAccountVersion", "configVersion", "reversalKey",
             "actionKey", "fromWarehouse", "toWarehouse", "value", "serial", "lot", "expiresOn", "trackingQuantity",
             "supplierRef", "requestLineRef", "previousLineId", "taxRef", "serviceProfile", "orderRef", "orderLineRef",
-            "warehouseRef", "trackingLineKey", "intent");
+            "warehouseRef", "trackingLineKey", "intent",
+            "arAccount", "unbilledAccount", "revenueAccount", "cogsAccount",
+            "receivedAt", "subject", "need", "customerId", "contactId", "contactVersion",
+            "priority", "followUpDue", "assigneeId", "key", "targetId", "enabled", "ruleId", "asOf",
+            "territoryConfirmed", "needConfirmed", "timeframeConfirmed", "budgetConfirmed",
+            "territoryPoints", "needPoints", "timeframePoints", "budgetPoints", "inquiryId", "inquiryVersion",
+            "customerAccountId", "title", "pipeline", "ownerId", "stage", "opportunityId", "opportunityVersion",
+            "dueAt", "outcome", "response", "orderVersion", "lineId", "warehouse", "serialId", "lotId",
+            "reservationId", "number", "receiptKey", "paymentConfigVersion", "shipmentLineId", "sliceStart", "sliceEnd",
+            "origin", "customerRef", "validUntil", "billingAddress", "shippingAddress", "bookRef", "overridePrice", "revisionId", "action",
+            "customer", "address", "first", "second", "label");
     private static final Set<String> HIDDEN_FIELDS = Set.of("id", "version", "customerVersion", "accountVersion",
             "supplierVersion", "linkVersion", "productVersion", "settingVersion", "bookVersion", "lineVersion",
-            "bankAccountVersion", "configVersion", "previousLineId", "intent");
+            "bankAccountVersion", "configVersion", "previousLineId", "intent", "contactVersion",
+            "inquiryVersion", "opportunityVersion", "orderVersion", "lineId", "reservationId", "paymentConfigVersion", "revisionId");
     private static final FormFeedback EMPTY = new FormFeedback(null, null, Map.of(), Map.of(), "");
     private final String action;
     private final String submittedForm;

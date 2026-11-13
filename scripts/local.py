@@ -15,6 +15,7 @@ import uuid
 import ci
 import database as db
 from native_windows import NativeJob, WindowsEvent, owns_loopback_listener
+import release
 
 ROOT = ci.ROOT
 
@@ -55,6 +56,9 @@ def verify_artifact(path, revision):
     if not isinstance(manifest, dict) or not isinstance(manifest.get('run_id'), str):
         raise db.OperationError('Artifact manifest is invalid.')
     ci.verify(path, revision, manifest['run_id'])
+    if set(release.derived(path / 'application.jar')) != (
+            {'migration/pom.xml'} | {'migration/sql/' + name for name in release.SQL_NAMES}):
+        raise db.OperationError('Launcher requires an artifact with the current exact migration lineage.')
     return manifest['files']['application.jar']['sha256']
 
 
@@ -93,7 +97,8 @@ def probe(port, revision, pid):
             health = json.loads(reply.read(16385))
             if (reply.status != 200 or not isinstance(health, dict)
                     or health.get('status') != 'UP' or health.get('application') != 'lab-sales-systems'
-                    or health.get('revision') != revision or health.get('schemaVersion') not in (3, 4)):
+                    or health.get('revision') != revision or type(health.get('schemaVersion')) is not int
+                    or health.get('schemaVersion') != len(release.SQL_NAMES)):
                 return False
         with opener.open(Request(origin + '/login'), timeout=1) as reply:
             return (reply.status == 200 and b'Sign in | Lab Sales Systems' in reply.read(16384)
@@ -229,7 +234,7 @@ def main(argv=None):
                 signal.signal(signal.SIGBREAK, signal.default_int_handler)
             return launch(state, args)
         return control(state, args.command, args.timeout)
-    except (db.OperationError, ci.CheckError, OSError, ValueError, KeyError, TypeError):
+    except (db.OperationError, ci.CheckError, release.ReleaseError, OSError, ValueError, KeyError, TypeError):
         print('error: Invalid local input, unavailable prerequisite or inactive owned instance; no process/data mutation is implied.', file=sys.stderr)
         return 1
 

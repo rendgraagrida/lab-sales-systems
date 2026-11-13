@@ -24,6 +24,18 @@
     <a th:if="${contextBase != null}" th:href="${contextBase + '/procurement'}">Procurement</a>
     <a th:if="${contextBase != null}" th:href="${contextBase + '/inventory'}">Inventory</a>
     <a th:if="${contextBase != null}" th:href="${contextBase + '/finance/ap'}">Supplier payables</a>
+    <a th:if="${contextBase != null}" th:href="${contextBase + '/crm/inquiries'}">CRM inquiries</a>
+    <a th:if="${contextBase != null}" th:href="${contextBase + '/crm/activities'}">Activities</a>
+    <a th:if="${contextBase != null}" th:href="${contextBase + '/crm/opportunities'}">Opportunities</a>
+    <a th:if="${contextBase != null}" th:href="${contextBase + '/crm/reactivation'}">Reactivation</a>
+    <a th:if="${contextBase != null}" th:href="${contextBase + '/masters/price-books'}">Price books</a>
+    <a th:if="${contextBase != null}" th:href="${contextBase + '/sales/quotes'}">Goods quotes</a>
+    <a th:if="${contextBase != null}" th:href="${contextBase + '/sales/orders'}">Sales orders</a>
+    <a th:if="${contextBase != null}" th:href="${contextBase + '/sales/shipments'}">Goods shipments</a>
+    <a th:if="${contextBase != null}" th:href="${contextBase + '/sales/invoices'}">Customer invoices</a>
+    <a th:if="${contextBase != null}" th:href="${contextBase + '/finance/ar'}">Customer receivables</a>
+    <a th:if="${contextBase != null}" th:href="${contextBase + '/finance/customer-receipts'}">Customer receipts</a>
+    <a th:if="${contextBase != null}" th:href="${contextBase + '/finance/sales-config'}">Sales posting accounts</a>
   </nav>
   <p class="context" th:if="${workspaceId != null}">Workspace <b th:text="${workspaceId}"></b><span th:if="${entityId != null}"> / Entity <b th:text="${entityId}"></b></span></p>
   <h1 th:text="${title}">Lab Sales Systems</h1>

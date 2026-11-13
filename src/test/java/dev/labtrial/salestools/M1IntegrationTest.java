@@ -94,6 +94,18 @@ class M1IntegrationTest {
     @Autowired ProcurementService procurement;
     @Autowired VendorInvoiceService vendorInvoices;
     @Autowired SupplierPaymentService supplierPayments;
+    @Autowired dev.labtrial.salestools.finance.SalesPostingConfigService salesPosting;
+    @Autowired dev.labtrial.salestools.crm.InquiryService crmInquiries;
+    @Autowired dev.labtrial.salestools.crm.ScoringService crmScoring;
+    @Autowired dev.labtrial.salestools.crm.RoutingService crmRouting;
+    @Autowired dev.labtrial.salestools.crm.ActivityService crmActivities;
+    @Autowired dev.labtrial.salestools.order.QuoteService salesQuotes;
+    @Autowired dev.labtrial.salestools.order.HandoverService salesHandover;
+    @Autowired dev.labtrial.salestools.order.FulfillmentService fulfillment;
+    @Autowired dev.labtrial.salestools.finance.SalesInvoiceService salesInvoices;
+    @Autowired dev.labtrial.salestools.finance.CustomerReceiptService customerReceipts;
+    @Autowired dev.labtrial.salestools.crm.ReactivationService reactivation;
+    @Autowired dev.labtrial.salestools.crm.OpportunityService crmOpportunities;
     @Autowired Environment environment;
     private long administrator;
     private long initialWorkspace;
@@ -1304,6 +1316,206 @@ class M1IntegrationTest {
                 accountToken(c, "GAIN"), accountToken(c, "LOSS"), accountToken(c, "SERVICE")));
     }
 
+    @Test void taxBankAndProcurementMappingsRejectConflictingRolesWithoutPartialChanges() {
+        var fixture = purchase(BigDecimal.ONE, new BigDecimal("10.00"), null, null);
+        var c = fixture.creator();
+        long inventoryAccount = Long.parseLong(accountToken(c, "INVENTORY").split(":")[0]);
+        long bankAccount = Long.parseLong(accountToken(c, "BANK").split(":")[0]);
+        long inputTax = Long.parseLong(accountToken(c, "TAX_INPUT").split(":")[0]);
+        long outputTax = Long.parseLong(accountToken(c, "TAX_OUTPUT").split(":")[0]);
+        long ap = Long.parseLong(accountToken(c, "AP").split(":")[0]);
+        long grni = Long.parseLong(accountToken(c, "GRNI").split(":")[0]);
+        long taxCode = db.queryForObject("select id from tax_codes where workspace_id=? and entity_id=? and code='SIM-VAT7'", Long.class, c.workspace(), c.entity());
+        int audits = db.queryForObject("select count(*) from audit_events where workspace_id=?", Integer.class, c.workspace());
+        for (long conflictingInput : List.of(inventoryAccount, bankAccount)) {
+            denied(400, () -> finance.tax(c.workspace(), c.entity(), "BAD-INPUT", "Conflicting input tax",
+                    DAY, null, new BigDecimal("7"), false, conflictingInput, outputTax));
+            denied(400, () -> finance.taxVersion(c.workspace(), c.entity(), taxCode, 1,
+                    DAY.plusYears(1), null, new BigDecimal("7"), false, conflictingInput, outputTax));
+        }
+        for (long conflictingOutput : List.of(ap, grni))
+            denied(400, () -> finance.tax(c.workspace(), c.entity(), "BAD-OUTPUT", "Conflicting output tax",
+                    DAY, null, new BigDecimal("7"), false, inputTax, conflictingOutput));
+        denied(400, () -> finance.paymentConfig(c.workspace(), c.entity(), 1, inputTax));
+        denied(400, () -> finance.procurementConfig(c.workspace(), c.entity(), 1,
+                accountToken(c, "TAX_INPUT"), accountToken(c, "AP"), accountToken(c, "GRNI"),
+                accountToken(c, "GAIN"), accountToken(c, "LOSS"), accountToken(c, "SERVICE")));
+        denied(400, () -> finance.procurementConfig(c.workspace(), c.entity(), 1,
+                accountToken(c, "INVENTORY"), accountToken(c, "TAX_OUTPUT"), accountToken(c, "GRNI"),
+                accountToken(c, "GAIN"), accountToken(c, "LOSS"), accountToken(c, "SERVICE")));
+        denied(400, () -> finance.procurementConfig(c.workspace(), c.entity(), 1,
+                accountToken(c, "INVENTORY"), accountToken(c, "AP"), accountToken(c, "TAX_OUTPUT"),
+                accountToken(c, "GAIN"), accountToken(c, "LOSS"), accountToken(c, "SERVICE")));
+        assertEquals(1, db.queryForObject("select count(*) from tax_codes where workspace_id=?", Integer.class, c.workspace()));
+        assertEquals(1L, db.queryForObject("select version from tax_codes where id=?", Long.class, taxCode));
+        assertEquals(1L, db.queryForObject("select version from payment_posting_config where workspace_id=? and entity_id=?", Long.class, c.workspace(), c.entity()));
+        assertEquals(1L, db.queryForObject("select version from procurement_posting_config where workspace_id=? and entity_id=?", Long.class, c.workspace(), c.entity()));
+        assertEquals(audits, db.queryForObject("select count(*) from audit_events where workspace_id=?", Integer.class, c.workspace()));
+    }
+
+    @Test void legacyTaxRoleConflictRejectsCashSaveAndPostWithoutChangingBalances() {
+        var fixture = purchase(BigDecimal.ONE, new BigDecimal("10.00"), null, null);
+        var c = fixture.creator();
+        var line = new VendorInvoiceService.Line("CASH-ROLE-LINE", fixture.receiptLine(), BigDecimal.ONE,
+                new BigDecimal("10.00"), null, null, new BigDecimal("10.00"), new BigDecimal("0.00"),
+                new BigDecimal("10.00"), new BigDecimal("0.70"), new BigDecimal("10.70"));
+        long invoice = vendorInvoices.save(c.workspace(), c.entity(), null, 0,
+                new VendorInvoiceService.Draft("CASH-ROLE", DAY.plusDays(2), 1, 1, List.of(line)));
+        assertFalse(vendorInvoices.post(c.workspace(), c.entity(), invoice, 1).held());
+        var draft = new SupplierPaymentService.Draft("ROLE-CASH", fixture.supplierAccount(), 1, 1, 1,
+                DAY.plusDays(3), "EUR", new BigDecimal("10.70"),
+                List.of(new SupplierPaymentService.Allocation(invoice, new BigDecimal("10.70"))));
+        long payment = supplierPayments.save(c.workspace(), c.entity(), null, 0, draft);
+        long bank = Long.parseLong(accountToken(c, "BANK").split(":")[0]);
+        long output = Long.parseLong(accountToken(c, "TAX_OUTPUT").split(":")[0]);
+        long legacyTax = db.queryForObject("insert into tax_codes(workspace_id,entity_id,code,name,created_by) values (?,?, 'LEGACY-BANK-TAX','Legacy conflicting role',?) returning id",
+                Long.class, c.workspace(), c.entity(), c.user());
+        db.update("insert into tax_versions(workspace_id,entity_id,tax_code_id,valid_from,rate_pct,price_inclusive,rounding_mode,input_account_id,output_account_id,created_by) values (?,?,?,?,7,false,'HALF_UP',?,?,?)",
+                c.workspace(), c.entity(), legacyTax, DAY, bank, output, c.user());
+        int journals = db.queryForObject("select count(*) from journal_entries where workspace_id=?", Integer.class, c.workspace());
+        int audits = db.queryForObject("select count(*) from audit_events where workspace_id=?", Integer.class, c.workspace());
+        denied(400, () -> supplierPayments.post(c.workspace(), c.entity(), payment, 1));
+        var another = new SupplierPaymentService.Draft("ROLE-CASH-SECOND", fixture.supplierAccount(), 1, 1, 1,
+                DAY.plusDays(3), "EUR", new BigDecimal("10.70"), draft.allocations());
+        denied(400, () -> supplierPayments.save(c.workspace(), c.entity(), null, 0, another));
+        assertEquals("DRAFT", db.queryForObject("select status from supplier_payments where id=?", String.class, payment));
+        assertEquals(1, db.queryForObject("select count(*) from supplier_payments where workspace_id=?", Integer.class, c.workspace()));
+        assertEquals(new BigDecimal("10.70"), supplierPayments.aging(c.workspace(), c.entity(), DAY.plusDays(3)).get(0).get("open_amount"));
+        assertEquals(journals, db.queryForObject("select count(*) from journal_entries where workspace_id=?", Integer.class, c.workspace()));
+        assertEquals(audits, db.queryForObject("select count(*) from audit_events where workspace_id=?", Integer.class, c.workspace()));
+        assertEquals(new BigDecimal("10.00"), db.queryForObject("select value from inventory_valuation_pools where workspace_id=? and entity_id=? and product_id=?", BigDecimal.class, c.workspace(), c.entity(), fixture.product()));
+    }
+
+    @Test void legacyReceiptTaxSnapshotCannotAllocateOrPostIntoBank() {
+        var fixture = purchase(BigDecimal.ONE, new BigDecimal("10.00"), null, null);
+        var c = fixture.creator();
+        var line = new VendorInvoiceService.Line("RECEIPT-ROLE-LINE", fixture.receiptLine(), BigDecimal.ONE,
+                new BigDecimal("10.00"), null, null, new BigDecimal("10.00"), new BigDecimal("0.00"),
+                new BigDecimal("10.00"), new BigDecimal("0.70"), new BigDecimal("10.70"));
+        long invoice = vendorInvoices.save(c.workspace(), c.entity(), null, 0,
+                new VendorInvoiceService.Draft("RECEIPT-ROLE", DAY.plusDays(2), 1, 1, List.of(line)));
+        long inputTax = Long.parseLong(accountToken(c, "TAX_INPUT").split(":")[0]);
+        db.update("update payment_posting_config set bank_account_id=? where workspace_id=? and entity_id=?", inputTax, c.workspace(), c.entity());
+        int journals = db.queryForObject("select count(*) from journal_entries where workspace_id=?", Integer.class, c.workspace());
+        int audits = db.queryForObject("select count(*) from audit_events where workspace_id=?", Integer.class, c.workspace());
+        denied(409, () -> vendorInvoices.post(c.workspace(), c.entity(), invoice, 1));
+        assertEquals("DRAFT", vendorInvoices.detail(c.workspace(), c.entity(), invoice).get("status"));
+        assertEquals(0, db.queryForObject("select count(*) from invoice_source_allocations where workspace_id=?", Integer.class, c.workspace()));
+        assertEquals(journals, db.queryForObject("select count(*) from journal_entries where workspace_id=?", Integer.class, c.workspace()));
+        assertEquals(audits, db.queryForObject("select count(*) from audit_events where workspace_id=?", Integer.class, c.workspace()));
+        assertEquals(new BigDecimal("10.00"), db.queryForObject("select value from inventory_valuation_pools where workspace_id=? and entity_id=? and product_id=?", BigDecimal.class, c.workspace(), c.entity(), fixture.product()));
+    }
+
+    @Test void legacyBankInventoryConflictRejectsReceiptAndAdjustmentWithoutEffects() {
+        for (boolean receiptOnly : List.of(false, true)) {
+            var fixture = purchase(BigDecimal.ONE, new BigDecimal("10.00"), null, null, !receiptOnly);
+            var c = fixture.creator();
+            var warehouse = configuration.list(c.workspace(), c.entity(), ConfigurationService.Kind.WAREHOUSE, "").get(0);
+            long action = receiptOnly ? 0 : stockAction(fixture, "LEGACY-ISSUE", "NEGATIVE_ADJUSTMENT",
+                    warehouse.id(), null, BigDecimal.ONE, null, DAY.plusDays(2));
+            long inventoryAccount = Long.parseLong(accountToken(c, "INVENTORY").split(":")[0]);
+            db.update("update payment_posting_config set bank_account_id=? where workspace_id=? and entity_id=?", inventoryAccount, c.workspace(), c.entity());
+            int journals = db.queryForObject("select count(*) from journal_entries where workspace_id=?", Integer.class, c.workspace());
+            int audits = db.queryForObject("select count(*) from audit_events where workspace_id=?", Integer.class, c.workspace());
+            var pools = db.queryForList("select * from inventory_valuation_pools where workspace_id=? and entity_id=? and product_id=?", c.workspace(), c.entity(), fixture.product());
+            var movements = db.queryForList("select * from stock_movements where workspace_id=? and entity_id=? and product_id=? order by id", c.workspace(), c.entity(), fixture.product());
+            if (receiptOnly) {
+                denied(409, () -> procurement.postReceipt(c.workspace(), c.entity(), fixture.receipt(), 1, "LEGACY-RECEIPT"));
+                assertEquals("DRAFT", db.queryForObject("select status from procurement_receipts where id=?", String.class, fixture.receipt()));
+            } else {
+                denied(409, () -> inventory.postAction(c.workspace(), c.entity(), action, 1));
+                assertEquals("DRAFT", inventory.action(c.workspace(), c.entity(), action).status());
+            }
+            assertEquals(pools, db.queryForList("select * from inventory_valuation_pools where workspace_id=? and entity_id=? and product_id=?", c.workspace(), c.entity(), fixture.product()));
+            assertEquals(movements, db.queryForList("select * from stock_movements where workspace_id=? and entity_id=? and product_id=? order by id", c.workspace(), c.entity(), fixture.product()));
+            assertEquals(journals, db.queryForObject("select count(*) from journal_entries where workspace_id=?", Integer.class, c.workspace()));
+            assertEquals(audits, db.queryForObject("select count(*) from audit_events where workspace_id=?", Integer.class, c.workspace()));
+        }
+    }
+
+    @Test void weightedAverageReceiptTransferAndIssuePreserveCostAndStockToGl() {
+        var fixture = purchase(new BigDecimal("10"), new BigDecimal("65.00"), null, null, false);
+        var c = fixture.creator();
+        var from = configuration.list(c.workspace(), c.entity(), ConfigurationService.Kind.WAREHOUSE, "").get(0);
+        long initial = stockAction(fixture, "COST-OPENING", "POSITIVE_ADJUSTMENT", null, from.id(),
+                new BigDecimal("20"), new BigDecimal("1000.00"), DAY);
+        inventory.submitAction(c.workspace(), c.entity(), initial, 1);
+        actor(fixture.checker().user());
+        inventory.postAction(c.workspace(), c.entity(), initial, 2);
+        actor(c.user());
+        procurement.postReceipt(c.workspace(), c.entity(), fixture.receipt(), 1, "COST-RECEIPT");
+        assertEquals(new BigDecimal("30.000000"), db.queryForObject("select quantity from inventory_valuation_pools where workspace_id=? and entity_id=? and product_id=?", BigDecimal.class, c.workspace(), c.entity(), fixture.product()));
+        assertEquals(new BigDecimal("1650.00"), db.queryForObject("select value from inventory_valuation_pools where workspace_id=? and entity_id=? and product_id=?", BigDecimal.class, c.workspace(), c.entity(), fixture.product()));
+        long destination = configuration.save(c.workspace(), c.entity(), ConfigurationService.Kind.WAREHOUSE, null, null, "COST-DEST", "Cost transfer destination", null, null);
+        int journals = db.queryForObject("select count(*) from journal_entries where workspace_id=?", Integer.class, c.workspace());
+        long transfer = stockAction(fixture, "COST-TRANSFER", "TRANSFER", from.id(), destination,
+                new BigDecimal("5"), null, DAY.plusDays(2));
+        assertNull(inventory.postAction(c.workspace(), c.entity(), transfer, 1).journalId());
+        assertEquals(journals, db.queryForObject("select count(*) from journal_entries where workspace_id=?", Integer.class, c.workspace()));
+        assertEquals(new BigDecimal("275.00"), db.queryForObject("select value_delta from stock_movements where workspace_id=? and entity_id=? and source_type='INVENTORY_ACTION' and source_id=? and quantity_delta>0", BigDecimal.class, c.workspace(), c.entity(), Long.toString(transfer)));
+        long issue = stockAction(fixture, "COST-ISSUE", "NEGATIVE_ADJUSTMENT", from.id(), null,
+                new BigDecimal("7"), null, DAY.plusDays(2));
+        var posted = inventory.postAction(c.workspace(), c.entity(), issue, 1);
+        assertEquals(new BigDecimal("385.00"), db.queryForObject("select sum(debit) from journal_lines where journal_id=?", BigDecimal.class, posted.journalId()));
+        assertEquals(new BigDecimal("23.000000"), db.queryForObject("select quantity from inventory_valuation_pools where workspace_id=? and entity_id=? and product_id=?", BigDecimal.class, c.workspace(), c.entity(), fixture.product()));
+        assertEquals(new BigDecimal("1265.00"), db.queryForObject("select value from inventory_valuation_pools where workspace_id=? and entity_id=? and product_id=?", BigDecimal.class, c.workspace(), c.entity(), fixture.product()));
+        long inventoryAccount = Long.parseLong(accountToken(c, "INVENTORY").split(":")[0]);
+        assertEquals(db.queryForObject("select sum(value) from inventory_valuation_pools where workspace_id=? and entity_id=?", BigDecimal.class, c.workspace(), c.entity()),
+                db.queryForObject("select sum(debit-credit) from journal_lines where workspace_id=? and entity_id=? and account_id=?", BigDecimal.class, c.workspace(), c.entity(), inventoryAccount));
+    }
+
+    @Test void competingReceiptsCannotConsumeTheSameOrderCapacity() throws Exception {
+        var fixture = purchase(new BigDecimal("10"), new BigDecimal("55.00"), null, null, false);
+        var c = fixture.creator();
+        var line = db.queryForMap("select order_line_id,warehouse_id,warehouse_version from procurement_receipt_lines where id=?", fixture.receiptLine());
+        long second = procurement.saveReceipt(c.workspace(), c.entity(), null, null,
+                new ProcurementService.ReceiptInput(fixture.order(), 3, "GOODS", DAY.plusDays(1),
+                        List.of(new ProcurementService.ReceiptLineInput("COMPETING-RECEIPT",
+                                ((Number) line.get("order_line_id")).longValue(), new BigDecimal("10"),
+                                ((Number) line.get("warehouse_id")).longValue(), ((Number) line.get("warehouse_version")).longValue(), List.of()))));
+        assertEquals(List.of(200, 409), competing(c,
+                () -> procurement.postReceipt(c.workspace(), c.entity(), fixture.receipt(), 1, "RECEIPT-A"),
+                () -> procurement.postReceipt(c.workspace(), c.entity(), second, 1, "RECEIPT-B")));
+        assertEquals(1, db.queryForObject("select count(*) from procurement_receipts where workspace_id=? and status='POSTED'", Integer.class, c.workspace()));
+        assertEquals(new BigDecimal("10.000000"), db.queryForObject("select quantity from inventory_valuation_pools where workspace_id=? and entity_id=? and product_id=?", BigDecimal.class, c.workspace(), c.entity(), fixture.product()));
+        assertEquals(new BigDecimal("550.00"), db.queryForObject("select value from inventory_valuation_pools where workspace_id=? and entity_id=? and product_id=?", BigDecimal.class, c.workspace(), c.entity(), fixture.product()));
+    }
+
+    @Test void competingIssuesCannotOverdrawTheSameValuationPool() throws Exception {
+        var fixture = purchase(new BigDecimal("10"), new BigDecimal("55.00"), null, null);
+        var c = fixture.creator();
+        var warehouse = configuration.list(c.workspace(), c.entity(), ConfigurationService.Kind.WAREHOUSE, "").get(0);
+        long first = stockAction(fixture, "ISSUE-A", "NEGATIVE_ADJUSTMENT", warehouse.id(), null, new BigDecimal("6"), null, DAY.plusDays(2));
+        long second = stockAction(fixture, "ISSUE-B", "NEGATIVE_ADJUSTMENT", warehouse.id(), null, new BigDecimal("6"), null, DAY.plusDays(2));
+        assertEquals(List.of(200, 409), competing(c,
+                () -> inventory.postAction(c.workspace(), c.entity(), first, 1),
+                () -> inventory.postAction(c.workspace(), c.entity(), second, 1)));
+        assertEquals(new BigDecimal("4.000000"), db.queryForObject("select quantity from inventory_valuation_pools where workspace_id=? and entity_id=? and product_id=?", BigDecimal.class, c.workspace(), c.entity(), fixture.product()));
+        assertEquals(new BigDecimal("220.00"), db.queryForObject("select value from inventory_valuation_pools where workspace_id=? and entity_id=? and product_id=?", BigDecimal.class, c.workspace(), c.entity(), fixture.product()));
+        assertEquals(1, db.queryForObject("select count(*) from inventory_actions where workspace_id=? and status='POSTED'", Integer.class, c.workspace()));
+    }
+
+    @Test void competingPaymentsCannotSpendTheSameInvoiceBalance() throws Exception {
+        var fixture = purchase(BigDecimal.ONE, new BigDecimal("10.00"), null, null);
+        var c = fixture.creator();
+        var line = new VendorInvoiceService.Line("PAY-RACE", fixture.receiptLine(), BigDecimal.ONE,
+                new BigDecimal("10.00"), null, null, new BigDecimal("10.00"), new BigDecimal("0.00"),
+                new BigDecimal("10.00"), new BigDecimal("0.70"), new BigDecimal("10.70"));
+        long invoice = vendorInvoices.save(c.workspace(), c.entity(), null, 0,
+                new VendorInvoiceService.Draft("PAY-RACE", DAY.plusDays(2), 1, 1, List.of(line)));
+        vendorInvoices.post(c.workspace(), c.entity(), invoice, 1);
+        var allocation = List.of(new SupplierPaymentService.Allocation(invoice, new BigDecimal("10.70")));
+        long first = supplierPayments.save(c.workspace(), c.entity(), null, 0,
+                new SupplierPaymentService.Draft("PAY-A", fixture.supplierAccount(), 1, 1, 1, DAY.plusDays(3), "EUR", new BigDecimal("10.70"), allocation));
+        long second = supplierPayments.save(c.workspace(), c.entity(), null, 0,
+                new SupplierPaymentService.Draft("PAY-B", fixture.supplierAccount(), 1, 1, 1, DAY.plusDays(3), "EUR", new BigDecimal("10.70"), allocation));
+        assertEquals(List.of(200, 409), competing(c,
+                () -> supplierPayments.post(c.workspace(), c.entity(), first, 1),
+                () -> supplierPayments.post(c.workspace(), c.entity(), second, 1)));
+        assertEquals(1, db.queryForObject("select count(*) from supplier_payments where workspace_id=? and status='POSTED'", Integer.class, c.workspace()));
+        assertEquals(new BigDecimal("0.00"), supplierPayments.aging(c.workspace(), c.entity(), DAY.plusDays(3)).get(0).get("open_amount"));
+    }
+
     @Test void middleInvoiceRebillReusesExactReleasedRoundingIntervalWithoutRewritingOtherInvoices() {
         var fixture = purchase(new BigDecimal("3"), new BigDecimal("0.50"), null, new BigDecimal("0.50"));
         var c = fixture.creator();
@@ -1414,8 +1626,40 @@ class M1IntegrationTest {
                 BigDecimal.class, c.workspace(), c.entity(), fixture.product()));
     }
 
-    private record PurchaseFixture(Context creator, Context checker, long product, long supplierAccount, long receiptLine) {}
+    private long stockAction(PurchaseFixture fixture, String key, String kind, Long from, Long to,
+                             BigDecimal quantity, BigDecimal value, LocalDate date) {
+        var c = fixture.creator();
+        var product = products.get(c.workspace(), c.entity(), fixture.product());
+        var unit = configuration.get(c.workspace(), c.entity(), ConfigurationService.Kind.UOM, product.uomId());
+        var setting = products.setting(c.workspace(), c.entity(), product.id());
+        Long fromVersion = from == null ? null : configuration.get(c.workspace(), c.entity(), ConfigurationService.Kind.WAREHOUSE, from).version();
+        Long toVersion = to == null ? null : configuration.get(c.workspace(), c.entity(), ConfigurationService.Kind.WAREHOUSE, to).version();
+        return inventory.saveAction(c.workspace(), c.entity(), null, null,
+                new InventoryService.ActionInput(key, kind, product.id(), product.version(), unit.id(), unit.version(),
+                        setting.version(), from, fromVersion, to, toVersion, quantity, value, date, "Synthetic controlled stock effect", List.of()));
+    }
+    private List<Integer> competing(Context c, Runnable first, Runnable second) throws Exception {
+        var barrier = new java.util.concurrent.CyclicBarrier(2);
+        var jobs = new ArrayList<Callable<Integer>>();
+        for (var effect : List.of(first, second)) jobs.add(() -> {
+            actor(c.user());
+            try {
+                barrier.await(10, java.util.concurrent.TimeUnit.SECONDS);
+                try { effect.run(); return 200; }
+                catch (DomainException ex) { return ex.status(); }
+            } finally { SecurityContextHolder.clearContext(); }
+        });
+        try (var executor = Executors.newFixedThreadPool(2)) {
+            var results = new ArrayList<Integer>();
+            for (var future : executor.invokeAll(jobs)) results.add(future.get());
+            return results.stream().sorted().toList();
+        }
+    }
+    private record PurchaseFixture(Context creator, Context checker, long product, long supplierAccount, long receiptLine, long receipt, long order) {}
     private PurchaseFixture purchase(BigDecimal quantity, BigDecimal unitCost, BigDecimal discountPct, BigDecimal discountAmount) {
+        return purchase(quantity, unitCost, discountPct, discountAmount, true);
+    }
+    private PurchaseFixture purchase(BigDecimal quantity, BigDecimal unitCost, BigDecimal discountPct, BigDecimal discountAmount, boolean postReceipt) {
         var c = context("EUR", "OPERATIONS", "FINANCE");
         baseline.initialize(c.workspace(), c.entity(), "O2C_GOODS", 1);
         for (var account : List.of(new String[]{"AP", "LIABILITY"}, new String[]{"GRNI", "LIABILITY"},
@@ -1457,10 +1701,12 @@ class M1IntegrationTest {
                 new ProcurementService.ReceiptInput(order, 3, "GOODS", DAY.plusDays(1),
                         List.of(new ProcurementService.ReceiptLineInput("RECEIPT-LINE", orderLine, quantity,
                                 warehouse.id(), warehouse.version(), List.of()))));
-        assertFalse(procurement.postReceipt(c.workspace(), c.entity(), receipt, 1, "SYNTHETIC-RECEIPT").replayed());
-        assertTrue(procurement.postReceipt(c.workspace(), c.entity(), receipt, 1, "SYNTHETIC-RECEIPT").replayed());
+        if (postReceipt) {
+            assertFalse(procurement.postReceipt(c.workspace(), c.entity(), receipt, 1, "SYNTHETIC-RECEIPT").replayed());
+            assertTrue(procurement.postReceipt(c.workspace(), c.entity(), receipt, 1, "SYNTHETIC-RECEIPT").replayed());
+        }
         long receiptLine = ((Number) procurement.receiptLines(c.workspace(), c.entity(), receipt).get(0).get("id")).longValue();
-        return new PurchaseFixture(c, checker, product, supplierId, receiptLine);
+        return new PurchaseFixture(c, checker, product, supplierId, receiptLine, receipt, order);
     }
     private String accountToken(Context c, String code) {
         var row = db.queryForMap("select id,version from chart_accounts where workspace_id=? and entity_id=? and code=?", c.workspace(), c.entity(), code);
@@ -1563,6 +1809,719 @@ class M1IntegrationTest {
             attributes.put(pattern.group(1).toLowerCase(java.util.Locale.ROOT), org.springframework.web.util.HtmlUtils.htmlUnescape(value));
         }
         return attributes;
+    }
+
+    @Test void priceBookApprovalRejectsEveryContributorAndPreservesApprovedPrices() {
+        var maker=context("EUR","SALES_MANAGER","FINANCE");
+        baseline.initialize(maker.workspace(),maker.entity(),"O2C_GOODS",1);
+        long product=db.queryForObject("select id from products where workspace_id=? and sku='RGA-SUP-CS080'",Long.class,maker.workspace());
+        long productVersion=products.get(maker.workspace(),maker.entity(),product).version();
+        long book=priceBooks.save(maker.workspace(),maker.entity(),null,null,"INDEPENDENT","Independent reviewed prices","EUR",DAY,null);
+        priceBooks.line(maker.workspace(),maker.entity(),book,1,product,productVersion,null,new BigDecimal("125.00"));
+        var editor=peer(maker,"SALES_MANAGER");
+        actor(editor.user());
+        priceBooks.line(maker.workspace(),maker.entity(),book,2,product,productVersion,1L,new BigDecimal("127.50"));
+        long approvedVersion=priceBooks.get(maker.workspace(),maker.entity(),book).version();
+        denied(403,()->priceBooks.approve(maker.workspace(),maker.entity(),book,approvedVersion));
+        actor(maker.user());
+        denied(403,()->priceBooks.approve(maker.workspace(),maker.entity(),book,approvedVersion));
+        assertEquals("DRAFT",priceBooks.get(maker.workspace(),maker.entity(),book).status());
+        assertEquals(0,db.queryForObject("select count(*) from price_book_approvals where workspace_id=? and price_book_id=?",Integer.class,maker.workspace(),book));
+        var checker=peer(maker,"SALES_MANAGER");
+        actor(checker.user());
+        priceBooks.approve(maker.workspace(),maker.entity(),book,approvedVersion);
+        assertEquals("APPROVED",priceBooks.get(maker.workspace(),maker.entity(),book).status());
+        assertEquals(checker.user(),db.queryForObject("select approved_by from price_book_approvals where workspace_id=? and price_book_id=?",Long.class,maker.workspace(),book));
+        assertEquals(new BigDecimal("127.50"),priceBooks.lines(maker.workspace(),maker.entity(),book).get(0).amount());
+        denied(409,()->priceBooks.line(maker.workspace(),maker.entity(),book,approvedVersion+1,product,productVersion,2L,new BigDecimal("1.00")));
+        assertEquals(new BigDecimal("127.50"),priceBooks.lines(maker.workspace(),maker.entity(),book).get(0).amount());
+    }
+
+    @Test void salesControlMappingsRejectBankTaxInventoryAndUntypedOpeningsAtomically() {
+        var fixture=purchase(BigDecimal.ONE,new BigDecimal("10.00"),null,null);
+        var c=fixture.creator();
+        for(var account:List.of(new String[]{"AR","ASSET"},new String[]{"UNBILLED","ASSET"},new String[]{"GOODS_REVENUE","INCOME"},new String[]{"COGS","EXPENSE"}))
+            finance.account(c.workspace(),c.entity(),account[0],account[0],account[1]);
+        var ar=salesReference(c,"AR"); var unbilled=salesReference(c,"UNBILLED");
+        var revenue=salesReference(c,"GOODS_REVENUE"); var cogs=salesReference(c,"COGS");
+        for(String conflict:List.of("BANK","INVENTORY","TAX_INPUT"))
+            denied(400,()->salesPosting.save(c.workspace(),c.entity(),new dev.labtrial.salestools.finance.SalesPostingConfigService.Draft(0,salesReference(c,conflict),unbilled,revenue,cogs)));
+        assertEquals(0,db.queryForObject("select count(*) from sales_posting_config where workspace_id=?",Integer.class,c.workspace()));
+        salesPosting.save(c.workspace(),c.entity(),new dev.labtrial.salestools.finance.SalesPostingConfigService.Draft(0,ar,unbilled,revenue,cogs));
+        denied(400,()->finance.paymentConfig(c.workspace(),c.entity(),1,ar.id()));
+        long output=Long.parseLong(accountToken(c,"TAX_OUTPUT").split(":")[0]);
+        denied(400,()->finance.tax(c.workspace(),c.entity(),"BAD-SALES-TAX","AR cannot be Input Tax",DAY,null,new BigDecimal("7"),false,ar.id(),output));
+        int journals=db.queryForObject("select count(*) from journal_entries where workspace_id=?",Integer.class,c.workspace());
+        long equity=Long.parseLong(accountToken(c,"EQUITY").split(":")[0]);
+        for(var control:List.of(ar,unbilled))
+            denied(400,()->ledger.postOpening(c.workspace(),c.entity(),new Ledger.Opening("UNTYPED-"+control.id(),1,DAY,"EUR","Rejected untyped sales opening",List.of(new Ledger.Line(control.id(),BigDecimal.ONE,BigDecimal.ZERO),new Ledger.Line(equity,BigDecimal.ZERO,BigDecimal.ONE)))));
+        assertEquals(journals,db.queryForObject("select count(*) from journal_entries where workspace_id=?",Integer.class,c.workspace()));
+        assertEquals(1L,db.queryForObject("select version from sales_posting_config where workspace_id=?",Long.class,c.workspace()));
+    }
+
+    private dev.labtrial.salestools.finance.SalesPostingConfigService.Reference salesReference(Context c,String code) {
+        String[] token=accountToken(c,code).split(":");
+        return new dev.labtrial.salestools.finance.SalesPostingConfigService.Reference(Long.parseLong(token[0]),Long.parseLong(token[1]));
+    }
+
+    @Test void sharedInquiryClaimHasOneWinnerAndScoreReplayKeepsItsOriginalRuleAndReasons() throws Exception {
+        var c=context("EUR","INSIDE_SALES","SALES_MANAGER");
+        var received=java.time.OffsetDateTime.parse("2027-01-15T09:00:00Z");
+        long inquiry=crmInquiries.save(c.workspace(),c.entity(),null,null,new dev.labtrial.salestools.crm.InquiryService.Draft(
+                "INQUIRY-"+UUID.randomUUID(),received,"New research requirement","Synthetic compatible supply need",
+                null,null,null,null,null,"EU","TRANSFER","HIGH",received.plusDays(2)));
+        assertEquals(List.of(200,409),competing(c,
+            ()->crmInquiries.assign(c.workspace(),c.entity(),inquiry,1,null,"",true),
+            ()->crmInquiries.assign(c.workspace(),c.entity(),inquiry,1,null,"",true)));
+        actor(c.user());
+        var claimed=crmInquiries.get(c.workspace(),c.entity(),inquiry);
+        assertEquals(c.user(),claimed.assigneeId());
+        assertNull(claimed.customerId());
+        assertEquals(0,db.queryForObject("select count(*) from crm_activities where workspace_id=?",Integer.class,c.workspace()));
+        long rule=crmScoring.createRule(c.workspace(),c.entity(),"BASE",20,30,25,25,"BASE-RULE-ONE");
+        var input=new dev.labtrial.salestools.crm.ScoringService.Input(true,true,true,false);
+        var scored=crmScoring.evaluate(c.workspace(),c.entity(),inquiry,claimed.version(),rule,DAY,input);
+        assertEquals(75,scored.score());
+        assertEquals(0,scored.budgetPoints());
+        assertTrue(scored.reasons().contains("Budget"));
+        long updatedRule=crmScoring.createRule(c.workspace(),c.entity(),"BASE",10,10,10,70,"BASE-RULE-TWO");
+        var replay=crmScoring.evaluate(c.workspace(),c.entity(),inquiry,claimed.version(),rule,DAY,input);
+        assertEquals(scored.id(),replay.id());
+        assertEquals(75,replay.score());
+        assertEquals(30,crmScoring.evaluate(c.workspace(),c.entity(),inquiry,claimed.version(),updatedRule,DAY,input).score());
+        assertEquals(2,crmScoring.history(c.workspace(),c.entity(),inquiry).size());
+        assertEquals(0,db.queryForObject("select count(*) from crm_opportunities where workspace_id=?",Integer.class,c.workspace()));
+        assertEquals(0,db.queryForObject("select count(*) from sales_orders where workspace_id=?",Integer.class,c.workspace()));
+    }
+
+    @Test void routingUsesStableTieBreakAndRevokedOwnerBecomesUnassignedNotAnotherTeam() {
+        var manager=context("EUR","SALES_MANAGER");
+        var a=peer(manager,"INSIDE_SALES");
+        var b=peer(manager,"INSIDE_SALES");
+        actor(manager.user());
+        long inquiry=crmInquiries.save(manager.workspace(),manager.entity(),null,null,new dev.labtrial.salestools.crm.InquiryService.Draft(
+                "ROUTE-"+UUID.randomUUID(),java.time.OffsetDateTime.parse("2027-01-15T09:00:00Z"),"Routing boundary","",
+                null,null,null,null,null,"EU","TRANSFER","NORMAL",null));
+        crmRouting.createRule(manager.workspace(),manager.entity(),"Z-LATER","EU","TRANSFER",10,b.user(),true,"ROUTE-Z");
+        long chosen=crmRouting.createRule(manager.workspace(),manager.entity(),"A-FIRST","EU","TRANSFER",10,a.user(),true,"ROUTE-A");
+        var routed=crmRouting.route(manager.workspace(),manager.entity(),inquiry,1);
+        assertEquals(chosen,routed.ruleId());
+        assertEquals(a.user(),routed.assigneeId());
+        assertEquals(1,crmInquiries.list(manager.workspace(),manager.entity(),"team","").size());
+        actor(administrator);
+        identity.role(manager.workspace(),a.user(),"INSIDE_SALES",1,false);
+        actor(manager.user());
+        assertTrue(crmInquiries.list(manager.workspace(),manager.entity(),"team","").isEmpty());
+        var unavailable=crmRouting.route(manager.workspace(),manager.entity(),inquiry,2);
+        assertNull(unavailable.assigneeId());
+        assertEquals(chosen,unavailable.ruleId());
+        assertTrue(unavailable.reason().contains("unavailable"));
+        assertEquals(1,crmInquiries.list(manager.workspace(),manager.entity(),"unassigned","").size());
+    }
+
+    @Test void firstSimulatedResponseRequiresCompletedCommunicationNotClaimOrTask() {
+        var c=context("EUR","INSIDE_SALES");
+        var received=java.time.OffsetDateTime.parse("2027-01-15T09:00:00Z");
+        long inquiry=crmInquiries.save(c.workspace(),c.entity(),null,null,new dev.labtrial.salestools.crm.InquiryService.Draft(
+                "RESPONSE-"+UUID.randomUUID(),received,"Research inquiry","",null,null,null,null,null,"EU","TRANSFER","NORMAL",null));
+        crmInquiries.assign(c.workspace(),c.entity(),inquiry,1,null,"",true);
+        assertNull(crmInquiries.firstResponse(c.workspace(),c.entity(),inquiry));
+        long task=crmActivities.create(c.workspace(),c.entity(),new dev.labtrial.salestools.crm.ActivityService.Draft(
+                inquiry,2L,null,null,null,null,"TASK","Prepare a response",c.user(),received.plusDays(1),"PREPARE-RESPONSE"));
+        denied(400,()->crmActivities.complete(c.workspace(),c.entity(),task,1,"Task is not communication",true));
+        assertNull(crmInquiries.firstResponse(c.workspace(),c.entity(),inquiry));
+        crmActivities.complete(c.workspace(),c.entity(),task,1,"Response preparation complete",false);
+        long email=crmActivities.create(c.workspace(),c.entity(),new dev.labtrial.salestools.crm.ActivityService.Draft(
+                inquiry,2L,null,null,null,null,"EMAIL","Simulated substantive reply",c.user(),received.plusDays(1),"SUBSTANTIVE-EMAIL"));
+        crmActivities.complete(c.workspace(),c.entity(),email,1,"Confirmed compatible supply requirements",true);
+        var response=crmInquiries.firstResponse(c.workspace(),c.entity(),inquiry);
+        assertEquals(email,response.activityId());
+        assertEquals(c.user(),response.actorId());
+        assertEquals("EMAIL",response.kind());
+        assertEquals("Confirmed compatible supply requirements",response.outcome());
+        denied(409,()->crmActivities.edit(c.workspace(),c.entity(),email,2,"Overwrite historical reply",c.user(),received));
+        assertEquals("Confirmed compatible supply requirements",crmInquiries.firstResponse(c.workspace(),c.entity(),inquiry).outcome());
+    }
+
+    @Test void newProductPublicationRequiresIndependentCheckerAndFreezesStockIdentity() {
+        var maker=context("EUR","SALES_MANAGER","FINANCE","OPERATIONS");
+        baseline.initialize(maker.workspace(),maker.entity(),"O2C_GOODS",1);
+        var unit=configuration.list(maker.workspace(),maker.entity(),ConfigurationService.Kind.UOM,"").get(0);
+        long product=products.save(maker.workspace(),maker.entity(),null,null,new ProductService.Input(
+                "PUBLISH-"+UUID.randomUUID(),"User supplied goods","LAB_SUPPLY","TRANSFER",unit.id(),unit.version(),"NONE"));
+        products.assign(maker.workspace(),maker.entity(),product,1,null,true);
+        denied(403,()->products.publish(maker.workspace(),maker.entity(),product,1));
+        var editor=peer(maker,"SALES_MANAGER");
+        products.save(maker.workspace(),maker.entity(),product,1L,new ProductService.Input(
+                products.get(maker.workspace(),maker.entity(),product).sku(),"Edited new goods","LAB_SUPPLY","TRANSFER",unit.id(),unit.version(),"NONE"));
+        denied(403,()->products.publish(maker.workspace(),maker.entity(),product,2));
+        var checker=peer(maker,"SALES_MANAGER");
+        products.publish(maker.workspace(),maker.entity(),product,2);
+        assertEquals("ACTIVE",products.get(maker.workspace(),maker.entity(),product).status());
+        assertEquals(checker.user(),db.queryForObject("select approved_by from product_publications where workspace_id=? and product_id=?",Long.class,maker.workspace(),product));
+        denied(409,()->products.save(maker.workspace(),maker.entity(),product,3L,new ProductService.Input(
+                products.get(maker.workspace(),maker.entity(),product).sku(),"Change published identity","LAB_SUPPLY","TRANSFER",unit.id(),unit.version(),"SERIAL")));
+        assertEquals("NONE",products.get(maker.workspace(),maker.entity(),product).tracking());
+        assertEquals("Edited new goods",products.get(maker.workspace(),maker.entity(),product).name());
+    }
+
+    private record SalesFixture(Context seller,long order,long quote,long orderLine,long warehouse,long product,long customerAccount) {}
+
+    private SalesFixture salesFixture(BigDecimal quantity,BigDecimal price,BigDecimal discountAmount,BigDecimal taxRate) {
+        var purchased=purchase(quantity.add(BigDecimal.TEN),new BigDecimal("60.00"),null,null);
+        var c=peer(purchased.creator(),"INSIDE_SALES","SALES_MANAGER","OPERATIONS","FINANCE");
+        products.publish(c.workspace(),c.entity(),purchased.product(),1);
+        for(var account:List.of(new String[]{"AR","ASSET"},new String[]{"UNBILLED","ASSET"},new String[]{"GOODS_REVENUE","INCOME"},new String[]{"COGS","EXPENSE"}))
+            finance.account(c.workspace(),c.entity(),account[0],account[0],account[1]);
+        salesPosting.save(c.workspace(),c.entity(),new dev.labtrial.salestools.finance.SalesPostingConfigService.Draft(
+                0,salesReference(c,"AR"),salesReference(c,"UNBILLED"),salesReference(c,"GOODS_REVENUE"),salesReference(c,"COGS")));
+        finance.tax(c.workspace(),c.entity(),"GOODS-TAX","Synthetic goods tax",DAY,null,taxRate,false,
+                salesReference(c,"TAX_INPUT").id(),salesReference(c,"TAX_OUTPUT").id());
+        long tax=db.queryForObject("select v.id from tax_versions v join tax_codes t on t.workspace_id=v.workspace_id and t.entity_id=v.entity_id and t.id=v.tax_code_id where t.workspace_id=? and t.entity_id=? and t.code='GOODS-TAX'",Long.class,c.workspace(),c.entity());
+        long book=priceBooks.save(c.workspace(),c.entity(),null,null,"GOODS-BOOK","New goods prices","EUR",DAY,null);
+        priceBooks.line(c.workspace(),c.entity(),book,1,purchased.product(),2,null,price);
+        var checker=peer(c,"SALES_MANAGER");
+        priceBooks.approve(c.workspace(),c.entity(),book,2);
+        actor(c.user());
+        long customer=((Number)salesQuotes.customers(c.workspace(),c.entity()).get(0).get("id")).longValue();
+        var product=products.get(c.workspace(),c.entity(),purchased.product());
+        var unit=configuration.get(c.workspace(),c.entity(),ConfigurationService.Kind.UOM,product.uomId());
+        long quote=salesQuotes.save(c.workspace(),c.entity(),null,null,new dev.labtrial.salestools.order.QuoteService.Draft(
+                "DIRECT_ERP",customer,1,null,DAY.plusDays(2),DAY.plusDays(30),1,null,null,
+                List.of(new dev.labtrial.salestools.order.QuoteService.LineInput("GOODS-LINE",product.id(),product.version(),
+                        products.setting(c.workspace(),c.entity(),product.id()).version(),unit.version(),book,3,1,
+                        quantity,null,null,discountAmount,tax,1))));
+        salesQuotes.submit(c.workspace(),c.entity(),quote,1);
+        salesQuotes.accept(c.workspace(),c.entity(),quote,2,DAY.plusDays(2),"SYNTHETIC-CUSTOMER-PO");
+        var commercial=salesQuotes.quote(c.workspace(),c.entity(),quote);
+        long order=salesHandover.execute(c.workspace(),c.entity(),quote,((Number)commercial.get("revision_id")).longValue(),
+                ((Number)commercial.get("version")).longValue(),"BOOK-"+UUID.randomUUID()).orderId();
+        long line=db.queryForObject("select id from sales_order_lines where workspace_id=? and entity_id=? and order_id=?",Long.class,c.workspace(),c.entity(),order);
+        long warehouse=configuration.list(c.workspace(),c.entity(),ConfigurationService.Kind.WAREHOUSE,"").get(0).id();
+        return new SalesFixture(c,order,quote,line,warehouse,product.id(),customer);
+    }
+
+    private void reserveGoods(SalesFixture f,BigDecimal quantity) {
+        var c=f.seller(); actor(c.user());
+        long ov=db.queryForObject("select version from sales_orders where id=?",Long.class,f.order());
+        long lv=db.queryForObject("select version from sales_order_lines where id=?",Long.class,f.orderLine());
+        long wv=configuration.get(c.workspace(),c.entity(),ConfigurationService.Kind.WAREHOUSE,f.warehouse()).version();
+        fulfillment.reserve(c.workspace(),c.entity(),f.order(),ov,f.orderLine(),lv,f.warehouse(),wv,null,null,quantity,"RESERVE-"+UUID.randomUUID());
+    }
+
+    private long shipGoods(SalesFixture f,BigDecimal quantity,LocalDate date) {
+        var c=f.seller(); actor(c.user());
+        long ov=db.queryForObject("select version from sales_orders where id=?",Long.class,f.order());
+        long lv=db.queryForObject("select version from sales_order_lines where id=?",Long.class,f.orderLine());
+        long wv=configuration.get(c.workspace(),c.entity(),ConfigurationService.Kind.WAREHOUSE,f.warehouse()).version();
+        long shipment=fulfillment.saveShipment(c.workspace(),c.entity(),null,null,
+                new dev.labtrial.salestools.order.FulfillmentService.ShipmentDraft("SHIP-"+UUID.randomUUID(),f.order(),ov,date,
+                        List.of(new dev.labtrial.salestools.order.FulfillmentService.ShipmentLineDraft("GOODS",f.orderLine(),lv,f.warehouse(),wv,quantity))));
+        fulfillment.postShipment(c.workspace(),c.entity(),shipment,1);
+        return db.queryForObject("select id from shipment_lines where workspace_id=? and entity_id=? and shipment_id=? and active",Long.class,c.workspace(),c.entity(),shipment);
+    }
+
+    private long invoiceGoods(SalesFixture f,long shipmentLine,String start,String end,LocalDate date) {
+        var c=f.seller(); actor(c.user());
+        long invoice=salesInvoices.save(c.workspace(),c.entity(),null,0,new dev.labtrial.salestools.finance.SalesInvoiceService.Draft(
+                "INVOICE-"+UUID.randomUUID(),date,List.of(new dev.labtrial.salestools.finance.SalesInvoiceService.Line(
+                        "GOODS",shipmentLine,new BigDecimal(start),new BigDecimal(end)))));
+        salesInvoices.post(c.workspace(),c.entity(),invoice,1);
+        return invoice;
+    }
+
+    @Test void partialShipmentCancellationPreservesOpenQuantityReservationsAndSingleOrderLineage() {
+        var f=salesFixture(new BigDecimal("10"),new BigDecimal("125.00"),null,new BigDecimal("7"));
+        var c=f.seller();
+        reserveGoods(f,new BigDecimal("7"));
+        shipGoods(f,new BigDecimal("3"),DAY.plusDays(3));
+        long ov=db.queryForObject("select version from sales_orders where id=?",Long.class,f.order());
+        long lv=db.queryForObject("select version from sales_order_lines where id=?",Long.class,f.orderLine());
+        fulfillment.cancel(c.workspace(),c.entity(),f.order(),ov,f.orderLine(),lv,new BigDecimal("4"),"Customer reduced remaining requirement","CANCEL-FOUR");
+        var line=db.queryForMap("select fulfilled_qty,cancelled_qty from sales_order_lines where id=?",f.orderLine());
+        assertEquals(new BigDecimal("3.000000"),line.get("fulfilled_qty"));
+        assertEquals(new BigDecimal("4.000000"),line.get("cancelled_qty"));
+        assertEquals(new BigDecimal("3.000000"),db.queryForObject("select sum(quantity-released_qty-consumed_qty) from inventory_reservations where order_line_id=?",BigDecimal.class,f.orderLine()));
+        shipGoods(f,new BigDecimal("3"),DAY.plusDays(4));
+        assertEquals(new BigDecimal("6.000000"),db.queryForObject("select fulfilled_qty from sales_order_lines where id=?",BigDecimal.class,f.orderLine()));
+        assertEquals(new BigDecimal("0.000000"),db.queryForObject("select sum(quantity-released_qty-consumed_qty) from inventory_reservations where order_line_id=?",BigDecimal.class,f.orderLine()));
+        var quote=salesQuotes.quote(c.workspace(),c.entity(),f.quote());
+        assertEquals(f.order(),salesHandover.execute(c.workspace(),c.entity(),f.quote(),((Number)quote.get("revision_id")).longValue(),1,"RETRY-NEW-INTENT").orderId());
+        assertEquals(1,db.queryForObject("select count(*) from sales_orders where workspace_id=? and quote_id=?",Integer.class,c.workspace(),f.quote()));
+    }
+
+    @Test void middleInvoiceCorrectionRebillsOriginalResidualSliceWithoutReversingShipment() {
+        var f=salesFixture(new BigDecimal("3"),BigDecimal.ONE,BigDecimal.ONE,new BigDecimal("7"));
+        var c=f.seller(); reserveGoods(f,new BigDecimal("3"));
+        long delivered=shipGoods(f,new BigDecimal("3"),DAY.plusDays(3));
+        long first=invoiceGoods(f,delivered,"0","1",DAY.plusDays(3));
+        long middle=invoiceGoods(f,delivered,"1","2",DAY.plusDays(3));
+        long last=invoiceGoods(f,delivered,"2","3",DAY.plusDays(3));
+        for(var expected:List.of(new Object[]{first,"0.67","0.33","0.05"},new Object[]{middle,"0.66","0.34","0.04"},new Object[]{last,"0.67","0.33","0.05"})) {
+            var actual=db.queryForMap("select net,discount,tax from sales_invoice_lines where invoice_id=?",expected[0]);
+            assertEquals(new BigDecimal((String)expected[1]),actual.get("net"));
+            assertEquals(new BigDecimal((String)expected[2]),actual.get("discount"));
+            assertEquals(new BigDecimal((String)expected[3]),actual.get("tax"));
+        }
+        var original=db.queryForMap("select slice_start,slice_end,subtotal,discount,net,tax,gross from sales_invoice_lines where invoice_id=?",middle);
+        var stock=db.queryForMap("select quantity,value,pool_sequence from inventory_valuation_pools where workspace_id=? and entity_id=? and product_id=?",c.workspace(),c.entity(),f.product());
+        salesInvoices.reverse(c.workspace(),c.entity(),middle,DAY.plusDays(4),"Correct middle source interval","MIDDLE-REVERSAL");
+        long rebill=invoiceGoods(f,delivered,"1","2",DAY.plusDays(4));
+        assertEquals(original,db.queryForMap("select slice_start,slice_end,subtotal,discount,net,tax,gross from sales_invoice_lines where invoice_id=?",rebill));
+        assertEquals(stock,db.queryForMap("select quantity,value,pool_sequence from inventory_valuation_pools where workspace_id=? and entity_id=? and product_id=?",c.workspace(),c.entity(),f.product()));
+        assertEquals(new BigDecimal("2.00"),db.queryForObject("select sum(l.credit-l.debit) from journal_lines l join journal_entries j on j.id=l.journal_id where j.workspace_id=? and j.entity_id=? and l.account_id=?",BigDecimal.class,c.workspace(),c.entity(),salesReference(c,"GOODS_REVENUE").id()));
+    }
+
+    private long receiptGoods(SalesFixture f,String key,LocalDate date,String amount,
+            List<dev.labtrial.salestools.finance.CustomerReceiptService.Allocation> allocations) {
+        var c=f.seller(); actor(c.user());
+        return customerReceipts.save(c.workspace(),c.entity(),null,0,
+            new dev.labtrial.salestools.finance.CustomerReceiptService.Draft(key,f.customerAccount(),1,1,1,date,"EUR",
+                    new BigDecimal(amount),allocations));
+    }
+
+    @Test void fullyAllocatedCustomerCashAndFutureFullReversalPreserveAsOfAndInvoiceCorrectionGate() {
+        var f=salesFixture(new BigDecimal("11"),new BigDecimal("10.00"),null,BigDecimal.ZERO);
+        var c=f.seller(); reserveGoods(f,new BigDecimal("11"));
+        long delivered=shipGoods(f,new BigDecimal("11"),DAY.plusDays(3));
+        long a=invoiceGoods(f,delivered,"0","6",DAY.plusDays(3));
+        long b=invoiceGoods(f,delivered,"6","11",DAY.plusDays(3));
+        long bad=receiptGoods(f,"INVALID-SUM",DAY.plusDays(4),"100.00",List.of(
+                new dev.labtrial.salestools.finance.CustomerReceiptService.Allocation(a,new BigDecimal("60.00")),
+                new dev.labtrial.salestools.finance.CustomerReceiptService.Allocation(b,new BigDecimal("50.00"))));
+        int journals=db.queryForObject("select count(*) from journal_entries where workspace_id=?",Integer.class,c.workspace());
+        denied(400,()->customerReceipts.post(c.workspace(),c.entity(),bad,1));
+        assertEquals(journals,db.queryForObject("select count(*) from journal_entries where workspace_id=?",Integer.class,c.workspace()));
+        long cash=receiptGoods(f,"VALID-100",DAY.plusDays(4),"100.00",List.of(
+                new dev.labtrial.salestools.finance.CustomerReceiptService.Allocation(a,new BigDecimal("60.00")),
+                new dev.labtrial.salestools.finance.CustomerReceiptService.Allocation(b,new BigDecimal("40.00"))));
+        customerReceipts.post(c.workspace(),c.entity(),cash,1);
+        assertEquals(new BigDecimal("10.00"),customerReceipts.aging(c.workspace(),c.entity(),DAY.plusDays(4)).stream()
+                .map(row->(BigDecimal)row.get("open_amount")).reduce(BigDecimal.ZERO,BigDecimal::add));
+        customerReceipts.reverse(c.workspace(),c.entity(),cash,DAY.plusDays(6),"Reverse complete synthetic receipt","CASH-FULL-REVERSAL");
+        customerReceipts.reverse(c.workspace(),c.entity(),cash,DAY.plusDays(6),"Reverse complete synthetic receipt","CASH-FULL-REVERSAL");
+        assertEquals(new BigDecimal("10.00"),customerReceipts.aging(c.workspace(),c.entity(),DAY.plusDays(5)).stream()
+                .map(row->(BigDecimal)row.get("open_amount")).reduce(BigDecimal.ZERO,BigDecimal::add));
+        assertEquals(new BigDecimal("110.00"),customerReceipts.aging(c.workspace(),c.entity(),DAY.plusDays(6)).stream()
+                .map(row->(BigDecimal)row.get("open_amount")).reduce(BigDecimal.ZERO,BigDecimal::add));
+        denied(409,()->salesInvoices.reverse(c.workspace(),c.entity(),a,DAY.plusDays(5),"Cash still effective","EARLY-INVOICE-REVERSAL"));
+        assertEquals(0,db.queryForObject("select count(*) from sales_reversals where workspace_id=? and invoice_id=?",Integer.class,c.workspace(),a));
+        salesInvoices.reverse(c.workspace(),c.entity(),a,DAY.plusDays(6),"Cash fully reversed first","ALLOWED-INVOICE-REVERSAL");
+        assertEquals(new BigDecimal("50.00"),customerReceipts.aging(c.workspace(),c.entity(),DAY.plusDays(6)).stream()
+                .map(row->(BigDecimal)row.get("open_amount")).reduce(BigDecimal.ZERO,BigDecimal::add));
+    }
+
+    @Test void distinctCustomerReceiptsCompeteForOneBalanceWithoutDoubleCashOrAr() throws Exception {
+        var f=salesFixture(BigDecimal.ONE,new BigDecimal("100.00"),null,BigDecimal.ZERO);
+        var c=f.seller(); reserveGoods(f,BigDecimal.ONE);
+        long delivered=shipGoods(f,BigDecimal.ONE,DAY.plusDays(3));
+        long invoice=invoiceGoods(f,delivered,"0","1",DAY.plusDays(3));
+        var allocations=List.of(new dev.labtrial.salestools.finance.CustomerReceiptService.Allocation(invoice,new BigDecimal("100.00")));
+        long a=receiptGoods(f,"CASH-COMPETE-A",DAY.plusDays(4),"100.00",allocations);
+        long b=receiptGoods(f,"CASH-COMPETE-B",DAY.plusDays(4),"100.00",allocations);
+        assertEquals(List.of(200,409),competing(c,
+                ()->customerReceipts.post(c.workspace(),c.entity(),a,1),
+                ()->customerReceipts.post(c.workspace(),c.entity(),b,1)));
+        actor(c.user());
+        assertEquals(1,db.queryForObject("select count(*) from customer_receipts where workspace_id=? and status='POSTED'",Integer.class,c.workspace()));
+        assertEquals(new BigDecimal("0.00"),customerReceipts.aging(c.workspace(),c.entity(),DAY.plusDays(4)).get(0).get("open_amount"));
+        assertEquals(new BigDecimal("100.00"),db.queryForObject("select sum(l.debit-l.credit) from journal_lines l join journal_entries j on j.id=l.journal_id where j.workspace_id=? and j.source_type='CUSTOMER_RECEIPT' and l.account_id=?",BigDecimal.class,c.workspace(),salesReference(c,"BANK").id()));
+    }
+
+    @Test void reactivationUsesPositiveFulfillmentAtExactBoundaryAndRetainsOneResolvedCycle() {
+        var f=salesFixture(BigDecimal.ONE,new BigDecimal("10.00"),null,BigDecimal.ZERO);
+        var c=f.seller(); reserveGoods(f,BigDecimal.ONE);
+        LocalDate fulfilled=DAY.plusDays(3);
+        shipGoods(f,BigDecimal.ONE,fulfilled);
+        long customer=db.queryForObject("select customer_id from customer_entity_accounts where id=?",Long.class,f.customerAccount());
+        long rule=reactivation.createRule(c.workspace(),c.entity(),"DORMANT",180,"DORMANT-RULE-ONE");
+        assertEquals("NOT_DORMANT",reactivation.scan(c.workspace(),c.entity(),rule,fulfilled.plusDays(179)).stream()
+                .filter(row->row.customerId()==customer).findFirst().orElseThrow().outcome());
+        var candidate=reactivation.scan(c.workspace(),c.entity(),rule,fulfilled.plusDays(180)).stream()
+                .filter(row->row.customerId()==customer).findFirst().orElseThrow();
+        assertEquals("ELIGIBLE",candidate.outcome());
+        long caseId=candidate.caseId();
+        assertTrue(reactivation.scan(c.workspace(),c.entity(),rule,fulfilled.plusDays(180)).stream()
+                .anyMatch(row->row.outcome().equals("NO_HISTORY")));
+        long task=reactivation.followUp(c.workspace(),c.entity(),caseId,1,"Review dormant synthetic customer",
+                java.time.OffsetDateTime.parse("2027-08-01T09:00:00Z"));
+        reactivation.transition(c.workspace(),c.entity(),caseId,2,"RESOLVED","Customer declined follow-up");
+        long newRule=reactivation.createRule(c.workspace(),c.entity(),"DORMANT",181,"DORMANT-RULE-TWO");
+        var rescanned=reactivation.scan(c.workspace(),c.entity(),newRule,fulfilled.plusDays(182)).stream()
+                .filter(row->row.customerId()==customer).findFirst().orElseThrow();
+        assertEquals("HELD",rescanned.outcome());
+        assertEquals(caseId,rescanned.caseId());
+        assertEquals(1,db.queryForObject("select count(*) from crm_reactivation_cases where workspace_id=? and customer_id=?",Integer.class,c.workspace(),customer));
+        assertEquals(task,db.queryForObject("select follow_up_activity_id from crm_reactivation_cases where id=?",Long.class,caseId));
+        denied(409,()->reactivation.followUp(c.workspace(),c.entity(),caseId,3,"Duplicate forbidden",null));
+        assertEquals(1,db.queryForObject("select count(*) from crm_activities where workspace_id=? and customer_id=?",Integer.class,c.workspace(),customer));
+    }
+
+    private long anotherGoodsQuote(SalesFixture f,BigDecimal quantity,BigDecimal override,BigDecimal discount) {
+        var c=f.seller(); actor(c.user());
+        var p=products.get(c.workspace(),c.entity(),f.product());
+        var unit=configuration.get(c.workspace(),c.entity(),ConfigurationService.Kind.UOM,p.uomId());
+        var book=db.queryForMap("select id,version from price_books where workspace_id=? and entity_id=? and code='GOODS-BOOK'",c.workspace(),c.entity());
+        long bookId=((Number)book.get("id")).longValue();
+        long lineVersion=db.queryForObject("select version from price_book_lines where workspace_id=? and entity_id=? and price_book_id=? and product_id=?",Long.class,c.workspace(),c.entity(),bookId,f.product());
+        var tax=db.queryForMap("select v.id,v.version from tax_versions v join tax_codes t on t.workspace_id=v.workspace_id and t.entity_id=v.entity_id and t.id=v.tax_code_id where t.workspace_id=? and t.entity_id=? and t.code='GOODS-TAX'",c.workspace(),c.entity());
+        return salesQuotes.save(c.workspace(),c.entity(),null,null,new dev.labtrial.salestools.order.QuoteService.Draft(
+            "DIRECT_ERP",f.customerAccount(),1,null,DAY.plusDays(2),DAY.plusDays(30),1,null,null,
+            List.of(new dev.labtrial.salestools.order.QuoteService.LineInput("GOODS-LINE",p.id(),p.version(),products.setting(c.workspace(),c.entity(),p.id()).version(),
+                unit.version(),bookId,((Number)book.get("version")).longValue(),lineVersion,quantity,override,null,discount,
+                ((Number)tax.get("id")).longValue(),((Number)tax.get("version")).longValue()))));
+    }
+
+    @Test void manualPriceOverrideNeedsIndependentExactRevisionApprovalAndRevisionInvalidatesIt() {
+        var f=salesFixture(BigDecimal.ONE,new BigDecimal("100.00"),null,BigDecimal.ZERO);
+        var c=f.seller();
+        long quote=anotherGoodsQuote(f,BigDecimal.ONE,new BigDecimal("100.00"),null);
+        salesQuotes.submit(c.workspace(),c.entity(),quote,1);
+        assertEquals("SUBMITTED",salesQuotes.quote(c.workspace(),c.entity(),quote).get("status"));
+        denied(403,()->salesQuotes.decide(c.workspace(),c.entity(),quote,2,true,"I cannot approve my own override"));
+        denied(409,()->salesQuotes.accept(c.workspace(),c.entity(),quote,2,DAY.plusDays(2),"EARLY-PO"));
+        var checker=peer(c,"SALES_MANAGER");
+        salesQuotes.decide(c.workspace(),c.entity(),quote,2,true,"Independently reviewed manual override");
+        actor(c.user());
+        salesQuotes.revise(c.workspace(),c.entity(),quote,3);
+        var revised=salesQuotes.quote(c.workspace(),c.entity(),quote);
+        assertEquals("DRAFT",revised.get("status"));
+        assertEquals(2L,((Number)revised.get("revision")).longValue());
+        denied(409,()->salesQuotes.accept(c.workspace(),c.entity(),quote,4,DAY.plusDays(2),"OLD-APPROVAL-PO"));
+        assertEquals(0,db.queryForObject("select count(*) from sales_orders where workspace_id=? and quote_id=?",Integer.class,c.workspace(),quote));
+        assertEquals(1,db.queryForObject("select count(*) from quote_events e join quote_revisions r on r.workspace_id=e.workspace_id and r.entity_id=e.entity_id and r.id=e.revision_id where r.workspace_id=? and r.quote_id=? and e.kind='APPROVED'",Integer.class,c.workspace(),quote));
+    }
+
+    @Test void competingGoodsReservationsCannotOwnTheSameAvailableUnitsTwice() throws Exception {
+        var f=salesFixture(new BigDecimal("20"),new BigDecimal("100.00"),null,BigDecimal.ZERO);
+        var c=f.seller();
+        long ov=db.queryForObject("select version from sales_orders where id=?",Long.class,f.order());
+        long lv=db.queryForObject("select version from sales_order_lines where id=?",Long.class,f.orderLine());
+        long wv=configuration.get(c.workspace(),c.entity(),ConfigurationService.Kind.WAREHOUSE,f.warehouse()).version();
+        assertEquals(List.of(200,409),competing(c,
+            ()->fulfillment.reserve(c.workspace(),c.entity(),f.order(),ov,f.orderLine(),lv,f.warehouse(),wv,null,null,new BigDecimal("20"),"RESERVATION-A"),
+            ()->fulfillment.reserve(c.workspace(),c.entity(),f.order(),ov,f.orderLine(),lv,f.warehouse(),wv,null,null,new BigDecimal("20"),"RESERVATION-B")));
+        actor(c.user());
+        assertEquals(new BigDecimal("20.000000"),db.queryForObject("select reserved from inventory_balances where workspace_id=? and entity_id=? and product_id=? and warehouse_id=?",BigDecimal.class,c.workspace(),c.entity(),f.product(),f.warehouse()));
+        assertEquals(new BigDecimal("30.000000"),db.queryForObject("select on_hand from inventory_balances where workspace_id=? and entity_id=? and product_id=? and warehouse_id=?",BigDecimal.class,c.workspace(),c.entity(),f.product(),f.warehouse()));
+    }
+
+    @Test void oneMultilineShipmentPreservesDuplicateSkuLineEntitlementsAndOneBalancedJournal() {
+        var f=salesFixture(new BigDecimal("5"),new BigDecimal("10.00"),null,BigDecimal.ZERO);
+        var c=f.seller();
+        var original=salesQuotes.lines(c.workspace(),c.entity(),f.quote()).get(0);
+        var inputs=new ArrayList<dev.labtrial.salestools.order.QuoteService.LineInput>();
+        for(var pair:List.of(new String[]{"FIRST","2"},new String[]{"SECOND","3"}))
+            inputs.add(new dev.labtrial.salestools.order.QuoteService.LineInput(pair[0],f.product(),
+                ((Number)original.get("product_version")).longValue(),((Number)original.get("product_setting_version")).longValue(),
+                ((Number)original.get("uom_version")).longValue(),((Number)original.get("price_book_id")).longValue(),
+                ((Number)original.get("price_book_version")).longValue(),((Number)original.get("price_book_line_version")).longValue(),
+                new BigDecimal(pair[1]),null,null,null,((Number)original.get("tax_version_id")).longValue(),
+                ((Number)original.get("tax_version_version")).longValue()));
+        long quote=salesQuotes.save(c.workspace(),c.entity(),null,null,new dev.labtrial.salestools.order.QuoteService.Draft(
+                "DIRECT_ERP",f.customerAccount(),1,null,DAY.plusDays(2),DAY.plusDays(30),1,null,null,inputs));
+        salesQuotes.submit(c.workspace(),c.entity(),quote,1);
+        salesQuotes.accept(c.workspace(),c.entity(),quote,2,DAY.plusDays(2),"MULTILINE-PO");
+        var source=salesQuotes.quote(c.workspace(),c.entity(),quote);
+        long order=salesHandover.execute(c.workspace(),c.entity(),quote,((Number)source.get("revision_id")).longValue(),3,"MULTILINE-BOOK").orderId();
+        var lines=db.queryForList("select id,quantity from sales_order_lines where order_id=? order by id",order);
+        long wv=configuration.get(c.workspace(),c.entity(),ConfigurationService.Kind.WAREHOUSE,f.warehouse()).version();
+        for(var line:lines) {
+            long ov=db.queryForObject("select version from sales_orders where id=?",Long.class,order);
+            long lv=db.queryForObject("select version from sales_order_lines where id=?",Long.class,line.get("id"));
+            fulfillment.reserve(c.workspace(),c.entity(),order,ov,((Number)line.get("id")).longValue(),lv,f.warehouse(),wv,null,null,(BigDecimal)line.get("quantity"),"MULTILINE-RESERVE-"+line.get("id"));
+        }
+        var shipping=new ArrayList<dev.labtrial.salestools.order.FulfillmentService.ShipmentLineDraft>();
+        for(var line:lines) shipping.add(new dev.labtrial.salestools.order.FulfillmentService.ShipmentLineDraft(
+                "SHIP-"+line.get("id"),((Number)line.get("id")).longValue(),
+                db.queryForObject("select version from sales_order_lines where id=?",Long.class,line.get("id")),
+                f.warehouse(),wv,(BigDecimal)line.get("quantity")));
+        long shipment=fulfillment.saveShipment(c.workspace(),c.entity(),null,null,
+                new dev.labtrial.salestools.order.FulfillmentService.ShipmentDraft("MULTILINE-SHIP",order,
+                        db.queryForObject("select version from sales_orders where id=?",Long.class,order),DAY.plusDays(3),shipping));
+        fulfillment.postShipment(c.workspace(),c.entity(),shipment,1);
+        assertEquals(2,db.queryForObject("select count(*) from shipment_lines where shipment_id=? and active",Integer.class,shipment));
+        assertEquals(new BigDecimal("5.000000"),db.queryForObject("select sum(fulfilled_qty) from sales_order_lines where order_id=?",BigDecimal.class,order));
+        assertEquals(new BigDecimal("10.000000"),db.queryForObject("select on_hand from inventory_balances where workspace_id=? and entity_id=? and product_id=? and warehouse_id=?",BigDecimal.class,c.workspace(),c.entity(),f.product(),f.warehouse()));
+        long journal=db.queryForObject("select journal_id from shipments where id=?",Long.class,shipment);
+        assertEquals(new BigDecimal("350.00"),db.queryForObject("select sum(debit) from journal_lines where journal_id=?",BigDecimal.class,journal));
+        assertEquals(new BigDecimal("350.00"),db.queryForObject("select sum(credit) from journal_lines where journal_id=?",BigDecimal.class,journal));
+        assertEquals(1,db.queryForObject("select count(*) from journal_entries where workspace_id=? and source_type='SHIPMENT' and source_id=?",Integer.class,c.workspace(),Long.toString(shipment)));
+    }
+
+    @Test void deviceAmountDiscountRequiresIndependentApprovalAndReservedSerialCannotTransfer() {
+        var f=salesFixture(BigDecimal.ONE,new BigDecimal("10.00"),null,BigDecimal.ZERO);
+        var c=f.seller();
+        long product=db.queryForObject("select id from products where workspace_id=? and sku='RGA-UNIT-TR120'",Long.class,c.workspace());
+        var p=products.get(c.workspace(),c.entity(),product);
+        var unit=configuration.get(c.workspace(),c.entity(),ConfigurationService.Kind.UOM,p.uomId());
+        long bookId=priceBooks.save(c.workspace(),c.entity(),null,null,"DEVICE-BOOK","Independently reviewed device prices","EUR",DAY,null);
+        priceBooks.line(c.workspace(),c.entity(),bookId,1,product,p.version(),null,new BigDecimal("24000.00"));
+        var checker=peer(c,"SALES_MANAGER");
+        priceBooks.approve(c.workspace(),c.entity(),bookId,2);
+        actor(c.user());
+        var book=db.queryForMap("select id,version from price_books where id=?",bookId);
+        var price=db.queryForMap("select version from price_book_lines where price_book_id=? and product_id=?",bookId,product);
+        var tax=db.queryForMap("select v.id,v.version from tax_versions v join tax_codes t on t.id=v.tax_code_id where t.workspace_id=? and t.code='SIM-VAT7'",c.workspace());
+        long quote=salesQuotes.save(c.workspace(),c.entity(),null,null,new dev.labtrial.salestools.order.QuoteService.Draft(
+                "DIRECT_ERP",f.customerAccount(),1,null,DAY.plusDays(2),DAY.plusDays(30),1,null,null,
+                List.of(new dev.labtrial.salestools.order.QuoteService.LineInput("DEVICE",product,p.version(),1,unit.version(),
+                        bookId,((Number)book.get("version")).longValue(),((Number)price.get("version")).longValue(),
+                        BigDecimal.ONE,null,null,new BigDecimal("2400.01"),((Number)tax.get("id")).longValue(),((Number)tax.get("version")).longValue()))));
+        salesQuotes.submit(c.workspace(),c.entity(),quote,1);
+        assertEquals("SUBMITTED",salesQuotes.quote(c.workspace(),c.entity(),quote).get("status"));
+        denied(403,()->salesQuotes.decide(c.workspace(),c.entity(),quote,2,true,"Maker cannot approve amount discount"));
+        actor(checker.user());
+        salesQuotes.decide(c.workspace(),c.entity(),quote,2,true,"Independent greater-than-ten-percent discount");
+        actor(c.user());
+        salesQuotes.accept(c.workspace(),c.entity(),quote,3,DAY.plusDays(2),"DEVICE-PO");
+        var source=salesQuotes.quote(c.workspace(),c.entity(),quote);
+        long order=salesHandover.execute(c.workspace(),c.entity(),quote,((Number)source.get("revision_id")).longValue(),4,"DEVICE-BOOK").orderId();
+        long line=db.queryForObject("select id from sales_order_lines where order_id=?",Long.class,order);
+        long serial=db.queryForObject("select id from instrument_serials where workspace_id=? and entity_id=? and product_id=? and status='IN_STOCK'",Long.class,c.workspace(),c.entity(),product);
+        long ov=db.queryForObject("select version from sales_orders where id=?",Long.class,order);
+        long lv=db.queryForObject("select version from sales_order_lines where id=?",Long.class,line);
+        fulfillment.reserve(c.workspace(),c.entity(),order,ov,line,lv,f.warehouse(),1,serial,null,BigDecimal.ONE,"EXACT-SERIAL");
+        long target=configuration.save(c.workspace(),c.entity(),ConfigurationService.Kind.WAREHOUSE,null,null,"SECOND-WH","Second owned warehouse",null,null);
+        long move=inventory.saveAction(c.workspace(),c.entity(),null,null,new InventoryService.ActionInput(
+                "RESERVED-SERIAL-TRANSFER","TRANSFER",product,p.version(),unit.id(),unit.version(),1,
+                f.warehouse(),1L,target,1L,BigDecimal.ONE,null,DAY.plusDays(3),"Must not transfer order-reserved serial",
+                List.of(new InventoryService.TrackingInput("SIM-RGA-TR120-00002",null,null,BigDecimal.ONE))));
+        denied(409,()->inventory.postAction(c.workspace(),c.entity(),move,1));
+        assertEquals("IN_STOCK",db.queryForObject("select status from instrument_serials where id=?",String.class,serial));
+        var single=new SalesFixture(c,order,quote,line,f.warehouse(),product,f.customerAccount());
+        shipGoods(single,BigDecimal.ONE,DAY.plusDays(3));
+        assertEquals("ISSUED",db.queryForObject("select status from instrument_serials where id=?",String.class,serial));
+        assertEquals(new BigDecimal("-12000.00"),db.queryForObject("select sum(value_delta) from stock_movements where workspace_id=? and entity_id=? and source_type='SHIPMENT' and serial_id=?",BigDecimal.class,c.workspace(),c.entity(),serial));
+    }
+
+    @Test void freeGoodsStillIssueCostAndZeroGlInvoiceCannotBypassClosedPeriodOrCorrectionHistory() {
+        var f=salesFixture(BigDecimal.ONE,BigDecimal.ZERO,null,BigDecimal.ZERO);
+        var c=f.seller(); reserveGoods(f,BigDecimal.ONE);
+        long delivered=shipGoods(f,BigDecimal.ONE,DAY.plusDays(3));
+        assertEquals(new BigDecimal("60.00"),db.queryForObject("select cost from shipment_lines where id=?",BigDecimal.class,delivered));
+        long invoice=salesInvoices.save(c.workspace(),c.entity(),null,0,new dev.labtrial.salestools.finance.SalesInvoiceService.Draft(
+                "FREE-GOODS-INVOICE",DAY.plusDays(3),List.of(new dev.labtrial.salestools.finance.SalesInvoiceService.Line("FREE",delivered,BigDecimal.ZERO,BigDecimal.ONE))));
+        long period=db.queryForObject("select id from fiscal_periods where workspace_id=? and entity_id=?",Long.class,c.workspace(),c.entity());
+        finance.state(c.workspace(),c.entity(),period,1,"CLOSED");
+        int journals=db.queryForObject("select count(*) from journal_entries where workspace_id=?",Integer.class,c.workspace());
+        denied(409,()->salesInvoices.post(c.workspace(),c.entity(),invoice,1));
+        assertEquals("DRAFT",salesInvoices.detail(c.workspace(),c.entity(),invoice).get("status"));
+        assertEquals(journals,db.queryForObject("select count(*) from journal_entries where workspace_id=?",Integer.class,c.workspace()));
+        finance.state(c.workspace(),c.entity(),period,2,"OPEN");
+        salesInvoices.post(c.workspace(),c.entity(),invoice,1);
+        assertNull(salesInvoices.detail(c.workspace(),c.entity(),invoice).get("journal_id"));
+        assertEquals(journals,db.queryForObject("select count(*) from journal_entries where workspace_id=?",Integer.class,c.workspace()));
+        salesInvoices.reverse(c.workspace(),c.entity(),invoice,DAY.plusDays(4),"Free source correction","FREE-SOURCE-CORRECTION");
+        assertNull(db.queryForObject("select journal_id from sales_reversals where invoice_id=?",Long.class,invoice));
+        long rebill=invoiceGoods(f,delivered,"0","1",DAY.plusDays(4));
+        assertNull(salesInvoices.detail(c.workspace(),c.entity(),rebill).get("journal_id"));
+        assertEquals(0,db.queryForObject("select count(*) from customer_receipts where workspace_id=?",Integer.class,c.workspace()));
+        assertEquals(new BigDecimal("60.00"),db.queryForObject("select sum(l.debit-l.credit) from journal_lines l join journal_entries j on j.id=l.journal_id where j.workspace_id=? and l.account_id=?",BigDecimal.class,c.workspace(),salesReference(c,"COGS").id()));
+    }
+
+    @Test void invoiceIntervalsRejectExtremeExponentBeforeHashAndFutureReversalCannotReleaseEarly() {
+        var f=salesFixture(BigDecimal.ONE,new BigDecimal("10.00"),null,BigDecimal.ZERO);
+        var c=f.seller(); reserveGoods(f,BigDecimal.ONE);
+        long delivered=shipGoods(f,BigDecimal.ONE,DAY.plusDays(3));
+        denied(400,()->salesInvoices.save(c.workspace(),c.entity(),null,0,new dev.labtrial.salestools.finance.SalesInvoiceService.Draft(
+                "HUGE-INTERVAL",DAY.plusDays(3),List.of(new dev.labtrial.salestools.finance.SalesInvoiceService.Line("BAD",delivered,new BigDecimal("1e2147483647"),BigDecimal.ONE)))));
+        long original=invoiceGoods(f,delivered,"0","1",DAY.plusDays(3));
+        salesInvoices.reverse(c.workspace(),c.entity(),original,DAY.plusDays(6),"Future effective correction","FUTURE-INVOICE-CORRECTION");
+        long early=salesInvoices.save(c.workspace(),c.entity(),null,0,new dev.labtrial.salestools.finance.SalesInvoiceService.Draft(
+                "EARLY-REBILL",DAY.plusDays(5),List.of(new dev.labtrial.salestools.finance.SalesInvoiceService.Line("EARLY",delivered,BigDecimal.ZERO,BigDecimal.ONE))));
+        denied(409,()->salesInvoices.post(c.workspace(),c.entity(),early,1));
+        assertEquals("DRAFT",salesInvoices.detail(c.workspace(),c.entity(),early).get("status"));
+        long valid=invoiceGoods(f,delivered,"0","1",DAY.plusDays(6));
+        assertNotEquals(original,valid);
+        assertEquals(new BigDecimal("10.00"),customerReceipts.aging(c.workspace(),c.entity(),DAY.plusDays(5)).get(0).get("open_amount"));
+        assertEquals(new BigDecimal("10.00"),customerReceipts.aging(c.workspace(),c.entity(),DAY.plusDays(6)).get(0).get("open_amount"));
+    }
+
+    @Test void restrictedRuntimeCannotRewriteM3HistoryOrInsertLinesIntoBookedCommercialSource() throws Exception {
+        var f=salesFixture(BigDecimal.ONE,new BigDecimal("10.00"),null,BigDecimal.ZERO);
+        var c=f.seller();
+        try(var connection=dataSource.getConnection()) {
+            for(String table:List.of("price_book_contributors","price_book_approvals","product_contributors","product_publications",
+                    "crm_inquiry_events","crm_routing_rules","crm_routing_evaluations","crm_score_rules","crm_score_evaluations",
+                    "crm_reactivation_rules","crm_reactivation_evaluations","crm_reactivation_events","crm_opportunity_events",
+                    "crm_lifecycle_events","quote_contributors","quote_events","sales_handover_requests","sales_handover_executions",
+                    "product_compatibilities","bundle_components","party_addresses","party_address_versions","document_address_snapshots",
+                    "inventory_reservation_events","sales_order_cancellations","sales_reversals")) {
+                sqlDenied(connection,"delete from app."+table);
+                sqlDenied(connection,"update app."+table+" set workspace_id=workspace_id");
+            }
+            sqlDenied(connection,"update app.sales_orders set accepted_reference='tampered',version=version+1 where id="+f.order());
+            sqlDenied(connection,"update app.sales_order_lines set unit_price=1,version=version+1 where id="+f.orderLine());
+            sqlDenied(connection,"insert into app.sales_order_lines(workspace_id,entity_id,order_id,quote_line_id,line_key,product_id,product_version,product_setting_version,uom_id,uom_version,tracking,quantity_scale,quantity,unit_price,subtotal,discount,net,tax,gross,tax_version_id,tax_rate_pct,output_account_id,ar_account_id,unbilled_account_id,revenue_account_id,cogs_account_id,inventory_account_id) select workspace_id,entity_id,order_id,quote_line_id,'LATE-APPEND',product_id,product_version,product_setting_version,uom_id,uom_version,tracking,quantity_scale,quantity,unit_price,subtotal,discount,net,tax,gross,tax_version_id,tax_rate_pct,output_account_id,ar_account_id,unbilled_account_id,revenue_account_id,cogs_account_id,inventory_account_id from app.sales_order_lines where id="+f.orderLine());
+        }
+        assertEquals(1,db.queryForObject("select count(*) from sales_order_lines where order_id=?",Integer.class,f.order()));
+        assertEquals("SYNTHETIC-CUSTOMER-PO",db.queryForObject("select accepted_reference from sales_orders where id=?",String.class,f.order()));
+        assertEquals(new BigDecimal("10.00"),db.queryForObject("select net from sales_order_lines where id=?",BigDecimal.class,f.orderLine()));
+    }
+
+    @Test void wonIsOnlyAReplaySafeBlockedRequestAndQualificationDoesNotGrantCreditOrCreateOrders() {
+        var c=context("EUR","INSIDE_SALES","SALES_MANAGER","FINANCE");
+        baseline.initialize(c.workspace(),c.entity(),"O2C_GOODS",1);
+        long account=db.queryForObject("select id from customer_entity_accounts where workspace_id=? and entity_id=? order by id limit 1",Long.class,c.workspace(),c.entity());
+        var command=new dev.labtrial.salestools.crm.OpportunityService.Qualification(account,1,null,null,
+                "Explicitly reviewed new opportunity","SUPPLY_REORDER",c.user(),"Synthetic qualification","QUALIFY-ONCE");
+        long opportunity=crmOpportunities.qualify(c.workspace(),c.entity(),command);
+        assertEquals(opportunity,crmOpportunities.qualify(c.workspace(),c.entity(),command));
+        denied(409,()->crmOpportunities.qualify(c.workspace(),c.entity(),new dev.labtrial.salestools.crm.OpportunityService.Qualification(
+                account,1,null,null,"Changed requirement","SUPPLY_REORDER",c.user(),"Synthetic qualification","QUALIFY-ONCE")));
+        var result=crmOpportunities.changeStage(c.workspace(),c.entity(),opportunity,1,"WON","Customer intends to proceed","WON-ONCE");
+        assertEquals("BLOCKED",result.status());
+        assertNull(result.orderId());
+        assertTrue(result.blockedReasons().contains("An accepted quote is required"));
+        var replay=crmOpportunities.changeStage(c.workspace(),c.entity(),opportunity,1,"WON","Customer intends to proceed","WON-ONCE");
+        assertEquals(result.requestId(),replay.requestId());
+        assertTrue(replay.replayed());
+        assertEquals(1,db.queryForObject("select count(*) from crm_opportunities where workspace_id=?",Integer.class,c.workspace()));
+        assertEquals(1,db.queryForObject("select count(*) from sales_handover_requests where workspace_id=?",Integer.class,c.workspace()));
+        assertEquals(0,db.queryForObject("select count(*) from sales_orders where workspace_id=?",Integer.class,c.workspace()));
+    }
+
+    @Test void crmCreationIntentsReplayAfterMutableChangesButRejectChangedPayloadAndRevokedRole() {
+        var c=context("EUR","INSIDE_SALES","SALES_MANAGER");
+        var received=java.time.OffsetDateTime.parse("2027-01-15T09:00:00Z");
+        var draft=new dev.labtrial.salestools.crm.InquiryService.Draft("REPLAY-SOURCE",received,"Persistent source","Original need",
+                null,null,null,null,null,"EU","TRANSFER","NORMAL",null);
+        long inquiry=crmInquiries.save(c.workspace(),c.entity(),null,null,draft);
+        assertEquals(inquiry,crmInquiries.save(c.workspace(),c.entity(),null,null,draft));
+        var activity=new dev.labtrial.salestools.crm.ActivityService.Draft(inquiry,1L,null,null,null,null,
+                "TASK","Single follow-up",c.user(),received.plusDays(1),"ACTIVITY-INTENT");
+        long id=crmActivities.create(c.workspace(),c.entity(),activity);
+        crmInquiries.assign(c.workspace(),c.entity(),inquiry,1,null,"",true);
+        assertEquals(id,crmActivities.create(c.workspace(),c.entity(),activity));
+        denied(409,()->crmActivities.create(c.workspace(),c.entity(),new dev.labtrial.salestools.crm.ActivityService.Draft(
+                inquiry,1L,null,null,null,null,"TASK","Changed follow-up",c.user(),received.plusDays(1),"ACTIVITY-INTENT")));
+        long rule=crmScoring.createRule(c.workspace(),c.entity(),"REPLAY-RULE",20,30,25,25,"RULE-INTENT");
+        assertEquals(rule,crmScoring.createRule(c.workspace(),c.entity(),"REPLAY-RULE",20,30,25,25,"RULE-INTENT"));
+        denied(409,()->crmScoring.createRule(c.workspace(),c.entity(),"REPLAY-RULE",10,30,25,25,"RULE-INTENT"));
+        assertEquals(1,db.queryForObject("select count(*) from crm_activities where workspace_id=?",Integer.class,c.workspace()));
+        assertEquals(1,db.queryForObject("select count(*) from crm_score_rules where workspace_id=?",Integer.class,c.workspace()));
+        actor(administrator);
+        identity.role(c.workspace(),c.user(),"INSIDE_SALES",1,false);
+        identity.role(c.workspace(),c.user(),"SALES_MANAGER",1,false);
+        actor(c.user());
+        denied(403,()->crmActivities.create(c.workspace(),c.entity(),activity));
+        denied(403,()->crmScoring.createRule(c.workspace(),c.entity(),"REPLAY-RULE",20,30,25,25,"RULE-INTENT"));
+    }
+
+    @Test void inquiryCustomerChangeCannotOrphanAnOpportunityAndUnlinkedInquiryCanBeCorrected() {
+        var c=context("EUR","INSIDE_SALES","SALES_MANAGER","FINANCE");
+        baseline.initialize(c.workspace(),c.entity(),"O2C_GOODS",1);
+        var accounts=db.queryForList("select id,customer_id from customer_entity_accounts where workspace_id=? and entity_id=? order by id",c.workspace(),c.entity());
+        long account=((Number)accounts.get(0).get("id")).longValue();
+        long first=((Number)accounts.get(0).get("customer_id")).longValue(), second=((Number)accounts.get(1).get("customer_id")).longValue();
+        var received=java.time.OffsetDateTime.parse("2027-01-15T09:00:00Z");
+        var original=new dev.labtrial.salestools.crm.InquiryService.Draft("LINKED-INQUIRY",received,"Original customer","Need",
+                first,1L,null,null,null,"EU","TRANSFER","NORMAL",null);
+        long inquiry=crmInquiries.save(c.workspace(),c.entity(),null,null,original);
+        long opportunity=crmOpportunities.qualify(c.workspace(),c.entity(),new dev.labtrial.salestools.crm.OpportunityService.Qualification(
+                account,1,inquiry,1L,"Linked opportunity","EQUIPMENT_SALES",c.user(),"Reviewed source","LINKED-QUALIFICATION"));
+        var before=crmInquiries.get(c.workspace(),c.entity(),inquiry);
+        int events=crmInquiries.history(c.workspace(),c.entity(),inquiry).size();
+        int audits=db.queryForObject("select count(*) from audit_events where workspace_id=?",Integer.class,c.workspace());
+        for(Long customer:new Long[]{second,null}) {
+            var changed=new dev.labtrial.salestools.crm.InquiryService.Draft(original.sourceKey(),received,"Wrong customer","Need",
+                    customer,customer==null?null:1L,null,null,null,"EU","TRANSFER","NORMAL",null);
+            denied(409,()->crmInquiries.save(c.workspace(),c.entity(),inquiry,1L,changed));
+            assertEquals(before,crmInquiries.get(c.workspace(),c.entity(),inquiry));
+            assertEquals(events,crmInquiries.history(c.workspace(),c.entity(),inquiry).size());
+            assertEquals(audits,db.queryForObject("select count(*) from audit_events where workspace_id=?",Integer.class,c.workspace()));
+        }
+        crmOpportunities.changeStage(c.workspace(),c.entity(),opportunity,1,"PROPOSAL","Source association still valid",null);
+        assertEquals("PROPOSAL",crmOpportunities.get(c.workspace(),c.entity(),opportunity).stage());
+        long unlinked=crmInquiries.save(c.workspace(),c.entity(),null,null,new dev.labtrial.salestools.crm.InquiryService.Draft(
+                "UNLINKED-INQUIRY",received,"Correctable","Need",first,1L,null,null,null,"EU","TRANSFER","NORMAL",null));
+        crmInquiries.save(c.workspace(),c.entity(),unlinked,1L,new dev.labtrial.salestools.crm.InquiryService.Draft(
+                "UNLINKED-INQUIRY",received,"Corrected","Need",second,1L,null,null,null,"EU","TRANSFER","NORMAL",null));
+        assertEquals(second,crmInquiries.get(c.workspace(),c.entity(),unlinked).customerId());
+    }
+
+    @Test void inquiryCustomerChangeCannotMisattributeCompletedResponseAndUnknownPartyCanBeQualified() {
+        var c=context("EUR","INSIDE_SALES","SALES_MANAGER","FINANCE");
+        baseline.initialize(c.workspace(),c.entity(),"O2C_GOODS",1);
+        var ids=db.queryForList("select customer_id from customer_entity_accounts where workspace_id=? and entity_id=? order by id",Long.class,c.workspace(),c.entity());
+        long first=ids.get(0), second=ids.get(1);
+        var received=java.time.OffsetDateTime.parse("2027-01-15T09:00:00Z");
+        long inquiry=crmInquiries.save(c.workspace(),c.entity(),null,null,new dev.labtrial.salestools.crm.InquiryService.Draft(
+                "RESPONSE-INQUIRY",received,"Original conversation","Need",first,1L,null,null,null,"EU","TRANSFER","NORMAL",null));
+        long activity=crmActivities.create(c.workspace(),c.entity(),new dev.labtrial.salestools.crm.ActivityService.Draft(
+                inquiry,1L,null,null,first,1L,"CALL","Completed response",c.user(),null,"RESPONSE-CREATE"));
+        crmActivities.complete(c.workspace(),c.entity(),activity,1,"Customer A responded",true);
+        var response=crmInquiries.firstResponse(c.workspace(),c.entity(),inquiry);
+        denied(409,()->crmInquiries.save(c.workspace(),c.entity(),inquiry,1L,new dev.labtrial.salestools.crm.InquiryService.Draft(
+                "RESPONSE-INQUIRY",received,"Reattributed conversation","Need",second,1L,null,null,null,"EU","TRANSFER","NORMAL",null)));
+        assertEquals(first,crmInquiries.get(c.workspace(),c.entity(),inquiry).customerId());
+        assertEquals(response,crmInquiries.firstResponse(c.workspace(),c.entity(),inquiry));
+        assertEquals(activity,response.activityId());
+        long unknown=crmInquiries.save(c.workspace(),c.entity(),null,null,new dev.labtrial.salestools.crm.InquiryService.Draft(
+                "UNKNOWN-INQUIRY",received,"Unknown party","Need",null,null,null,null,null,"EU","TRANSFER","NORMAL",null));
+        crmActivities.create(c.workspace(),c.entity(),new dev.labtrial.salestools.crm.ActivityService.Draft(
+                unknown,1L,null,null,null,null,"TASK","Identify party",c.user(),null,"UNKNOWN-TASK"));
+        crmInquiries.save(c.workspace(),c.entity(),unknown,1L,new dev.labtrial.salestools.crm.InquiryService.Draft(
+                "UNKNOWN-INQUIRY",received,"Known party","Need",first,1L,null,null,null,"EU","TRANSFER","NORMAL",null));
+        assertEquals(first,crmInquiries.get(c.workspace(),c.entity(),unknown).customerId());
+    }
+
+    @Test void reactivationHoldsOpenInquiriesAndOpportunitiesUntilBothAreClosed() {
+        var f=salesFixture(BigDecimal.ONE,new BigDecimal("10"),null,BigDecimal.ZERO);
+        var c=f.seller(); reserveGoods(f,BigDecimal.ONE);
+        LocalDate fulfilled=DAY.plusDays(3); shipGoods(f,BigDecimal.ONE,fulfilled);
+        long customer=db.queryForObject("select customer_id from customer_entity_accounts where id=?",Long.class,f.customerAccount());
+        long rule=reactivation.createRule(c.workspace(),c.entity(),"OPEN-WORK",180,"OPEN-WORK-RULE");
+        long inquiry=crmInquiries.save(c.workspace(),c.entity(),null,null,new dev.labtrial.salestools.crm.InquiryService.Draft(
+                "OPEN-WORK",java.time.OffsetDateTime.parse("2027-01-15T09:00:00Z"),"Open customer inquiry","Need",
+                customer,1L,null,null,null,"EU","TRANSFER","NORMAL",null));
+        var heldInquiry=reactivation.scan(c.workspace(),c.entity(),rule,fulfilled.plusDays(180)).stream().filter(r->r.customerId()==customer).findFirst().orElseThrow();
+        assertEquals("HELD",heldInquiry.outcome()); assertNull(heldInquiry.caseId());
+        assertEquals("Open inquiry or opportunity",heldInquiry.reason());
+        crmInquiries.transition(c.workspace(),c.entity(),inquiry,1,"RESOLVED",null,"Inquiry resolved");
+        long opportunity=crmOpportunities.qualify(c.workspace(),c.entity(),new dev.labtrial.salestools.crm.OpportunityService.Qualification(
+                f.customerAccount(),1,null,null,"Open customer opportunity","SUPPLY_REORDER",c.user(),"Explicit qualification","OPEN-OPPORTUNITY"));
+        var heldOpportunity=reactivation.scan(c.workspace(),c.entity(),rule,fulfilled.plusDays(180)).stream().filter(r->r.customerId()==customer).findFirst().orElseThrow();
+        assertEquals("HELD",heldOpportunity.outcome()); assertNull(heldOpportunity.caseId());
+        assertEquals("Open inquiry or opportunity",heldOpportunity.reason());
+        assertEquals(0,db.queryForObject("select count(*) from crm_reactivation_cases where workspace_id=? and customer_id=?",Integer.class,c.workspace(),customer));
+        crmOpportunities.changeStage(c.workspace(),c.entity(),opportunity,1,"LOST","Opportunity closed",null);
+        var eligible=reactivation.scan(c.workspace(),c.entity(),rule,fulfilled.plusDays(180)).stream().filter(r->r.customerId()==customer).findFirst().orElseThrow();
+        assertEquals("ELIGIBLE",eligible.outcome()); assertNotNull(eligible.caseId());
+        assertEquals(1,db.queryForObject("select count(*) from crm_reactivation_cases where workspace_id=? and customer_id=?",Integer.class,c.workspace(),customer));
+    }
+
+    @Test void reactivationIgnoresFutureShipmentsAndUsesUnpaidPositivePartialFulfillment() {
+        var f=salesFixture(new BigDecimal("2"),new BigDecimal("10"),null,BigDecimal.ZERO);
+        var c=f.seller(); reserveGoods(f,new BigDecimal("2"));
+        LocalDate fulfilled=DAY.plusDays(3);
+        long oldLine=shipGoods(f,BigDecimal.ONE,fulfilled);
+        shipGoods(f,BigDecimal.ONE,fulfilled.plusDays(200));
+        long customer=db.queryForObject("select customer_id from customer_entity_accounts where id=?",Long.class,f.customerAccount());
+        long rule=reactivation.createRule(c.workspace(),c.entity(),"FUTURE-PURCHASE",180,"FUTURE-PURCHASE-RULE");
+        var eligible=reactivation.scan(c.workspace(),c.entity(),rule,fulfilled.plusDays(180)).stream().filter(r->r.customerId()==customer).findFirst().orElseThrow();
+        assertEquals("ELIGIBLE",eligible.outcome()); assertEquals(oldLine,eligible.shipmentLineId()); assertEquals(fulfilled,eligible.purchaseDate());
+        assertEquals(0,db.queryForObject("select count(*) from customer_receipts where workspace_id=?",Integer.class,c.workspace()));
+        var future=salesFixture(BigDecimal.ONE,new BigDecimal("10"),null,BigDecimal.ZERO);
+        var other=future.seller(); reserveGoods(future,BigDecimal.ONE); shipGoods(future,BigDecimal.ONE,fulfilled.plusDays(200));
+        long futureCustomer=db.queryForObject("select customer_id from customer_entity_accounts where id=?",Long.class,future.customerAccount());
+        long futureRule=reactivation.createRule(other.workspace(),other.entity(),"FUTURE-ONLY",180,"FUTURE-ONLY-RULE");
+        var noHistory=reactivation.scan(other.workspace(),other.entity(),futureRule,fulfilled.plusDays(180)).stream().filter(r->r.customerId()==futureCustomer).findFirst().orElseThrow();
+        assertEquals("NO_HISTORY",noHistory.outcome()); assertNull(noHistory.shipmentLineId()); assertNull(noHistory.caseId());
+    }
+
+    @Test void reactivationExcludesFreeGoodsEvenWhenTheirCostWasIssued() {
+        var f=salesFixture(BigDecimal.ONE,BigDecimal.ZERO,null,BigDecimal.ZERO);
+        var c=f.seller(); reserveGoods(f,BigDecimal.ONE);
+        LocalDate fulfilled=DAY.plusDays(3); long line=shipGoods(f,BigDecimal.ONE,fulfilled);
+        assertEquals(BigDecimal.ZERO.setScale(2),db.queryForObject("select net from shipment_lines where id=?",BigDecimal.class,line));
+        assertTrue(db.queryForObject("select cost from shipment_lines where id=?",BigDecimal.class,line).signum()>0);
+        long customer=db.queryForObject("select customer_id from customer_entity_accounts where id=?",Long.class,f.customerAccount());
+        long rule=reactivation.createRule(c.workspace(),c.entity(),"FREE-GOODS",180,"FREE-GOODS-RULE");
+        var excluded=reactivation.scan(c.workspace(),c.entity(),rule,fulfilled.plusDays(180)).stream().filter(r->r.customerId()==customer).findFirst().orElseThrow();
+        assertEquals("NO_HISTORY",excluded.outcome()); assertNull(excluded.shipmentLineId()); assertNull(excluded.caseId());
+        assertEquals(0,db.queryForObject("select count(*) from crm_reactivation_cases where workspace_id=? and customer_id=?",Integer.class,c.workspace(),customer));
     }
 
     private void sqlDenied(Connection connection, String statement) throws Exception {
