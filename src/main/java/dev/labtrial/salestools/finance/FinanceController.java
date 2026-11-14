@@ -229,6 +229,12 @@ public class FinanceController implements FormController {
                 or ?=s.cogs_account_id or ?=s.cogs_account_id))
             """,Boolean.class,workspaceId,entityId,ids[0],ids[3],ids[4],ids[5]);
         if(Boolean.TRUE.equals(salesConflict)) throw new DomainException(400,"Procurement roles must be distinct from AR, Unbilled, goods revenue and COGS","inventoryAccount","adjustmentGainAccount","adjustmentLossAccount","serviceExpenseAccount");
+        Boolean serviceConflict=db.queryForObject("""
+            select exists(select 1 from service_posting_config s where s.workspace_id=? and s.entity_id=?
+              and (?=s.deferred_account_id or ?=s.deferred_account_id
+                or ? in (s.implementation_revenue_account_id,s.service_revenue_account_id)))
+            """,Boolean.class,workspaceId,entityId,ids[1],ids[2],ids[3]);
+        if(Boolean.TRUE.equals(serviceConflict)) throw new DomainException(400,"Procurement roles conflict with service posting accounts","apAccount","grniAccount","adjustmentGainAccount");
         var current=db.queryForList("select * from procurement_posting_config where workspace_id=? and entity_id=? for update",workspaceId,entityId);
         if((version==0 && !current.isEmpty()) || (version!=0 && (current.isEmpty() || ((Number)current.get(0).get("version")).longValue()!=version))) throw new DomainException(409,"Procurement configuration changed");
         if(!current.isEmpty()) {
@@ -272,8 +278,9 @@ public class FinanceController implements FormController {
             select count(*) from chart_accounts a
             where a.workspace_id=? and a.entity_id=? and a.id=? and a.active and a.account_type='LIABILITY'
               and not exists(select 1 from procurement_posting_config p where p.workspace_id=a.workspace_id and p.entity_id=a.entity_id and a.id in (p.ap_account_id,p.grni_account_id))
+              and not exists(select 1 from service_posting_config s where s.workspace_id=a.workspace_id and s.entity_id=a.entity_id and s.deferred_account_id=a.id)
             """,Integer.class,w,e,output);
-        if(validOutput==null || validOutput!=1) throw new DomainException(400,"Output Tax must be an active liability account distinct from AP and GRNI","outputAccount");
+        if(validOutput==null || validOutput!=1) throw new DomainException(400,"Output Tax must be an active liability account distinct from AP, GRNI and Deferred","outputAccount");
     }
     @GetMapping("/finance/openings/new") public String openingForm(@PathVariable long workspaceId,@PathVariable long entityId,@RequestParam(defaultValue="2") int count,Model model) {
         access.requireContext(workspaceId,entityId,false,"FINANCE"); context(model,workspaceId,entityId);

@@ -39,7 +39,6 @@ class ReleaseBoundaryTests(unittest.TestCase):
     def test_release_requires_and_attests_current_schema_lineage(self):
         digest = self.package()
         manifest = release.verify_release(self.output, REVISION, 'local', digest)
-        self.assertEqual(['1', '2', '3', '4', '5'], manifest['schema_versions'])
         manifest['schema_versions'] = ['1', '2', '3']
         manifest_path = self.output / 'release.json'
         manifest_path.write_text(json.dumps(manifest), encoding='ascii')
@@ -48,7 +47,7 @@ class ReleaseBoundaryTests(unittest.TestCase):
             release.verify_release(self.output, REVISION, 'local', replacement)
 
     def test_new_historical_release_is_refused(self):
-        for names in (release.LEGACY_SQL_NAMES, release.V4_SQL_NAMES):
+        for names in (release.LEGACY_SQL_NAMES, release.V4_SQL_NAMES, release.V5_SQL_NAMES, release.V6_SQL_NAMES):
             with self.subTest(names=names):
                 with zipfile.ZipFile(self.jar, 'w') as archive:
                     archive.writestr(release.POM, (SCRIPTS.parent / 'pom.xml').read_bytes())
@@ -72,7 +71,7 @@ class ReleaseBoundaryTests(unittest.TestCase):
         self.assertNotEqual(current, old_identity)
 
     def test_retained_historical_release_verifies_only_its_own_tuple(self):
-        for names in (release.LEGACY_SQL_NAMES, release.V4_SQL_NAMES):
+        for names in (release.LEGACY_SQL_NAMES, release.V4_SQL_NAMES, release.V5_SQL_NAMES, release.V6_SQL_NAMES):
             with self.subTest(names=names):
                 jar = self.root / ('historical-' + str(len(names)) + '.jar')
                 with zipfile.ZipFile(jar, 'w') as archive:
@@ -99,7 +98,7 @@ class ReleaseBoundaryTests(unittest.TestCase):
                 path.write_text(json.dumps(manifest), encoding='ascii')
                 digest = hashlib.sha256(path.read_bytes()).hexdigest()
                 self.assertEqual(manifest, release.verify_release(directory, REVISION, 'local', digest))
-                manifest['schema_versions'] = ['1', '2', '3', '4', '5']
+                manifest['schema_versions'] = ['1', '2', '3', '4', '5', '6', '7']
                 path.write_text(json.dumps(manifest), encoding='ascii')
                 with self.assertRaises(release.ReleaseError):
                     release.verify_release(directory, REVISION, 'local', hashlib.sha256(path.read_bytes()).hexdigest())

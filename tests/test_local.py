@@ -34,9 +34,10 @@ class Reply:
 class LauncherBoundaryTests(unittest.TestCase):
     def test_readiness_requires_exact_current_schema_and_revision(self):
         revision = 'a' * 40
-        for version, actual_revision, expected in ((5, revision, True), (4, revision, False),
-                                                    (6, revision, False), (True, revision, False),
-                                                    (5, 'b' * 40, False)):
+        current = len(release.SQL_NAMES)
+        for version, actual_revision, expected in ((current, revision, True), (current - 1, revision, False),
+                                                    (current + 1, revision, False), (True, revision, False),
+                                                    (current, 'b' * 40, False)):
             health = json.dumps({'status': 'UP', 'application': 'lab-sales-systems',
                                  'revision': actual_revision, 'schemaVersion': version}).encode()
             opener = mock.Mock()
@@ -49,7 +50,7 @@ class LauncherBoundaryTests(unittest.TestCase):
     def test_launcher_rejects_old_artifact_even_if_valid(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            for names in (release.V4_SQL_NAMES, release.SQL_NAMES):
+            for names in (release.V4_SQL_NAMES, release.V5_SQL_NAMES, release.V6_SQL_NAMES, release.SQL_NAMES):
                 jar = root / ('input' + str(len(names)) + '.jar')
                 with zipfile.ZipFile(jar, 'w') as archive:
                     archive.writestr(release.POM, (Path(__file__).resolve().parents[1] / 'pom.xml').read_bytes())
@@ -57,7 +58,7 @@ class LauncherBoundaryTests(unittest.TestCase):
                         archive.writestr(release.SQL_PREFIX + name, 'SELECT 1;')
                 artifact = root / ('app' + str(len(names)))
                 ci.package(jar, artifact, 'a' * 40, 'local')
-                if len(names) == 4:
+                if names != release.SQL_NAMES:
                     with self.assertRaises(local.db.OperationError):
                         local.verify_artifact(artifact, 'a' * 40)
                 else:

@@ -67,6 +67,25 @@ public final class SourceAmounts {
         return new Slice(start, end, n.add(d), d, n, t, n.add(t));
     }
 
+    /** Allocate a service entitlement using net-fee coordinates, preserving tax and discount residuals. */
+    public static Slice feeSlice(BigDecimal net, BigDecimal discount, BigDecimal tax,
+                                 BigDecimal start, BigDecimal end) {
+        check(net, 18, 2, "source net");
+        check(discount, 18, 2, "source discount");
+        check(tax, 18, 2, "source tax");
+        check(start, 18, 2, "fee start");
+        check(end, 18, 2, "fee end");
+        if (net.signum() <= 0 || discount.signum() < 0 || tax.signum() < 0
+                || start.signum() < 0 || start.compareTo(end) >= 0 || end.compareTo(net) > 0)
+            throw invalid("Invalid service fee interval or snapshot");
+        money(net.add(discount));
+        money(net.add(tax));
+        BigDecimal n = end.subtract(start).setScale(2);
+        BigDecimal d = part(discount, net, start, end);
+        BigDecimal t = part(tax, net, start, end);
+        return new Slice(start, end, money(n.add(d)), d, n, t, money(n.add(t)));
+    }
+
     private static BigDecimal part(BigDecimal amount, BigDecimal quantity, BigDecimal start, BigDecimal end) {
         return cumulative(amount, quantity, end).subtract(cumulative(amount, quantity, start));
     }

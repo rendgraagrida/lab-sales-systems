@@ -17,7 +17,9 @@ public class SalesPostingController implements FormController {
     @ModelAttribute
     public void validateParameters(HttpServletRequest request) {
         if (!"POST".equals(request.getMethod())) return;
-        Set<String> fields=Set.of("_csrf","_form","version","arAccount","unbilledAccount","revenueAccount","cogsAccount");
+        Set<String> fields=request.getRequestURI().endsWith("/service")
+                ? Set.of("_csrf","_form","version","deferredAccount","implementationRevenueAccount","serviceRevenueAccount")
+                : Set.of("_csrf","_form","version","arAccount","unbilledAccount","revenueAccount","cogsAccount");
         for (var entry:request.getParameterMap().entrySet())
             if (!fields.contains(entry.getKey()) || entry.getValue().length!=1)
                 throw new DomainException(400,"Unexpected or duplicate form field");
@@ -27,6 +29,9 @@ public class SalesPostingController implements FormController {
     public String form(@PathVariable long workspaceId,@PathVariable long entityId,Model model) {
         var current=service.current(workspaceId,entityId);
         model.addAttribute("configuration",current.isEmpty()?null:current.get(0));
+        var serviceCurrent=service.currentService(workspaceId,entityId);
+        model.addAttribute("serviceConfiguration",serviceCurrent.isEmpty()?null:serviceCurrent.get(0));
+        model.addAttribute("serviceAction",path(workspaceId,entityId)+"/service");
         model.addAttribute("accounts",service.choices(workspaceId,entityId));
         model.addAttribute("action",path(workspaceId,entityId));
         return "sales-posting-config";
@@ -44,6 +49,16 @@ public class SalesPostingController implements FormController {
         service.save(workspaceId,entityId,new SalesPostingConfigService.Draft(version,
             reference(arAccount,"arAccount"),reference(unbilledAccount,"unbilledAccount"),
             reference(revenueAccount,"revenueAccount"),reference(cogsAccount,"cogsAccount")));
+        return "redirect:"+path(workspaceId,entityId);
+    }
+
+    @PostMapping("/service")
+    public String saveService(@PathVariable long workspaceId,@PathVariable long entityId,@RequestParam long version,
+            @RequestParam String deferredAccount,@RequestParam String implementationRevenueAccount,
+            @RequestParam String serviceRevenueAccount) {
+        service.saveService(workspaceId,entityId,new SalesPostingConfigService.ServiceDraft(version,
+            reference(deferredAccount,"deferredAccount"),reference(implementationRevenueAccount,"implementationRevenueAccount"),
+            reference(serviceRevenueAccount,"serviceRevenueAccount")));
         return "redirect:"+path(workspaceId,entityId);
     }
 

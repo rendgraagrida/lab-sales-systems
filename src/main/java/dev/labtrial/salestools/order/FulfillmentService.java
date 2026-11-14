@@ -8,6 +8,8 @@ import dev.labtrial.salestools.finance.SalesPostingConfigService;
 import dev.labtrial.salestools.finance.SourceAmounts;
 import dev.labtrial.salestools.identity.AccessControl;
 import dev.labtrial.salestools.inventory.InventoryService;
+import dev.labtrial.salestools.service.AssetService;
+import dev.labtrial.salestools.service.ServiceObligationService;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -31,9 +33,12 @@ public class FulfillmentService {
     private final PostingService posting;
     private final SalesPostingConfigService config;
     private final AuditLog audit;
+    private final AssetService assets;
+    private final ServiceObligationService obligations;
     public FulfillmentService(JdbcTemplate db, AccessControl access, InventoryService inventory, PostingService posting,
-                              SalesPostingConfigService config, AuditLog audit) {
+                              SalesPostingConfigService config, AuditLog audit, AssetService assets, ServiceObligationService obligations) {
         this.db=db; this.access=access; this.inventory=inventory; this.posting=posting; this.config=config; this.audit=audit;
+        this.assets=assets; this.obligations=obligations;
     }
     private static long id(Map<String,Object> r,String k) { return ((Number)r.get(k)).longValue(); }
     private static BigDecimal amount(Map<String,Object> r,String k) { return (BigDecimal)r.get(k); }
@@ -47,6 +52,12 @@ public class FulfillmentService {
     private Map<String,Object> line(long w,long e,long order,long line,boolean lock) {
         var rows=db.queryForList("select * from sales_order_lines where workspace_id=? and entity_id=? and order_id=? and id=?"+(lock?" for update":""),w,e,order,line);
         if(rows.size()!=1) throw new DomainException(404,"Order line not found"); return rows.get(0);
+    }
+    private static boolean physical(Map<String,Object> line) {
+        return java.util.Set.of("LAB_UNIT","LAB_SUPPLY","REPLACEMENT_PART").contains(line.get("product_category"));
+    }
+    private static void requirePhysical(Map<String,Object> line) {
+        if(!physical(line)) throw new DomainException(400,"Only physical order lines can be reserved or shipped");
     }
     private void checkProduct(long w,long e,Map<String,Object> line) {
         if(!Boolean.TRUE.equals(db.queryForObject("""
@@ -79,7 +90,7 @@ public class FulfillmentService {
     @Transactional(readOnly=true)
     public List<Map<String,Object>> orderLines(long w,long e,long order) {
         access.requireContext(w,e,false,"OPERATIONS","INSIDE_SALES","SALES_MANAGER","FINANCE"); order(w,e,order,false);
-        return db.queryForList("select l.id,l.line_key,l.product_id,l.tracking,l.quantity,l.fulfilled_qty,l.cancelled_qty,l.version,p.sku,coalesce((select sum(r.quantity-r.released_qty-r.consumed_qty) from inventory_reservations r where r.workspace_id=l.workspace_id and r.entity_id=l.entity_id and r.order_line_id=l.id),0) as reserved_qty from sales_order_lines l join products p on p.workspace_id=l.workspace_id and p.id=l.product_id where l.workspace_id=? and l.entity_id=? and l.order_id=? order by l.id",w,e,order);
+        return db.queryForList("select l.id,l.line_key,l.product_id,l.product_category,l.tracking,l.quantity,l.fulfilled_qty,l.cancelled_qty,l.version,p.sku,coalesce((select sum(r.quantity-r.released_qty-r.consumed_qty) from inventory_reservations r where r.workspace_id=l.workspace_id and r.entity_id=l.entity_id and r.order_line_id=l.id),0) as reserved_qty from sales_order_lines l join products p on p.workspace_id=l.workspace_id and p.id=l.product_id where l.workspace_id=? and l.entity_id=? and l.order_id=? order by l.id",w,e,order);
     }
     @Transactional(readOnly=true)
     public List<Map<String,Object>> reservations(long w,long e,long order) {
@@ -114,6 +125,7 @@ public class FulfillmentService {
         if(!prior.isEmpty()) { if(!h.equals(prior.get(0).get("intent_hash"))) throw new DomainException(409,"Reservation intent conflicts"); return id(prior.get(0),"id"); }
         if(Boolean.TRUE.equals(db.queryForObject("select exists(select 1 from inventory_reservation_events where workspace_id=? and entity_id=? and intent_key=?)",Boolean.class,w,e,intent))) throw new DomainException(409,"Reservation intent conflicts with an existing event");
         var o=order(w,e,order,true); var l=line(w,e,order,lineId,true); if(id(o,"version")!=orderVersion || id(l,"version")!=lineVersion) throw new DomainException(409,"Order changed");
+        requirePhysical(l);
         checkProduct(w,e,l);
         quantity(q,((Number)l.get("quantity_scale")).intValue());
         if(!Boolean.TRUE.equals(db.queryForObject("select exists(select 1 from warehouses where workspace_id=? and entity_id=? and id=? and version=? and active)",Boolean.class,w,e,warehouse,warehouseVersion))) throw new DomainException(409,"Warehouse changed");
@@ -127,6 +139,7 @@ public class FulfillmentService {
         var prior=db.queryForList("select intent_hash from inventory_reservation_events where workspace_id=? and entity_id=? and intent_key=?",w,e,intent);
         if(!prior.isEmpty()) { if(!h.equals(prior.get(0).get("intent_hash"))) throw new DomainException(409,"Release intent conflicts"); return; }
         var o=order(w,e,order,true); var l=line(w,e,order,lineId,true); if(id(o,"version")!=orderVersion || id(l,"version")!=lineVersion) throw new DomainException(409,"Order changed"); quantity(q,((Number)l.get("quantity_scale")).intValue());
+        requirePhysical(l);
         if(!Boolean.TRUE.equals(db.queryForObject("select exists(select 1 from inventory_reservations where workspace_id=? and entity_id=? and id=? and order_line_id=?)",Boolean.class,w,e,reservation,lineId))) throw new DomainException(404,"Reservation not found");
         inventory.applyOrderReservation(scope,reservation,q,false,null,0,intent,h); bump(w,e,order,lineId);
         audit.record(scope.actor(),w,e,"RELEASE","SALES_ORDER",Long.toString(order),orderVersion+1,"SUCCESS",intent);
@@ -140,6 +153,14 @@ public class FulfillmentService {
         if(reason==null || reason.isBlank() || reason.length()>500) throw new DomainException(400,"Cancellation reason required");
         BigDecimal end=amount(l,"quantity").subtract(amount(l,"cancelled_qty")),start=end.subtract(q), fulfilled=amount(l,"fulfilled_qty");
         if(start.compareTo(fulfilled)<0) throw new DomainException(409,"Cancellation exceeds unfulfilled quantity");
+        if(!physical(l)) {
+            obligations.cancelFromOrder(scope,lineId,q,intent,reason);
+            db.update("insert into sales_order_cancellations(workspace_id,entity_id,order_line_id,slice_start,slice_end,reason,intent_key,intent_hash,created_by) values (?,?,?,?,?,?,?,?,?)",w,e,lineId,start,end,reason,intent,h,scope.actor().id());
+            db.update("update sales_order_lines set cancelled_qty=cancelled_qty+?,version=version+1 where workspace_id=? and entity_id=? and id=?",q,w,e,lineId);
+            db.update("update sales_orders set version=version+1 where workspace_id=? and entity_id=? and id=?",w,e,order);
+            audit.record(scope.actor(),w,e,"CANCEL","SALES_ORDER",Long.toString(order),orderVersion+1,"SUCCESS",reason);
+            return;
+        }
         BigDecimal release=reserved(w,e,lineId).subtract(start.subtract(fulfilled));
         if(release.signum()>0) {
             var rs=db.queryForList("select * from inventory_reservations where workspace_id=? and entity_id=? and order_line_id=? and quantity>released_qty+consumed_qty order by id desc for update",w,e,lineId);
@@ -167,6 +188,7 @@ public class FulfillmentService {
             key(entry.lineKey());
             if(!keys.add(entry.lineKey())) throw new DomainException(400,"Shipment line keys must be distinct");
             var l=sources.computeIfAbsent(entry.orderLineId(),ignored->line(w,e,d.orderId(),entry.orderLineId(),true));
+            requirePhysical(l);
             if(id(l,"version")!=entry.lineVersion()) throw new DomainException(409,"Order line changed");
             quantity(entry.quantity(),((Number)l.get("quantity_scale")).intValue());
             if(!Boolean.TRUE.equals(db.queryForObject("select exists(select 1 from warehouses where workspace_id=? and entity_id=? and id=? and version=? and active)",Boolean.class,w,e,entry.warehouseId(),entry.warehouseVersion()))) throw new DomainException(409,"Warehouse changed");
@@ -191,6 +213,7 @@ public class FulfillmentService {
         var versions=new java.util.HashMap<Long,Long>();
         for(var d:drafts) {
             long lineId=id(d,"order_line_id"); var source=line(w,e,orderId,lineId,true);
+            requirePhysical(source);
             if(id(source,"version")!=id(d,"order_line_version") || id(source,"product_id")!=id(d,"product_id")) throw new DomainException(409,"Order line changed; refresh shipment draft");
             Long previous=versions.putIfAbsent(lineId,id(d,"order_line_version"));
             if(previous!=null && previous.longValue()!=id(d,"order_line_version")) throw new DomainException(409,"Inconsistent order line version");
@@ -232,6 +255,7 @@ public class FulfillmentService {
         }
         var result=posting.post(scope,"SHIPMENT",Long.toString(shipmentId),"shipment:"+shipmentId,date,(String)o.get("currency"),"Goods shipment "+s.get("number"),journal);
         db.update("update shipments set status='POSTED',posted_by=?,posted_at=now(),journal_id=?,version=version+1 where workspace_id=? and entity_id=? and id=?",scope.actor().id(),result.journalId(),w,e,shipmentId); db.update("update sales_orders set version=version+1 where workspace_id=? and entity_id=? and id=?",w,e,orderId);
+        assets.recordPostedShipment(scope,shipmentId);
         audit.record(scope.actor(),w,e,"POST","SHIPMENT",Long.toString(shipmentId),version+1,"SUCCESS",(String)s.get("number"));
     }
 }

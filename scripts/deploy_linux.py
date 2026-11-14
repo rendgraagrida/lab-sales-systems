@@ -13,6 +13,7 @@ import json
 import os
 import pwd
 import re
+import stat
 import shutil
 import socket
 import subprocess
@@ -79,6 +80,31 @@ def validate_ancestors_root_owned(path):
             break
         if curr.is_symlink() or st.st_uid != 0 or (st.st_mode & 0o022):
             fail(f'Untrusted path component: {curr}')
+
+
+def validate_migration_user(cfg):
+    name = cfg.get('migration_user')
+    if not isinstance(name, str) or not ROLE_PATTERN.fullmatch(name):
+        fail('Invalid migration user')
+    try:
+        migration = pwd.getpwnam(name)
+        service = pwd.getpwnam(cfg['service_user'])
+    except (KeyError, TypeError):
+        fail('Migration or service user does not exist on host')
+    if (migration.pw_uid == 0 or migration.pw_gid == 0
+            or migration.pw_uid == service.pw_uid or migration.pw_gid == service.pw_gid):
+        fail('Migration user must have a non-root UID and GID distinct from the service user')
+    if migration.pw_shell not in {'/usr/sbin/nologin', '/bin/false', '/sbin/nologin', '/usr/bin/false'}:
+        fail('Migration user must have a non-login shell')
+    home = validate_clean_path(migration.pw_dir, 'Migration home')
+    validate_ancestors_root_owned(home.parent)
+    try:
+        st = home.lstat()
+    except OSError:
+        fail('Migration home must be an existing owned directory')
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != migration.pw_uid or st.st_mode & 0o022:
+        fail('Migration home must be owned by the migration user and not group/world writable')
+    return migration
 
 
 def parse_env_file(path, allowed_keys):
@@ -167,7 +193,7 @@ def validate_config(config_path, expected_env):
         fail('Config must be a JSON object')
 
     required_keys = {
-        'schema', 'project', 'environment', 'target_id', 'root', 'service_user',
+        'schema', 'project', 'environment', 'target_id', 'root', 'service_user', 'migration_user',
         'port', 'java_home', 'maven_home', 'pg_bin', 'pg_port', 'database',
         'owner_role', 'migrator_role', 'runtime_role', 'system_identifier',
         'machine_id', 'runtime_env_file', 'migration_env_file'
@@ -208,6 +234,7 @@ def validate_config(config_path, expected_env):
     non_login_shells = {'/usr/sbin/nologin', '/bin/false', '/sbin/nologin', '/usr/bin/false'}
     if pw.pw_shell not in non_login_shells:
         fail(f'service_user {user_name} must have a non-login shell, found {pw.pw_shell}')
+    validate_migration_user(cfg)
 
     # Ports
     if type(cfg['port']) is not int or not (1024 <= cfg['port'] <= 65535):
@@ -241,7 +268,7 @@ def validate_config(config_path, expected_env):
     for cmd, version in (([str(java_bin), '-version'], '21.0.13'),
                          ([str(mvn_bin), '-version'], '3.9.16'),
                          ([str(psql_bin), '--version'], '17.')):
-        result = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=30)
+        result = subprocess.run(cmd, env=env, cwd='/', capture_output=True, text=True, timeout=30)
         if result.returncode or version not in result.stdout + result.stderr:
             fail('Configured tool version does not match required pin')
 
@@ -354,24 +381,46 @@ def run_psql(cfg, sql_command, db_name='postgres', timeout=30):
     return res.stdout.strip()
 
 
+def run_migrator_psql(cfg, sql_command, timeout=30):
+    validate_ancestors_root_owned(cfg['migration_env_file'])
+    values = parse_env_file(cfg['migration_env_file'], {
+        'LAB_MIGRATION_DB_URL', 'LAB_MIGRATION_DB_USER', 'LAB_MIGRATION_DB_PASSWORD', 'LAB_MIGRATION_OWNER'
+    })
+    expected_url = f"jdbc:postgresql://127.0.0.1:{cfg['pg_port']}/{cfg['database']}"
+    if (values['LAB_MIGRATION_DB_URL'] != expected_url
+            or values['LAB_MIGRATION_DB_USER'] != cfg['migrator_role']
+            or values['LAB_MIGRATION_OWNER'] != cfg['owner_role']):
+        fail('Database environment does not match configured target')
+    cmd = [str(Path(cfg['pg_bin']) / 'psql'), '-X', '-w', '-q', '-h', '127.0.0.1',
+           '-p', str(cfg['pg_port']), '-U', cfg['migrator_role'], '-d', cfg['database'],
+           '-t', '-A', '-v', 'ON_ERROR_STOP=1',
+           '-c', f'SET ROLE "{cfg["owner_role"]}"; ' + sql_command]
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                         env={'PATH': '/usr/bin:/bin', 'LANG': 'C',
+                              'PGPASSWORD': values['LAB_MIGRATION_DB_PASSWORD']})
+    if res.returncode:
+        fail(f"PostgreSQL query failed (code {res.returncode})")
+    return res.stdout.strip()
+
+
 def verify_db_cluster_and_ownership(cfg):
-    identity = run_psql(cfg, "SELECT current_user || '|' || system_identifier::text FROM pg_control_system();")
+    identity = run_psql(cfg, "SELECT current_user || '|' || system_identifier::text FROM pg_catalog.pg_control_system();")
     if identity != 'postgres|' + str(cfg['system_identifier']):
         fail('PostgreSQL local administrator or cluster identity mismatch')
-    db_owner = run_psql(cfg, f"SELECT pg_catalog.pg_get_userbyid(datdba) FROM pg_database WHERE datname='{cfg['database']}';")
+    db_owner = run_psql(cfg, f"SELECT pg_catalog.pg_get_userbyid(datdba) FROM pg_catalog.pg_database WHERE datname='{cfg['database']}';")
     if db_owner != 'postgres':
         fail('Configured database is absent or not owned by postgres')
-    schema_owners = run_psql(cfg, "SELECT string_agg(nspname || '=' || pg_get_userbyid(nspowner), ',' ORDER BY nspname) FROM pg_namespace WHERE nspname IN ('app','extensions');", db_name=cfg['database'])
+    schema_owners = run_psql(cfg, "SELECT pg_catalog.string_agg(nspname || '=' || pg_catalog.pg_get_userbyid(nspowner), ',' ORDER BY nspname) FROM pg_catalog.pg_namespace WHERE nspname IN ('app','extensions');", db_name=cfg['database'])
     if schema_owners != 'app=' + cfg['owner_role'] + ',extensions=postgres':
         fail('Configured schema owners do not match target')
     if len({cfg['owner_role'], cfg['migrator_role'], cfg['runtime_role'], 'postgres'}) != 4:
         fail('Database roles must be distinct')
     role_names = ','.join(database.literal(cfg[r]) for r in ('owner_role', 'migrator_role', 'runtime_role'))
-    roles = run_psql(cfg, "SELECT string_agg(rolname || ':' || rolcanlogin::int || ':' || (rolsuper OR rolcreatedb OR rolcreaterole OR rolreplication OR rolbypassrls)::int, ',' ORDER BY rolname) FROM pg_roles WHERE rolname IN (" + role_names + ");", db_name=cfg['database'])
+    roles = run_psql(cfg, "SELECT pg_catalog.string_agg(rolname || ':' || rolcanlogin::int || ':' || (rolsuper OR rolcreatedb OR rolcreaterole OR rolreplication OR rolbypassrls)::int, ',' ORDER BY rolname) FROM pg_catalog.pg_roles WHERE rolname IN (" + role_names + ");", db_name=cfg['database'])
     expected = ','.join(sorted([cfg['owner_role'] + ':0:0', cfg['migrator_role'] + ':1:0', cfg['runtime_role'] + ':1:0']))
     if roles != expected:
         fail('Configured database roles have unexpected attributes')
-    memberships = run_psql(cfg, "SELECT string_agg(member.rolname || '>' || parent.rolname, ',' ORDER BY member.rolname,parent.rolname) FROM pg_auth_members m JOIN pg_roles member ON member.oid=m.member JOIN pg_roles parent ON parent.oid=m.roleid WHERE member.rolname IN (" + role_names + ");", db_name=cfg['database'])
+    memberships = run_psql(cfg, "SELECT pg_catalog.string_agg(member.rolname || '>' || parent.rolname, ',' ORDER BY member.rolname,parent.rolname) FROM pg_catalog.pg_auth_members m JOIN pg_catalog.pg_roles member ON member.oid=m.member JOIN pg_catalog.pg_roles parent ON parent.oid=m.roleid WHERE member.rolname IN (" + role_names + ");", db_name=cfg['database'])
     if memberships != cfg['migrator_role'] + '>' + cfg['owner_role']:
         fail('Configured database role membership mismatch')
 
@@ -541,6 +590,7 @@ def get_systemd_main_pid(unit_name):
 
 
 def action_migrate(cfg, release_dir, revision, run_id, manifest_sha):
+    validate_migration_user(cfg)
     paths = get_target_paths(cfg)
     verify_target_ownership(cfg)
 
@@ -562,38 +612,38 @@ def action_migrate(cfg, release_dir, revision, run_id, manifest_sha):
         if not is_running and (main_pid or state not in ('inactive', 'failed')):
             fail('Service state is not safely inactive')
 
-        history_exists = run_psql(cfg, "SELECT to_regclass('app.flyway_schema_history') IS NOT NULL;", db_name=cfg['database'])
+        history_exists = run_psql(cfg, "SELECT pg_catalog.to_regclass('app.flyway_schema_history') IS NOT NULL;", db_name=cfg['database'])
         applied_versions = ''
         if history_exists == 't':
-            applied_versions = run_psql(cfg, "SELECT COALESCE(string_agg(version, ',' ORDER BY installed_rank), '') FROM app.flyway_schema_history WHERE success AND type='SQL';", db_name=cfg['database'])
-            bad = run_psql(cfg, "SELECT count(*) FROM app.flyway_schema_history WHERE NOT success OR type NOT IN ('SQL','SCHEMA') OR (type='SQL' AND (version IS NULL OR script IS NULL OR checksum IS NULL OR (version,script) NOT IN (('1','V1__identity.sql'),('2','V2__masters.sql'),('3','V3__finance.sql'),('4','V4__procurement_inventory_ap.sql'),('5','V5__local_crm_goods_o2c.sql'))));", db_name=cfg['database'])
-            if applied_versions not in ('1,2,3,4', '1,2,3,4,5') or bad != '0':
+            applied_versions = run_migrator_psql(cfg, "SELECT COALESCE(string_agg(version, ',' ORDER BY installed_rank), '') FROM app.flyway_schema_history WHERE success AND type='SQL';")
+            bad = run_migrator_psql(cfg, "SELECT count(*) FROM app.flyway_schema_history WHERE NOT success OR type NOT IN ('SQL','SCHEMA') OR (type='SQL' AND (version IS NULL OR script IS NULL OR checksum IS NULL OR (version,script) NOT IN (('1','V1__identity.sql'),('2','V2__masters.sql'),('3','V3__finance.sql'),('4','V4__procurement_inventory_ap.sql'),('5','V5__local_crm_goods_o2c.sql'),('6','V6__assets_service_contracts.sql'),('7','V7__draft_service_invoice_source_guard.sql'))));")
+            if applied_versions not in ('1,2,3,4', '1,2,3,4,5', '1,2,3,4,5,6', '1,2,3,4,5,6,7') or bad != '0':
                 fail('Partial or unexpected Flyway history')
         else:
-            objects = run_psql(cfg, "SELECT (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='app') + (SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='app') + (SELECT count(*) FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace WHERE n.nspname='app' AND t.typrelid=0);", db_name=cfg['database'])
+            objects = run_psql(cfg, "SELECT (SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='app') + (SELECT count(*) FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='app') + (SELECT count(*) FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON n.oid=t.typnamespace WHERE n.nspname='app' AND t.typrelid=0);", db_name=cfg['database'])
             if objects != '0':
                 fail('Fresh application schema is not empty')
 
         foreign_schemas = run_psql(cfg,
-            "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+            "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace "
             "WHERE c.relkind IN ('r','p') AND n.nspname NOT IN ('app','extensions','pg_catalog','information_schema') "
             "AND n.nspname NOT LIKE 'pg_toast%';",
             db_name=cfg['database']
         )
         if foreign_schemas != '0':
             fail("Foreign or unowned tables found in database; refusing migration")
-        if applied_versions != '1,2,3,4,5' and (main_pid or state not in ('inactive', 'failed')):
+        if applied_versions != ','.join(database.SCHEMA_VERSIONS) and (main_pid or state not in ('inactive', 'failed')):
             fail('Service must be inactive for schema migration')
         dest = paths['releases'] / manifest_sha
         copy_release_immutable(Path(release_dir), dest)
         release.verify_release(str(dest), revision, run_id, manifest_sha)
         release_dir = str(dest)
 
-        if applied_versions == '1,2,3,4,5':
+        if applied_versions == ','.join(database.SCHEMA_VERSIONS):
             run_flyway(cfg, Path(release_dir) / 'migration' / 'pom.xml', ['flyway:validate'])
         else:
-            if applied_versions == '1,2,3,4':
-                run_flyway(cfg, Path(release_dir) / 'migration' / 'pom.xml', ['-Dflyway.target=4', 'flyway:validate'])
+            if applied_versions in ('1,2,3,4', '1,2,3,4,5', '1,2,3,4,5,6'):
+                run_flyway(cfg, Path(release_dir) / 'migration' / 'pom.xml', ['-Dflyway.target=' + applied_versions[-1], 'flyway:validate'])
             run_flyway(cfg, Path(release_dir) / 'migration' / 'pom.xml', ['flyway:migrate', 'flyway:validate'])
         require_schema_compatible(cfg, release_dir)
 
@@ -621,6 +671,7 @@ def action_migrate(cfg, release_dir, revision, run_id, manifest_sha):
 
 
 def run_flyway(cfg, pom_path, goals):
+    migration = validate_migration_user(cfg)
     if not pom_path.is_file():
         fail(f"Migration pom.xml not found at {pom_path}")
 
@@ -632,7 +683,7 @@ def run_flyway(cfg, pom_path, goals):
     env = {
         'JAVA_HOME': cfg['java_home'],
         'PATH': f"{Path(cfg['java_home']) / 'bin'}:/usr/bin:/bin",
-        'HOME': '/root',
+        'HOME': migration.pw_dir,
         'LANG': 'C',
         'LAB_MIGRATION_DB_URL': mig_env_data['LAB_MIGRATION_DB_URL'],
         'LAB_MIGRATION_DB_USER': mig_env_data['LAB_MIGRATION_DB_USER'],
@@ -640,9 +691,17 @@ def run_flyway(cfg, pom_path, goals):
         'LAB_MIGRATION_OWNER': mig_env_data['LAB_MIGRATION_OWNER']
     }
 
-    mvn_bin = str(Path(cfg['maven_home']) / 'bin' / 'mvn')
-    cmd = [mvn_bin, '--batch-mode', '--no-transfer-progress', '-f', str(pom_path)] + goals
-    res = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=300)
+    java_bin = Path(cfg['java_home']) / 'bin' / 'java'
+    mvn_bin = Path(cfg['maven_home']) / 'bin' / 'mvn'
+    for binary in (java_bin, mvn_bin):
+        validate_clean_path(str(binary), 'Tool binary')
+        validate_ancestors_root_owned(binary)
+        if not binary.is_file() or not os.access(binary, os.X_OK):
+            fail(f'Tool binary not found or not executable: {binary}')
+    cmd = [str(mvn_bin), '--batch-mode', '--no-transfer-progress', '-f', str(pom_path)] + goals
+    res = subprocess.run(cmd, env=env, cwd=migration.pw_dir, user=migration.pw_uid,
+                         group=migration.pw_gid, extra_groups=[],
+                         capture_output=True, text=True, timeout=300)
     if res.returncode != 0:
         fail(f"Flyway command failed (code {res.returncode})")
 
@@ -660,9 +719,8 @@ def grant_runtime_privileges(cfg):
     for tables, privileges in ((database.INSERT_ONLY, 'SELECT,INSERT'), (database.MUTABLE, 'SELECT,INSERT,UPDATE')):
         for table in tables:
             statements.append(f'GRANT {privileges} ON app."{table}" TO {user};')
-            seq = run_psql(cfg,
-                f"SELECT CASE WHEN EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='app' AND table_name='{table}' AND column_name='id' AND is_identity='YES') THEN pg_get_serial_sequence('app.{table}','id') END;",
-                db_name=cfg['database']
+            seq = run_migrator_psql(cfg,
+                f"SELECT CASE WHEN EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='app' AND table_name='{table}' AND column_name='id' AND is_identity='YES') THEN pg_catalog.pg_get_serial_sequence('app.{table}','id') END;"
             )
             if seq:
                 if not re.fullmatch(r'app\.[a-z_][a-z0-9_]*', seq):
@@ -892,10 +950,9 @@ def check_receipt(cfg, kind, sha, revision, run_id):
 
 
 def initial_admin_receipt(cfg):
-    value = run_psql(cfg,
+    value = run_migrator_psql(cfg,
         "SELECT json_build_object('id',id,'user_id',user_id,'workspace_id',workspace_id,"
-        "'payload_hash',payload_hash)::text FROM app.setup_receipts WHERE receipt_key='INITIAL_ADMIN';",
-        db_name=cfg['database'])
+        "'payload_hash',payload_hash)::text FROM app.setup_receipts WHERE receipt_key='INITIAL_ADMIN';")
     if not value:
         fail('Bootstrap database receipt missing')
     return json.loads(value)
@@ -926,12 +983,12 @@ def previous_distinct_release(state):
 
 def require_schema_compatible(cfg, release_dir):
     expected = release.schema_identity(Path(release_dir) / 'app' / 'application.jar')
-    actual = run_psql(cfg,
+    actual = run_migrator_psql(cfg,
         "SELECT COALESCE(string_agg(version || '|' || script || '|' || checksum::text, ',' ORDER BY installed_rank), '') "
-        "FROM app.flyway_schema_history WHERE success AND type='SQL';", db_name=cfg['database'])
-    bad = run_psql(cfg, "SELECT count(*) FROM app.flyway_schema_history "
+        "FROM app.flyway_schema_history WHERE success AND type='SQL';")
+    bad = run_migrator_psql(cfg, "SELECT count(*) FROM app.flyway_schema_history "
         "WHERE NOT success OR type NOT IN ('SQL','SCHEMA') OR (type='SQL' AND "
-        "(version IS NULL OR script IS NULL OR checksum IS NULL));", db_name=cfg['database'])
+        "(version IS NULL OR script IS NULL OR checksum IS NULL));")
     if bad != '0' or actual != expected:
         fail('Release is incompatible with the applied database schema; refusing rollout or recovery')
 

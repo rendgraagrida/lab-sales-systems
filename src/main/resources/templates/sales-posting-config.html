@@ -22,6 +22,23 @@
 <p>All four roles must be distinct. AR and Unbilled cannot share Bank, Inventory or Input Tax. Goods revenue and COGS cannot be adjustment or service-expense accounts. Booked source mappings cannot be rewritten.</p>
 <button type="submit">Save sales posting accounts</button>
 </form>
+<h2>Service posting accounts</h2>
+<form method="post" th:action="${serviceAction}" th:with="form=${feedback.form('service-config',serviceAction)}">
+<section th:replace="~{fragments :: formErrors(${form})}"></section>
+<input type="hidden" name="version" th:value="${form.value('version',serviceConfiguration == null ? 0 : serviceConfiguration.version)}">
+<div th:each="i : ${#numbers.sequence(0,2)}" th:with="fields=${ {'deferredAccount','implementationRevenueAccount','serviceRevenueAccount'} }, labels=${ {'Deferred revenue (liability)','Implementation revenue (income)','Service revenue (income)'} }, columns=${ {'deferred_account_id','implementation_revenue_account_id','service_revenue_account_id'} }, field=${fields[i]}, missing=${form.submitted() and form.missingChoice(field,accounts.![id + ':' + version])}">
+<label th:for="${form.id(field)}" th:text="${labels[i]}"></label>
+<select th:id="${form.id(field)}" th:name="${field}" required th:attr="aria-invalid=${form.invalid(field) or missing ? 'true' : null},aria-describedby=${form.invalid(field) ? form.errorId(field) : (missing ? form.id(field)+'-reference' : null)}">
+<option value="">Choose account</option>
+<option th:if="${missing}" th:value="${form.value(field,'')}" selected>Previously submitted selection (changed or unavailable)</option>
+<option th:each="account : ${accounts}" th:value="${account.id + ':' + account.version}" th:selected="${form.selected(field,account.id + ':' + account.version,serviceConfiguration != null and account.id == serviceConfiguration.get(columns[i]) ? account.id + ':' + account.version : '')}" th:text="${account.code + ' - ' + account.name + ' (' + account.account_type + (account.active ? ')' : ', inactive)')}"></option>
+</select>
+<p th:replace="~{fragments :: fieldError(${form},${field},0)}"></p>
+<p th:if="${missing}" th:id="${form.id(field)+'-reference'}" role="note">Choose a current authorized account explicitly before saving.</p>
+</div>
+<p>Service mappings become immutable after a service source is created. AR and Unbilled reuse the sales mappings above.</p>
+<button type="submit">Save service posting accounts</button>
+</form>
 <section th:replace="~{fragments :: formFallback(${feedback})}"></section>
 </main>
 <footer th:replace="~{fragments :: footer()}"></footer>

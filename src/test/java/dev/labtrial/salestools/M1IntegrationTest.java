@@ -36,6 +36,7 @@ import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.LinkedHashMap;
 import java.util.UUID;
 import java.util.concurrent.Callable;
 import java.util.concurrent.Executors;
@@ -106,6 +107,10 @@ class M1IntegrationTest {
     @Autowired dev.labtrial.salestools.finance.CustomerReceiptService customerReceipts;
     @Autowired dev.labtrial.salestools.crm.ReactivationService reactivation;
     @Autowired dev.labtrial.salestools.crm.OpportunityService crmOpportunities;
+    @Autowired dev.labtrial.salestools.finance.ServiceRevenueService serviceRevenue;
+    @Autowired dev.labtrial.salestools.service.RenewalService serviceRenewals;
+    @Autowired dev.labtrial.salestools.service.AssetService serviceAssets;
+    @Autowired dev.labtrial.salestools.order.GoodsConfigurationService goodsConfiguration;
     @Autowired Environment environment;
     private long administrator;
     private long initialWorkspace;
@@ -361,6 +366,106 @@ class M1IntegrationTest {
         actor(c.user());
         denied(404, () -> contacts.get(c.workspace(), c.entity(), contact));
         denied(404, () -> customers.get(c.workspace(), c.entity(), first));
+    }
+
+    @Test void existingContactLinkRetainsStaleContactAndRoleUntilExplicitRefresh() throws Exception {
+        var c = context("EUR", "INSIDE_SALES", "FINANCE");
+        long customer = customers.save(c.workspace(), c.entity(), null, null,
+                new CustomerService.Input("LINK-CUSTOMER", "Relationship customer", "", "", "", null, null));
+        customerAccounts.assign(c.workspace(), c.entity(), customer, 1, "LINK-EU");
+        long contact = contacts.save(c.workspace(), c.entity(), null, null,
+                "LINK-A", "Original", "Contact", "link-a@example.example", "LEAD");
+        long other = contacts.save(c.workspace(), c.entity(), null, null,
+                "LINK-B", "Other", "Contact", "link-b@example.example", "LEAD");
+        contacts.link(c.workspace(), c.entity(), customer, 1, contact, 1, null, "Procurement", true);
+        contacts.link(c.workspace(), c.entity(), customer, 1, other, 1, null, "Lab manager", true);
+        HttpClient client = signedIn(c.login());
+        String detail = "/w/" + c.workspace() + "/e/" + c.entity() + "/masters/customers/" + customer;
+        String formId = "customer-contact-" + contact;
+        var submitted = renderedForm(get(client, detail).body(), formId);
+        assertEquals(contact + ":1", submitted.get("contact"));
+        actor(c.user());
+        contacts.save(c.workspace(), c.entity(), contact, 1L,
+                "LINK-A", "Concurrently changed", "Contact", "link-a@example.example", "LEAD");
+        var beforeContact = contacts.get(c.workspace(), c.entity(), contact);
+        var beforeLinks = contacts.links(c.workspace(), c.entity(), customer);
+        int beforeAudits = db.queryForObject("select count(*) from audit_events where workspace_id=?", Integer.class, c.workspace());
+        submitted.put("role", "User-entered responsibility");
+        submitted.remove("active");
+        var invalid = post(client, detail + "/contact-link", submitted);
+        assertEquals(400, invalid.statusCode());
+        var retained = renderedForm(invalid.body(), formId);
+        assertEquals(contact + ":1", retained.get("contact"), "Redisplay must not promote the contact revision");
+        assertEquals("1", retained.get("customerVersion"));
+        assertEquals("1", retained.get("linkVersion"));
+        assertEquals("User-entered responsibility", retained.get("role"));
+        assertLinkedFieldError(invalid.body(), formId + "-active-0");
+        var unaffected = renderedForm(invalid.body(), "customer-contact-" + other);
+        assertEquals(other + ":1", unaffected.get("contact"));
+        assertEquals("Lab manager", unaffected.get("role"));
+        actor(c.user());
+        assertEquals(beforeContact, contacts.get(c.workspace(), c.entity(), contact));
+        assertEquals(beforeLinks, contacts.links(c.workspace(), c.entity(), customer));
+        assertEquals(beforeAudits, db.queryForObject("select count(*) from audit_events where workspace_id=?", Integer.class, c.workspace()));
+        retained.put("active", "false");
+        var stale = post(client, detail + "/contact-link", retained);
+        assertEquals(409, stale.statusCode());
+        assertEquals(contact + ":1", renderedForm(stale.body(), formId).get("contact"));
+        actor(c.user());
+        assertEquals(beforeLinks, contacts.links(c.workspace(), c.entity(), customer));
+        assertEquals(beforeAudits, db.queryForObject("select count(*) from audit_events where workspace_id=?", Integer.class, c.workspace()));
+        var explicit = renderedForm(get(client, detail).body(), formId);
+        assertEquals(contact + ":2", explicit.get("contact"));
+        explicit.put("role", "User-entered responsibility");
+        explicit.put("active", "false");
+        assertEquals(302, post(client, detail + "/contact-link", explicit).statusCode());
+        actor(c.user());
+        var links = contacts.links(c.workspace(), c.entity(), customer);
+        var changed = links.stream().filter(link -> link.contactId() == contact).findFirst().orElseThrow();
+        var unchanged = links.stream().filter(link -> link.contactId() == other).findFirst().orElseThrow();
+        assertEquals("User-entered responsibility", changed.role());
+        assertFalse(changed.active());
+        assertEquals(2L, changed.version());
+        assertEquals("Lab manager", unchanged.role());
+        assertTrue(unchanged.active());
+        assertEquals(1L, unchanged.version());
+        assertEquals(beforeAudits + 1, db.queryForObject("select count(*) from audit_events where workspace_id=?", Integer.class, c.workspace()));
+    }
+
+    @Test void existingContactLinkRetainsRejectedInputAfterContactDeactivation() throws Exception {
+        var c = context("EUR", "INSIDE_SALES", "FINANCE");
+        long customer = customers.save(c.workspace(), c.entity(), null, null,
+                new CustomerService.Input("INACTIVE-LINK", "Inactive reference customer", "", "", "", null, null));
+        customerAccounts.assign(c.workspace(), c.entity(), customer, 1, "INACTIVE-LINK-EU");
+        long contact = contacts.save(c.workspace(), c.entity(), null, null,
+                "INACTIVE-PERSON", "Inactive", "Contact", "inactive-person@example.example", "LEAD");
+        contacts.link(c.workspace(), c.entity(), customer, 1, contact, 1, null, "Original role", true);
+        HttpClient client = signedIn(c.login());
+        String detail = "/w/" + c.workspace() + "/e/" + c.entity() + "/masters/customers/" + customer;
+        String formId = "customer-contact-" + contact;
+        var submitted = renderedForm(get(client, detail).body(), formId);
+        actor(c.user());
+        contacts.deactivate(c.workspace(), c.entity(), contact, 1);
+        var beforeLinks = contacts.links(c.workspace(), c.entity(), customer);
+        int beforeAudits = db.queryForObject("select count(*) from audit_events where workspace_id=?", Integer.class, c.workspace());
+        submitted.put("role", "Retained inactive input");
+        submitted.remove("active");
+        var invalid = post(client, detail + "/contact-link", submitted);
+        assertEquals(400, invalid.statusCode());
+        var retained = renderedForm(invalid.body(), formId);
+        assertEquals(contact + ":1", retained.get("contact"));
+        assertEquals("Retained inactive input", retained.get("role"));
+        assertEquals("1", retained.get("linkVersion"));
+        assertLinkedFieldError(invalid.body(), formId + "-active-0");
+        retained.put("active", "true");
+        assertEquals(409, post(client, detail + "/contact-link", retained).statusCode());
+        var explicit = renderedForm(get(client, detail).body(), formId);
+        assertEquals(contact + ":2", explicit.get("contact"));
+        assertEquals(400, post(client, detail + "/contact-link", explicit).statusCode());
+        actor(c.user());
+        assertFalse(contacts.get(c.workspace(), c.entity(), contact).active());
+        assertEquals(beforeLinks, contacts.links(c.workspace(), c.entity(), customer));
+        assertEquals(beforeAudits, db.queryForObject("select count(*) from audit_events where workspace_id=?", Integer.class, c.workspace()));
     }
 
     @Test void ownContactRemainsVisibleWhileLinkedToOwnDraftAndThenFollowsEntityAssignment() {
@@ -1742,6 +1847,18 @@ class M1IntegrationTest {
         }
         throw new AssertionError("The original form field is missing: " + id);
     }
+    private static void assertInlineFieldError(String html, String id) {
+        var controls = Pattern.compile("<(?:input|select)\\b[^>]*>", Pattern.CASE_INSENSITIVE).matcher(html);
+        while (controls.find()) {
+            var attributes = htmlAttributes(controls.group());
+            if (!id.equals(attributes.get("id"))) continue;
+            assertEquals("true", attributes.get("aria-invalid"));
+            assertEquals(id + "-error", attributes.get("aria-describedby"));
+            assertTrue(html.contains("id=\"" + id + "-error\""), "The described inline error must exist.");
+            return;
+        }
+        throw new AssertionError("The original form field is missing: " + id);
+    }
     private static void assertUnavailableReviewNotice(String html, String fieldName, String expectedToken) {
         var selects = Pattern.compile("<select\\b([^>]*)>(.*?)</select>", Pattern.CASE_INSENSITIVE | Pattern.DOTALL).matcher(html);
         while (selects.find()) {
@@ -1769,18 +1886,23 @@ class M1IntegrationTest {
         throw new AssertionError("The submitted reference control is missing: " + fieldName);
     }
     private static Map<String,String> renderedForm(String html, String identity) {
+        var result = new LinkedHashMap<String,String>();
+        renderedFormValues(html, identity).forEach((name, values) -> result.put(name, values.getLast()));
+        return result;
+    }
+    private static Map<String,List<String>> renderedFormValues(String html, String identity) {
         var forms = Pattern.compile("<form\\b[^>]*>.*?</form>", Pattern.CASE_INSENSITIVE | Pattern.DOTALL).matcher(html);
         while (forms.find()) {
             String form = forms.group();
-            var values = new java.util.LinkedHashMap<String,String>();
+            var values = new LinkedHashMap<String,List<String>>();
             var inputs = Pattern.compile("<input\\b[^>]*>", Pattern.CASE_INSENSITIVE).matcher(form);
             while (inputs.find()) {
                 var attributes = htmlAttributes(inputs.group());
                 String name = attributes.get("name"), type = attributes.getOrDefault("type", "text");
                 if (name == null || attributes.containsKey("disabled") || (List.of("checkbox", "radio").contains(type) && !attributes.containsKey("checked"))) continue;
-                values.put(name, attributes.getOrDefault("value", ""));
+                values.computeIfAbsent(name, ignored -> new ArrayList<>()).add(attributes.getOrDefault("value", ""));
             }
-            if (!identity.equals(values.get("_form"))) continue;
+            if (!List.of(identity).equals(values.get("_form"))) continue;
             var selects = Pattern.compile("<select\\b([^>]*)>(.*?)</select>", Pattern.CASE_INSENSITIVE | Pattern.DOTALL).matcher(form);
             while (selects.find()) {
                 String name = htmlAttributes(selects.group(1)).get("name");
@@ -1793,11 +1915,32 @@ class M1IntegrationTest {
                     if (value == null || attributes.containsKey("selected")) value = option;
                     if (attributes.containsKey("selected")) break;
                 }
-                values.put(name, value == null ? "" : value);
+                values.computeIfAbsent(name, ignored -> new ArrayList<>()).add(value == null ? "" : value);
             }
             return values;
         }
         throw new AssertionError("The actual rendered consumer form is missing: " + identity);
+    }
+    private static String renderedControlValue(String html, String id) {
+        var inputs = Pattern.compile("<input\\b[^>]*>", Pattern.CASE_INSENSITIVE).matcher(html);
+        while (inputs.find()) {
+            var attributes = htmlAttributes(inputs.group());
+            if (id.equals(attributes.get("id"))) return attributes.getOrDefault("value", "");
+        }
+        var selects = Pattern.compile("<select\\b([^>]*)>(.*?)</select>", Pattern.CASE_INSENSITIVE | Pattern.DOTALL).matcher(html);
+        while (selects.find()) {
+            if (!id.equals(htmlAttributes(selects.group(1)).get("id"))) continue;
+            String first = null;
+            var options = Pattern.compile("<option\\b([^>]*)>(.*?)</option>", Pattern.CASE_INSENSITIVE | Pattern.DOTALL).matcher(selects.group(2));
+            while (options.find()) {
+                var attributes = htmlAttributes(options.group(1));
+                String value = attributes.getOrDefault("value", org.springframework.web.util.HtmlUtils.htmlUnescape(options.group(2)));
+                if (attributes.containsKey("selected")) return value;
+                if (first == null) first = value;
+            }
+            return first == null ? "" : first;
+        }
+        throw new AssertionError("The actual rendered control is missing: " + id);
     }
     private static Map<String,String> htmlAttributes(String tag) {
         var attributes = new java.util.LinkedHashMap<String,String>();
@@ -1987,10 +2130,10 @@ class M1IntegrationTest {
         var product=products.get(c.workspace(),c.entity(),purchased.product());
         var unit=configuration.get(c.workspace(),c.entity(),ConfigurationService.Kind.UOM,product.uomId());
         long quote=salesQuotes.save(c.workspace(),c.entity(),null,null,new dev.labtrial.salestools.order.QuoteService.Draft(
-                "DIRECT_ERP",customer,1,null,DAY.plusDays(2),DAY.plusDays(30),1,null,null,
+                "DIRECT_ERP",customer,1,null,DAY.plusDays(2),DAY.plusDays(30),1,null,null,null,
                 List.of(new dev.labtrial.salestools.order.QuoteService.LineInput("GOODS-LINE",product.id(),product.version(),
                         products.setting(c.workspace(),c.entity(),product.id()).version(),unit.version(),book,3,1,
-                        quantity,null,null,discountAmount,tax,1))));
+                        quantity,null,null,discountAmount,tax,1,List.of()))));
         salesQuotes.submit(c.workspace(),c.entity(),quote,1);
         salesQuotes.accept(c.workspace(),c.entity(),quote,2,DAY.plusDays(2),"SYNTHETIC-CUSTOMER-PO");
         var commercial=salesQuotes.quote(c.workspace(),c.entity(),quote);
@@ -2025,7 +2168,7 @@ class M1IntegrationTest {
         var c=f.seller(); actor(c.user());
         long invoice=salesInvoices.save(c.workspace(),c.entity(),null,0,new dev.labtrial.salestools.finance.SalesInvoiceService.Draft(
                 "INVOICE-"+UUID.randomUUID(),date,List.of(new dev.labtrial.salestools.finance.SalesInvoiceService.Line(
-                        "GOODS",shipmentLine,new BigDecimal(start),new BigDecimal(end)))));
+                        "GOODS",dev.labtrial.salestools.finance.SalesInvoiceService.SourceType.SHIPMENT,shipmentLine,new BigDecimal(start),new BigDecimal(end)))));
         salesInvoices.post(c.workspace(),c.entity(),invoice,1);
         return invoice;
     }
@@ -2166,10 +2309,10 @@ class M1IntegrationTest {
         long lineVersion=db.queryForObject("select version from price_book_lines where workspace_id=? and entity_id=? and price_book_id=? and product_id=?",Long.class,c.workspace(),c.entity(),bookId,f.product());
         var tax=db.queryForMap("select v.id,v.version from tax_versions v join tax_codes t on t.workspace_id=v.workspace_id and t.entity_id=v.entity_id and t.id=v.tax_code_id where t.workspace_id=? and t.entity_id=? and t.code='GOODS-TAX'",c.workspace(),c.entity());
         return salesQuotes.save(c.workspace(),c.entity(),null,null,new dev.labtrial.salestools.order.QuoteService.Draft(
-            "DIRECT_ERP",f.customerAccount(),1,null,DAY.plusDays(2),DAY.plusDays(30),1,null,null,
+            "DIRECT_ERP",f.customerAccount(),1,null,DAY.plusDays(2),DAY.plusDays(30),1,null,null,null,
             List.of(new dev.labtrial.salestools.order.QuoteService.LineInput("GOODS-LINE",p.id(),p.version(),products.setting(c.workspace(),c.entity(),p.id()).version(),
                 unit.version(),bookId,((Number)book.get("version")).longValue(),lineVersion,quantity,override,null,discount,
-                ((Number)tax.get("id")).longValue(),((Number)tax.get("version")).longValue()))));
+                ((Number)tax.get("id")).longValue(),((Number)tax.get("version")).longValue(),List.of()))));
     }
 
     @Test void manualPriceOverrideNeedsIndependentExactRevisionApprovalAndRevisionInvalidatesIt() {
@@ -2217,9 +2360,9 @@ class M1IntegrationTest {
                 ((Number)original.get("uom_version")).longValue(),((Number)original.get("price_book_id")).longValue(),
                 ((Number)original.get("price_book_version")).longValue(),((Number)original.get("price_book_line_version")).longValue(),
                 new BigDecimal(pair[1]),null,null,null,((Number)original.get("tax_version_id")).longValue(),
-                ((Number)original.get("tax_version_version")).longValue()));
+                ((Number)original.get("tax_version_version")).longValue(),List.of()));
         long quote=salesQuotes.save(c.workspace(),c.entity(),null,null,new dev.labtrial.salestools.order.QuoteService.Draft(
-                "DIRECT_ERP",f.customerAccount(),1,null,DAY.plusDays(2),DAY.plusDays(30),1,null,null,inputs));
+                "DIRECT_ERP",f.customerAccount(),1,null,DAY.plusDays(2),DAY.plusDays(30),1,null,null,null,inputs));
         salesQuotes.submit(c.workspace(),c.entity(),quote,1);
         salesQuotes.accept(c.workspace(),c.entity(),quote,2,DAY.plusDays(2),"MULTILINE-PO");
         var source=salesQuotes.quote(c.workspace(),c.entity(),quote);
@@ -2264,10 +2407,10 @@ class M1IntegrationTest {
         var price=db.queryForMap("select version from price_book_lines where price_book_id=? and product_id=?",bookId,product);
         var tax=db.queryForMap("select v.id,v.version from tax_versions v join tax_codes t on t.id=v.tax_code_id where t.workspace_id=? and t.code='SIM-VAT7'",c.workspace());
         long quote=salesQuotes.save(c.workspace(),c.entity(),null,null,new dev.labtrial.salestools.order.QuoteService.Draft(
-                "DIRECT_ERP",f.customerAccount(),1,null,DAY.plusDays(2),DAY.plusDays(30),1,null,null,
+                "DIRECT_ERP",f.customerAccount(),1,null,DAY.plusDays(2),DAY.plusDays(30),1,null,null,null,
                 List.of(new dev.labtrial.salestools.order.QuoteService.LineInput("DEVICE",product,p.version(),1,unit.version(),
                         bookId,((Number)book.get("version")).longValue(),((Number)price.get("version")).longValue(),
-                        BigDecimal.ONE,null,null,new BigDecimal("2400.01"),((Number)tax.get("id")).longValue(),((Number)tax.get("version")).longValue()))));
+                        BigDecimal.ONE,null,null,new BigDecimal("2400.01"),((Number)tax.get("id")).longValue(),((Number)tax.get("version")).longValue(),List.of()))));
         salesQuotes.submit(c.workspace(),c.entity(),quote,1);
         assertEquals("SUBMITTED",salesQuotes.quote(c.workspace(),c.entity(),quote).get("status"));
         denied(403,()->salesQuotes.decide(c.workspace(),c.entity(),quote,2,true,"Maker cannot approve amount discount"));
@@ -2301,7 +2444,7 @@ class M1IntegrationTest {
         long delivered=shipGoods(f,BigDecimal.ONE,DAY.plusDays(3));
         assertEquals(new BigDecimal("60.00"),db.queryForObject("select cost from shipment_lines where id=?",BigDecimal.class,delivered));
         long invoice=salesInvoices.save(c.workspace(),c.entity(),null,0,new dev.labtrial.salestools.finance.SalesInvoiceService.Draft(
-                "FREE-GOODS-INVOICE",DAY.plusDays(3),List.of(new dev.labtrial.salestools.finance.SalesInvoiceService.Line("FREE",delivered,BigDecimal.ZERO,BigDecimal.ONE))));
+                "FREE-GOODS-INVOICE",DAY.plusDays(3),List.of(new dev.labtrial.salestools.finance.SalesInvoiceService.Line("FREE",dev.labtrial.salestools.finance.SalesInvoiceService.SourceType.SHIPMENT,delivered,BigDecimal.ZERO,BigDecimal.ONE))));
         long period=db.queryForObject("select id from fiscal_periods where workspace_id=? and entity_id=?",Long.class,c.workspace(),c.entity());
         finance.state(c.workspace(),c.entity(),period,1,"CLOSED");
         int journals=db.queryForObject("select count(*) from journal_entries where workspace_id=?",Integer.class,c.workspace());
@@ -2325,11 +2468,11 @@ class M1IntegrationTest {
         var c=f.seller(); reserveGoods(f,BigDecimal.ONE);
         long delivered=shipGoods(f,BigDecimal.ONE,DAY.plusDays(3));
         denied(400,()->salesInvoices.save(c.workspace(),c.entity(),null,0,new dev.labtrial.salestools.finance.SalesInvoiceService.Draft(
-                "HUGE-INTERVAL",DAY.plusDays(3),List.of(new dev.labtrial.salestools.finance.SalesInvoiceService.Line("BAD",delivered,new BigDecimal("1e2147483647"),BigDecimal.ONE)))));
+                "HUGE-INTERVAL",DAY.plusDays(3),List.of(new dev.labtrial.salestools.finance.SalesInvoiceService.Line("BAD",dev.labtrial.salestools.finance.SalesInvoiceService.SourceType.SHIPMENT,delivered,new BigDecimal("1e2147483647"),BigDecimal.ONE)))));
         long original=invoiceGoods(f,delivered,"0","1",DAY.plusDays(3));
         salesInvoices.reverse(c.workspace(),c.entity(),original,DAY.plusDays(6),"Future effective correction","FUTURE-INVOICE-CORRECTION");
         long early=salesInvoices.save(c.workspace(),c.entity(),null,0,new dev.labtrial.salestools.finance.SalesInvoiceService.Draft(
-                "EARLY-REBILL",DAY.plusDays(5),List.of(new dev.labtrial.salestools.finance.SalesInvoiceService.Line("EARLY",delivered,BigDecimal.ZERO,BigDecimal.ONE))));
+                "EARLY-REBILL",DAY.plusDays(5),List.of(new dev.labtrial.salestools.finance.SalesInvoiceService.Line("EARLY",dev.labtrial.salestools.finance.SalesInvoiceService.SourceType.SHIPMENT,delivered,BigDecimal.ZERO,BigDecimal.ONE))));
         denied(409,()->salesInvoices.post(c.workspace(),c.entity(),early,1));
         assertEquals("DRAFT",salesInvoices.detail(c.workspace(),c.entity(),early).get("status"));
         long valid=invoiceGoods(f,delivered,"0","1",DAY.plusDays(6));
@@ -2346,11 +2489,12 @@ class M1IntegrationTest {
                     "crm_inquiry_events","crm_routing_rules","crm_routing_evaluations","crm_score_rules","crm_score_evaluations",
                     "crm_reactivation_rules","crm_reactivation_evaluations","crm_reactivation_events","crm_opportunity_events",
                     "crm_lifecycle_events","quote_contributors","quote_events","sales_handover_requests","sales_handover_executions",
-                    "product_compatibilities","bundle_components","party_addresses","party_address_versions","document_address_snapshots",
+                    "bundle_components","party_addresses","party_address_versions","document_address_snapshots",
                     "inventory_reservation_events","sales_order_cancellations","sales_reversals")) {
                 sqlDenied(connection,"delete from app."+table);
                 sqlDenied(connection,"update app."+table+" set workspace_id=workspace_id");
             }
+            sqlDenied(connection,"delete from app.product_compatibilities");
             sqlDenied(connection,"update app.sales_orders set accepted_reference='tampered',version=version+1 where id="+f.order());
             sqlDenied(connection,"update app.sales_order_lines set unit_price=1,version=version+1 where id="+f.orderLine());
             sqlDenied(connection,"insert into app.sales_order_lines(workspace_id,entity_id,order_id,quote_line_id,line_key,product_id,product_version,product_setting_version,uom_id,uom_version,tracking,quantity_scale,quantity,unit_price,subtotal,discount,net,tax,gross,tax_version_id,tax_rate_pct,output_account_id,ar_account_id,unbilled_account_id,revenue_account_id,cogs_account_id,inventory_account_id) select workspace_id,entity_id,order_id,quote_line_id,'LATE-APPEND',product_id,product_version,product_setting_version,uom_id,uom_version,tracking,quantity_scale,quantity,unit_price,subtotal,discount,net,tax,gross,tax_version_id,tax_rate_pct,output_account_id,ar_account_id,unbilled_account_id,revenue_account_id,cogs_account_id,inventory_account_id from app.sales_order_lines where id="+f.orderLine());
@@ -2522,6 +2666,915 @@ class M1IntegrationTest {
         var excluded=reactivation.scan(c.workspace(),c.entity(),rule,fulfilled.plusDays(180)).stream().filter(r->r.customerId()==customer).findFirst().orElseThrow();
         assertEquals("NO_HISTORY",excluded.outcome()); assertNull(excluded.shipmentLineId()); assertNull(excluded.caseId());
         assertEquals(0,db.queryForObject("select count(*) from crm_reactivation_cases where workspace_id=? and customer_id=?",Integer.class,c.workspace(),customer));
+    }
+
+    @Test void fullOpeningSeparatesLegacyAssetAndCoveredRevenueWithoutSyntheticTransactions() throws Exception {
+        var c=context("EUR","FINANCE");
+        try (var executor=Executors.newFixedThreadPool(2)) {
+            Callable<Long> initialize=()->{
+                actor(c.user());
+                try { return baseline.initialize(c.workspace(),c.entity(),"FULL_OPERATIONS",1); }
+                finally { SecurityContextHolder.clearContext(); }
+            };
+            var results=executor.invokeAll(List.of(initialize,initialize));
+            assertEquals(results.get(0).get(),results.get(1).get());
+        }
+        actor(c.user());
+        assertEquals("FULL_OPERATIONS",db.queryForObject("select baseline_key from scenario_workspaces where id=?",String.class,c.workspace()));
+        var balances=db.queryForList("""
+                select a.code,sum(l.debit-l.credit) as balance from journal_entries j
+                join journal_lines l on l.workspace_id=j.workspace_id and l.entity_id=j.entity_id and l.journal_id=j.id
+                join chart_accounts a on a.workspace_id=l.workspace_id and a.entity_id=l.entity_id and a.id=l.account_id
+                where j.workspace_id=? and j.entity_id=? and j.state='POSTED' group by a.code
+                """,c.workspace(),c.entity());
+        var expected=Map.of("INVENTORY",new BigDecimal("13100.00"),"BANK",new BigDecimal("1800.00"),
+                "DEFERRED",new BigDecimal("-450.00"),"EQUITY",new BigDecimal("-14450.00"));
+        assertEquals(expected.keySet(),balances.stream().map(row->(String)row.get("code")).collect(java.util.stream.Collectors.toSet()));
+        for (var row:balances) assertEquals(0,expected.get((String)row.get("code")).compareTo((BigDecimal)row.get("balance")));
+        assertEquals(1,db.queryForObject("select count(*) from journal_entries where workspace_id=?",Integer.class,c.workspace()));
+        assertEquals(0,db.queryForObject("select count(*) from instrument_serials where workspace_id=? and serial='SIM-RGA-TR120-00001'",Integer.class,c.workspace()));
+        assertEquals("IN_STOCK",db.queryForObject("select status from instrument_serials where workspace_id=? and serial='SIM-RGA-TR120-00002'",String.class,c.workspace()));
+        var asset=db.queryForMap("select id,origin,inventory_serial_id from installed_instruments where workspace_id=? and serial='SIM-RGA-TR120-00001'",c.workspace());
+        assertEquals("LEGACY",asset.get("origin")); assertNull(asset.get("inventory_serial_id"));
+        assertEquals(LocalDate.of(2026,4,15),db.queryForObject("select business_date from installation_events where workspace_id=? and asset_id=?",LocalDate.class,c.workspace(),asset.get("id")));
+        var statement=db.queryForMap("select net_fee,billed,earned,cutoff from service_opening_balances where workspace_id=?",c.workspace());
+        assertEquals(new BigDecimal("1800.00"),statement.get("net_fee"));
+        assertEquals(new BigDecimal("1800.00"),statement.get("billed"));
+        assertEquals(new BigDecimal("1350.00"),statement.get("earned"));
+        assertEquals(DAY,((java.sql.Date)statement.get("cutoff")).toLocalDate());
+        assertEquals(9,db.queryForObject("select count(*) from service_opening_periods where workspace_id=?",Integer.class,c.workspace()));
+        var remaining=db.queryForList("""
+                select l.period_start,l.period_end,l.amount from revenue_schedule_lines l
+                where l.workspace_id=? and not exists(select 1 from service_opening_periods p
+                    where p.workspace_id=l.workspace_id and p.entity_id=l.entity_id and p.schedule_line_id=l.id)
+                order by l.period_no
+                """,c.workspace());
+        assertEquals(List.of(LocalDate.of(2027,2,15),LocalDate.of(2027,3,15),LocalDate.of(2027,4,15)),
+                remaining.stream().map(row->((java.sql.Date)row.get("period_end")).toLocalDate()).toList());
+        for (var period:remaining) assertEquals(new BigDecimal("150.00"),period.get("amount"));
+        assertEquals(0,db.queryForObject("select count(*) from revenue_recognitions where workspace_id=?",Integer.class,c.workspace()));
+        assertEquals(0,db.queryForObject("select count(*) from sales_invoices where workspace_id=?",Integer.class,c.workspace()));
+        assertEquals(0,db.queryForObject("select count(*) from customer_receipts where workspace_id=?",Integer.class,c.workspace()));
+        long deferred=salesReference(c,"DEFERRED").id(),equity=salesReference(c,"EQUITY").id();
+        denied(400,()->ledger.postOpening(c.workspace(),c.entity(),new Ledger.Opening("UNTYPED-SERVICE",1,DAY,"EUR",
+                "Cannot invent an unbacked service control balance",List.of(new Ledger.Line(equity,BigDecimal.ONE,BigDecimal.ZERO),
+                new Ledger.Line(deferred,BigDecimal.ZERO,BigDecimal.ONE)))));
+        assertEquals(1,db.queryForObject("select count(*) from opening_balance_sources where workspace_id=?",Integer.class,c.workspace()));
+        long matrix=db.queryForObject("select min(id) from product_compatibilities where workspace_id=?",Long.class,c.workspace());
+        try (var connection=dataSource.getConnection()) {
+            sqlDenied(connection,"update app.product_compatibilities set component_id=device_id,version=version+1 where id="+matrix);
+        }
+        setBusinessDate(c,LocalDate.of(2027,4,15));
+        long period=db.queryForObject("select id from fiscal_periods where workspace_id=?",Long.class,c.workspace());
+        finance.state(c.workspace(),c.entity(),period,1,"CLOSED");
+        denied(409,()->serviceRevenue.recognize(c.workspace(),c.entity(),LocalDate.of(2027,4,15),"CLOSED-CATCHUP"));
+        assertEquals(0,db.queryForObject("select count(*) from revenue_recognitions where workspace_id=?",Integer.class,c.workspace()));
+        finance.state(c.workspace(),c.entity(),period,2,"OPEN");
+        assertEquals(3,serviceRevenue.recognize(c.workspace(),c.entity(),LocalDate.of(2027,4,15),"OPEN-CATCHUP"));
+        serviceRevenue.recognize(c.workspace(),c.entity(),LocalDate.of(2027,4,15),"OPEN-CATCHUP");
+        serviceRevenue.recognize(c.workspace(),c.entity(),LocalDate.of(2027,4,15),"ANOTHER-RUN-KEY");
+        assertEquals(3,db.queryForObject("select count(*) from revenue_recognitions where workspace_id=?",Integer.class,c.workspace()));
+        assertEquals(new BigDecimal("450.00"),db.queryForObject("""
+                select sum(l.credit-l.debit) from journal_lines l join chart_accounts a
+                on a.workspace_id=l.workspace_id and a.entity_id=l.entity_id and a.id=l.account_id
+                where l.workspace_id=? and a.code='SERVICE_REVENUE'
+                """,BigDecimal.class,c.workspace()));
+        assertEquals(new BigDecimal("0.00"),db.queryForObject("select sum(credit-debit) from journal_lines where workspace_id=? and account_id=?",
+                BigDecimal.class,c.workspace(),deferred));
+    }
+
+    private void setBusinessDate(Context c,LocalDate when) {
+        actor(administrator);
+        try {
+            var workspace=identity.workspaceDetails(c.workspace());
+            identity.updateWorkspace(c.workspace(),((Number)workspace.get("version")).longValue(),
+                    (String)workspace.get("code"),(String)workspace.get("name"),when);
+        } finally { actor(c.user()); }
+    }
+
+    @Test void exactT90AndConcurrentScansCreateOneLocalRenewalWithoutStockOrOrder() throws Exception {
+        var c=context("EUR","FINANCE","INSIDE_SALES");
+        baseline.initialize(c.workspace(),c.entity(),"FULL_OPERATIONS",1);
+        long ownerVersion=db.queryForObject("select security_version from app_users where id=?",Long.class,c.user());
+        setBusinessDate(c,DAY.minusDays(1));
+        long earlierVersion=db.queryForObject("select version from scenario_workspaces where id=?",Long.class,c.workspace());
+        serviceRenewals.scan(c.workspace(),c.entity(),earlierVersion,c.user(),ownerVersion);
+        assertEquals(0,db.queryForObject("select count(*) from renewal_intents where workspace_id=?",Integer.class,c.workspace()));
+        setBusinessDate(c,DAY);
+        long dueVersion=db.queryForObject("select version from scenario_workspaces where id=?",Long.class,c.workspace());
+        try (var executor=Executors.newFixedThreadPool(2)) {
+            Callable<dev.labtrial.salestools.service.RenewalService.ScanResult> scan=()->{
+                actor(c.user());
+                try { return serviceRenewals.scan(c.workspace(),c.entity(),dueVersion,c.user(),ownerVersion); }
+                finally { SecurityContextHolder.clearContext(); }
+            };
+            var outcomes=executor.invokeAll(List.of(scan,scan));
+            assertEquals(1,outcomes.get(0).get().created().size()+outcomes.get(1).get().created().size());
+        }
+        actor(c.user());
+        var renewal=db.queryForMap("""
+                select i.target_start,i.contract_id,i.predecessor_term_id,o.pipeline,o.stage,o.customer_account_id
+                from renewal_intents i join crm_opportunities o on o.workspace_id=i.workspace_id
+                    and o.entity_id=i.entity_id and o.id=i.opportunity_id where i.workspace_id=?
+                """,c.workspace());
+        assertEquals(LocalDate.of(2027,4,15),((java.sql.Date)renewal.get("target_start")).toLocalDate());
+        assertEquals("SERVICE_RENEWAL",renewal.get("pipeline")); assertEquals("QUALIFIED",renewal.get("stage"));
+        assertEquals(1,db.queryForObject("select count(*) from crm_opportunities where workspace_id=?",Integer.class,c.workspace()));
+        assertEquals(0,db.queryForObject("select count(*) from sales_orders where workspace_id=?",Integer.class,c.workspace()));
+        assertEquals(new BigDecimal("13100.00"),db.queryForObject("select sum(value) from inventory_valuation_pools where workspace_id=?",BigDecimal.class,c.workspace()));
+    }
+
+    private record ServiceFixture(Context actor,Context checker,long order,long asset,long term,long customer,long onboarding) {}
+
+    private long fixtureId(Context c,String table,String key,String value) {
+        return db.queryForObject("select id from "+table+" where workspace_id=? and "+key+"=?",Long.class,c.workspace(),value);
+    }
+
+    private ServiceFixture serviceFixture(boolean mixed,BigDecimal fee) {
+        return serviceFixture(mixed, fee, DAY, DAY.plusYears(1));
+    }
+
+    private ServiceFixture serviceFixture(boolean mixed,BigDecimal fee,LocalDate coverageStart,LocalDate coverageEnd) {
+        return serviceFixture(mixed,fee,coverageStart,coverageEnd,true);
+    }
+
+    private ServiceFixture serviceFixture(boolean mixed,BigDecimal fee,LocalDate coverageStart,LocalDate coverageEnd,boolean completeInstallation) {
+        var c=context("EUR","FINANCE","OPERATIONS","INSIDE_SALES","SALES_MANAGER");
+        baseline.initialize(c.workspace(),c.entity(),"FULL_OPERATIONS",1);
+        long customer=db.queryForObject("select a.id from customer_entity_accounts a join customers p on p.workspace_id=a.workspace_id and p.id=a.customer_id where a.workspace_id=? and p.code='RGA-CUST-001'",Long.class,c.workspace());
+        long device=fixtureId(c,"products","sku","RGA-UNIT-TR120");
+        long plan=fixtureId(c,"products","sku","RGA-SVC-BASE12");
+        long onboarding=fixtureId(c,"products","sku","RGA-IMP-ONB01");
+        long supply=fixtureId(c,"products","sku","RGA-SUP-CS080");
+        Long asset=null;
+        if (!mixed) {
+            long contact=fixtureId(c,"contacts","code","RGA-CON-001");
+            asset=serviceAssets.registerLegacy(c.workspace(),c.entity(),customer,1,device,1,1,
+                    "SIM-NEW-"+UUID.randomUUID(),"ASSET-"+UUID.randomUUID(),DAY,"New synthetic installed-device evidence",contact,1,1,"REGISTER-"+UUID.randomUUID());
+        } else goodsConfiguration.compatibility(c.workspace(),c.entity(),device,1,supply,1);
+        long book=priceBooks.save(c.workspace(),c.entity(),null,null,"M4-"+UUID.randomUUID(),"New approved service prices","EUR",DAY,null);
+        List<Long> productIds=mixed ? List.of(device,supply,onboarding,plan) : List.of(plan);
+        long bookVersion=1;
+        for (long product:productIds) {
+            BigDecimal price=product==plan ? fee : product==device ? new BigDecimal("24000.00")
+                    : product==supply ? new BigDecimal("100.00") : new BigDecimal("1200.00");
+            priceBooks.line(c.workspace(),c.entity(),book,bookVersion++,product,1,null,price);
+        }
+        var checker=peer(c,"SALES_MANAGER");
+        priceBooks.approve(c.workspace(),c.entity(),book,bookVersion);
+        actor(c.user()); bookVersion++;
+        long tax=db.queryForObject("select v.id from tax_versions v join tax_codes t on t.workspace_id=v.workspace_id and t.entity_id=v.entity_id and t.id=v.tax_code_id where t.workspace_id=? and t.code='SIM-VAT7'",Long.class,c.workspace());
+        var inputs=new ArrayList<dev.labtrial.salestools.order.QuoteService.LineInput>();
+        for (long product:productIds) {
+            var p=products.get(c.workspace(),c.entity(),product);
+            var unit=configuration.get(c.workspace(),c.entity(),ConfigurationService.Kind.UOM,p.uomId());
+            var targets=List.<dev.labtrial.salestools.service.ServiceObligationService.TargetInput>of();
+            boolean service=product==plan || product==onboarding;
+            if (service) {
+                long profile=db.queryForObject("select id from service_product_versions where workspace_id=? and entity_id=? and product_id=?",Long.class,c.workspace(),c.entity(),product);
+                long matrix=db.queryForObject("select id from product_compatibilities where workspace_id=? and entity_id=? and device_id=? and component_id=?",Long.class,c.workspace(),c.entity(),device,product);
+                targets=List.of(new dev.labtrial.salestools.service.ServiceObligationService.TargetInput(1,profile,matrix,1,
+                        asset,asset==null?null:1L,asset==null?"DEVICE":null,asset==null?1:null,
+                        mixed?"INSTALLATION":"EXPLICIT",mixed?null:coverageStart,mixed?null:coverageEnd,null,null));
+            }
+            String key=product==device?"DEVICE":product==supply?"SUPPLY":product==onboarding?"ONBOARDING":"PLAN";
+            inputs.add(new dev.labtrial.salestools.order.QuoteService.LineInput(key,product,1,1,unit.version(),book,bookVersion,1,
+                    product==supply?new BigDecimal("2"):BigDecimal.ONE,null,
+                    product==device?new BigDecimal("6"):null,null,tax,1,targets));
+        }
+        long quote=salesQuotes.save(c.workspace(),c.entity(),null,null,new dev.labtrial.salestools.order.QuoteService.Draft(
+                "DIRECT_ERP",customer,1,null,DAY,DAY.plusDays(30),1,null,null,1L,inputs));
+        salesQuotes.submit(c.workspace(),c.entity(),quote,1);
+        salesQuotes.accept(c.workspace(),c.entity(),quote,2,DAY,"SIM-APPROVED-"+UUID.randomUUID());
+        var q=salesQuotes.quote(c.workspace(),c.entity(),quote);
+        long order=salesHandover.execute(c.workspace(),c.entity(),quote,((Number)q.get("revision_id")).longValue(),
+                ((Number)q.get("version")).longValue(),"HANDOVER-"+UUID.randomUUID()).orderId();
+        if (mixed) {
+            long warehouse=fixtureId(c,"warehouses","code","RGA-EU-01");
+            var physical=db.queryForList("select id,product_id,quantity from sales_order_lines where order_id=? and product_category in ('LAB_UNIT','LAB_SUPPLY') order by id",order);
+            for (var line:physical) {
+                long product=((Number)line.get("product_id")).longValue(),lineId=((Number)line.get("id")).longValue();
+                Long serial=product==device ? fixtureId(c,"instrument_serials","serial","SIM-RGA-TR120-00002") : null;
+                Long lot=product==supply ? fixtureId(c,"inventory_lots","lot","SIM-LOT-CS080-001") : null;
+                long version=db.queryForObject("select version from sales_orders where id=?",Long.class,order);
+                fulfillment.reserve(c.workspace(),c.entity(),order,version,lineId,1,warehouse,1,serial,lot,(BigDecimal)line.get("quantity"),"RESERVE-"+lineId);
+            }
+            long version=db.queryForObject("select version from sales_orders where id=?",Long.class,order);
+            var shipments=new ArrayList<dev.labtrial.salestools.order.FulfillmentService.ShipmentLineDraft>();
+            for (var line:physical) {
+                long lineId=((Number)line.get("id")).longValue();
+                long lv=db.queryForObject("select version from sales_order_lines where id=?",Long.class,lineId);
+                shipments.add(new dev.labtrial.salestools.order.FulfillmentService.ShipmentLineDraft("SHIP-"+lineId,lineId,lv,warehouse,1,(BigDecimal)line.get("quantity")));
+            }
+            long shipment=fulfillment.saveShipment(c.workspace(),c.entity(),null,null,new dev.labtrial.salestools.order.FulfillmentService.ShipmentDraft(
+                    "M4-SHIP-"+UUID.randomUUID(),order,version,DAY,shipments));
+            fulfillment.postShipment(c.workspace(),c.entity(),shipment,1);
+            asset=db.queryForObject("select id from installed_instruments where workspace_id=? and serial='SIM-RGA-TR120-00002'",Long.class,c.workspace());
+            assertEquals(0,db.queryForObject("select count(*) from installation_events where workspace_id=? and asset_id=?",Integer.class,c.workspace(),asset));
+            assertEquals(0,db.queryForObject("select count(*) from service_contract_terms where workspace_id=? and asset_id=?",Integer.class,c.workspace(),asset));
+            long obligation=db.queryForObject("select id from sales_service_obligations where workspace_id=? and asset_id=? and kind='ONBOARDING'",Long.class,c.workspace(),asset);
+            long assetVersion=db.queryForObject("select version from installed_instruments where id=?",Long.class,asset);
+            if (completeInstallation) serviceAssets.complete(c.workspace(),c.entity(),asset,assetVersion,obligation,DAY,DAY,"SIM-COMPLETION","Validated synthetic installation","COMPLETE-"+asset);
+        }
+        var terms=db.queryForList("select id from service_contract_terms where workspace_id=? and source_obligation_id is not null and asset_id=?",Long.class,c.workspace(),asset);
+        long term=terms.isEmpty()?0:terms.getFirst();
+        long completion=mixed ? db.queryForObject("select id from sales_service_obligations where workspace_id=? and asset_id=? and kind='ONBOARDING'",Long.class,c.workspace(),asset) : 0;
+        return new ServiceFixture(c,checker,order,asset,term,customer,completion);
+    }
+
+    private long serviceInvoice(ServiceFixture f,LocalDate date,BigDecimal start,BigDecimal end) {
+        var c=f.actor(); actor(c.user());
+        long invoice=salesInvoices.save(c.workspace(),c.entity(),null,0,new dev.labtrial.salestools.finance.SalesInvoiceService.Draft(
+                "SERVICE-"+UUID.randomUUID(),date,List.of(new dev.labtrial.salestools.finance.SalesInvoiceService.Line(
+                "TERM",dev.labtrial.salestools.finance.SalesInvoiceService.SourceType.SERVICE_TERM,f.term(),start,end))));
+        salesInvoices.post(c.workspace(),c.entity(),invoice,1); return invoice;
+    }
+
+    private BigDecimal accountNet(long journal,Context c,String code) {
+        return db.queryForObject("select coalesce(sum(debit-credit),0) from journal_lines where journal_id=? and account_id=?",
+                BigDecimal.class,journal,salesReference(c,code).id());
+    }
+
+    @Test void mixedOrderShipsBeforeInstallationAndOneInvoiceCombinesGoodsCompletionAndPlan() {
+        var f=serviceFixture(true,new BigDecimal("1800.00")); var c=f.actor();
+        var lines=new ArrayList<dev.labtrial.salestools.finance.SalesInvoiceService.Line>();
+        for (long shipmentLine:db.queryForList("select l.id from shipment_lines l join shipments s on s.id=l.shipment_id where s.workspace_id=? and s.order_id=? and l.active",Long.class,c.workspace(),f.order())) {
+            BigDecimal end=db.queryForObject("select slice_end from shipment_lines where id=?",BigDecimal.class,shipmentLine);
+            lines.add(new dev.labtrial.salestools.finance.SalesInvoiceService.Line("GOODS-"+shipmentLine,
+                    dev.labtrial.salestools.finance.SalesInvoiceService.SourceType.SHIPMENT,shipmentLine,BigDecimal.ZERO,end));
+        }
+        lines.add(new dev.labtrial.salestools.finance.SalesInvoiceService.Line("ONBOARDING",
+                dev.labtrial.salestools.finance.SalesInvoiceService.SourceType.SERVICE_OBLIGATION,f.onboarding(),BigDecimal.ZERO,new BigDecimal("1200.00")));
+        lines.add(new dev.labtrial.salestools.finance.SalesInvoiceService.Line("TERM",
+                dev.labtrial.salestools.finance.SalesInvoiceService.SourceType.SERVICE_TERM,f.term(),BigDecimal.ZERO,new BigDecimal("1800.00")));
+        long invoice=salesInvoices.save(c.workspace(),c.entity(),null,0,new dev.labtrial.salestools.finance.SalesInvoiceService.Draft("MIXED-"+UUID.randomUUID(),DAY,lines));
+        salesInvoices.post(c.workspace(),c.entity(),invoice,1);
+        long journal=((Number)salesInvoices.detail(c.workspace(),c.entity(),invoice).get("journal_id")).longValue();
+        assertEquals(new BigDecimal("27563.20"),accountNet(journal,c,"AR"));
+        assertEquals(new BigDecimal("-23960.00"),accountNet(journal,c,"UNBILLED"));
+        assertEquals(new BigDecimal("-1800.00"),accountNet(journal,c,"DEFERRED"));
+        assertEquals(new BigDecimal("-1803.20"),accountNet(journal,c,"TAX_OUTPUT"));
+        assertEquals(new BigDecimal("990.00"),db.queryForObject("select sum(value) from inventory_valuation_pools where workspace_id=?",BigDecimal.class,c.workspace()));
+        long receipt=customerReceipts.save(c.workspace(),c.entity(),null,0,new dev.labtrial.salestools.finance.CustomerReceiptService.Draft(
+                "SETTLE-"+UUID.randomUUID(),f.customer(),1,1,1,DAY,"EUR",new BigDecimal("27563.20"),
+                List.of(new dev.labtrial.salestools.finance.CustomerReceiptService.Allocation(invoice,new BigDecimal("27563.20")))));
+        customerReceipts.post(c.workspace(),c.entity(),receipt,1);
+        denied(409,()->salesInvoices.reverse(c.workspace(),c.entity(),invoice,DAY,"Cannot reverse allocated cash","NO-CASH-BYPASS"));
+        assertEquals(1,db.queryForObject("select count(*) from revenue_schedules where workspace_id=? and term_id=?",Integer.class,c.workspace(),f.term()));
+        assertEquals(LocalDate.of(2028,1,15),db.queryForObject("select coverage_end from service_contract_terms where id=?",LocalDate.class,f.term()));
+    }
+
+    @Test void serviceInvoiceCorrectionRetainsEarnedRevenueAndRebillDoesNotDuplicateSchedule() {
+        var f=serviceFixture(false,new BigDecimal("1800.00")); var c=f.actor();
+        long invoice=serviceInvoice(f,DAY,BigDecimal.ZERO,new BigDecimal("1800.00"));
+        setBusinessDate(c,DAY.plusMonths(1));
+        serviceRevenue.recognize(c.workspace(),c.entity(),DAY.plusMonths(1),"RECOGNIZE-FIRST");
+        salesInvoices.reverse(c.workspace(),c.entity(),invoice,DAY.plusMonths(1),"REV02 unchanged earning and coverage","SERVICE-REV02");
+        long correction=db.queryForObject("select journal_id from sales_reversals where workspace_id=? and invoice_id=?",Long.class,c.workspace(),invoice);
+        assertEquals(new BigDecimal("1650.00"),accountNet(correction,c,"DEFERRED"));
+        assertEquals(new BigDecimal("150.00"),accountNet(correction,c,"UNBILLED"));
+        assertEquals(new BigDecimal("126.00"),accountNet(correction,c,"TAX_OUTPUT"));
+        assertEquals(new BigDecimal("-1926.00"),accountNet(correction,c,"AR"));
+        assertEquals(0,accountNet(correction,c,"SERVICE_REVENUE").signum());
+        long rebill=serviceInvoice(f,DAY.plusMonths(1),BigDecimal.ZERO,new BigDecimal("1800.00"));
+        long rebillJournal=((Number)salesInvoices.detail(c.workspace(),c.entity(),rebill).get("journal_id")).longValue();
+        assertEquals(new BigDecimal("-150.00"),accountNet(rebillJournal,c,"UNBILLED"));
+        assertEquals(new BigDecimal("-1650.00"),accountNet(rebillJournal,c,"DEFERRED"));
+        assertEquals(1,db.queryForObject("select count(*) from revenue_schedules where workspace_id=? and term_id=?",Integer.class,c.workspace(),f.term()));
+        assertEquals(1,db.queryForObject("select count(*) from revenue_recognitions r join revenue_schedule_lines l on l.id=r.schedule_line_id join revenue_schedules s on s.id=l.schedule_id where s.workspace_id=? and s.term_id=?",Integer.class,c.workspace(),f.term()));
+        assertEquals("VALIDATED",db.queryForObject("select status from service_contract_terms where id=?",String.class,f.term()));
+    }
+
+    @Test void recognitionBeforeBillingClearsEarnedUnbilledAndConcurrentRunKeysCannotDuplicatePeriod() throws Exception {
+        var f=serviceFixture(false,new BigDecimal("1800.00")); var c=f.actor();
+        setBusinessDate(c,DAY.plusMonths(1));
+        serviceRevenue.recognize(c.workspace(),c.entity(),DAY.plusMonths(1),"REV01-FIRST");
+        long invoice=serviceInvoice(f,DAY.plusMonths(1),BigDecimal.ZERO,new BigDecimal("1800.00"));
+        long journal=((Number)salesInvoices.detail(c.workspace(),c.entity(),invoice).get("journal_id")).longValue();
+        assertEquals(new BigDecimal("-150.00"),accountNet(journal,c,"UNBILLED"));
+        assertEquals(new BigDecimal("-1650.00"),accountNet(journal,c,"DEFERRED"));
+        assertEquals(new BigDecimal("1926.00"),accountNet(journal,c,"AR"));
+        setBusinessDate(c,DAY.plusMonths(2));
+        assertEquals(List.of(200,200),competing(c,
+                ()->serviceRevenue.recognize(c.workspace(),c.entity(),DAY.plusMonths(2),"CONCURRENT-PERIOD-A"),
+                ()->serviceRevenue.recognize(c.workspace(),c.entity(),DAY.plusMonths(2),"CONCURRENT-PERIOD-B")));
+        actor(c.user());
+        assertEquals(new BigDecimal("300.00"),db.queryForObject("""
+                select sum(r.amount) from revenue_recognitions r join revenue_schedule_lines l on l.id=r.schedule_line_id
+                join revenue_schedules s on s.id=l.schedule_id where s.workspace_id=? and s.term_id=?
+                """,BigDecimal.class,c.workspace(),f.term()));
+    }
+
+    @Test void insertingRecognitionBeforePostedFutureCorrectionAddsReclassificationWithoutChangingHistory() {
+        var f=serviceFixture(false,new BigDecimal("1800.00")); var c=f.actor();
+        long invoice=serviceInvoice(f,DAY,BigDecimal.ZERO,new BigDecimal("1800.00"));
+        salesInvoices.reverse(c.workspace(),c.entity(),invoice,DAY.plusMonths(2),"Posted future correction","FUTURE-REV02");
+        long originalCorrection=db.queryForObject("select journal_id from sales_reversals where invoice_id=?",Long.class,invoice);
+        assertEquals(new BigDecimal("1800.00"),accountNet(originalCorrection,c,"DEFERRED"));
+        setBusinessDate(c,DAY.plusMonths(1));
+        serviceRevenue.recognize(c.workspace(),c.entity(),DAY.plusMonths(1),"INSERT-EARLIER-EARNING");
+        assertEquals(new BigDecimal("1800.00"),accountNet(originalCorrection,c,"DEFERRED"));
+        var reclass=db.queryForMap("""
+                select sum(unbilled_delta) as unbilled,sum(deferred_delta) as deferred
+                from service_balance_postings where workspace_id=? and term_id=? and effective_date=? and event_kind='RECLASSIFICATION'
+                """,c.workspace(),f.term(),DAY.plusMonths(2));
+        assertEquals(new BigDecimal("150.00"),reclass.get("unbilled"));
+        assertEquals(new BigDecimal("150.00"),reclass.get("deferred"));
+        assertEquals(new BigDecimal("150.00"),db.queryForObject("select sum(unbilled_delta) from service_balance_postings where workspace_id=? and term_id=?",
+                BigDecimal.class,c.workspace(),f.term()));
+        assertEquals(new BigDecimal("0.00"),db.queryForObject("select sum(deferred_delta) from service_balance_postings where workspace_id=? and term_id=?",
+                BigDecimal.class,c.workspace(),f.term()));
+        assertEquals("VALIDATED",db.queryForObject("select status from service_contract_terms where id=?",String.class,f.term()));
+    }
+
+    @Test void tinyServiceFeeScheduleCannotProduceNegativeResidualOrUnboundedEarning() {
+        var f=serviceFixture(false,new BigDecimal("0.06")); var c=f.actor();
+        var amounts=db.queryForList("""
+                select l.amount from revenue_schedule_lines l join revenue_schedules s on s.id=l.schedule_id
+                where s.workspace_id=? and s.term_id=? order by l.period_no
+                """,BigDecimal.class,c.workspace(),f.term());
+        assertEquals(12,amounts.size());
+        for (int i=0;i<11;i++) assertEquals(new BigDecimal("0.00"),amounts.get(i));
+        assertEquals(new BigDecimal("0.06"),amounts.get(11));
+        assertEquals(new BigDecimal("0.06"),amounts.stream().reduce(BigDecimal.ZERO,BigDecimal::add));
+    }
+
+    @Test void legacyAssetRegistrationStaleOptimisticVersionPreservesFormAndRecoversOnCorrectedPost() throws Exception {
+        var c = context("EUR", "FINANCE", "OPERATIONS");
+        baseline.initialize(c.workspace(), c.entity(), "FULL_OPERATIONS", 1);
+        int auditsBefore = db.queryForObject("select count(*) from audit_events where workspace_id=?", Integer.class, c.workspace());
+        HttpClient client = signedIn(c.login());
+        String newPath = "/w/" + c.workspace() + "/e/" + c.entity() + "/service/assets/new";
+        String registerPath = "/w/" + c.workspace() + "/e/" + c.entity() + "/service/assets/register";
+
+        var page = get(client, newPath);
+        assertEquals(200, page.statusCode());
+        var form = renderedForm(page.body(), "asset-register");
+
+        var customerAccount = db.queryForMap(
+                "select a.id, a.version from customer_entity_accounts a join customers c on c.id=a.customer_id where a.workspace_id=? and a.entity_id=? and c.code='RGA-CUST-001'",
+                c.workspace(), c.entity());
+        String customerRef = customerAccount.get("id") + ":" + customerAccount.get("version");
+
+        var product = db.queryForMap(
+                "select p.id, p.version from products p where p.workspace_id=? and p.sku='RGA-UNIT-TR120'",
+                c.workspace());
+        String productRef = product.get("id") + ":" + product.get("version");
+        long currentSettingVersion = db.queryForObject(
+                "select s.version from product_entity_settings s where s.workspace_id=? and s.entity_id=? and s.product_id=?",
+                Long.class, c.workspace(), c.entity(), product.get("id"));
+        assertEquals(1L, currentSettingVersion);
+
+        var contactLink = db.queryForMap(
+                "select c.id, c.version, l.version link_version from contacts c join customer_contact_links l on l.contact_id=c.id and l.workspace_id=c.workspace_id where c.workspace_id=? and c.code='RGA-CON-001'",
+                c.workspace());
+        String contactRef = contactLink.get("id") + ":" + contactLink.get("version");
+        String linkVersion = contactLink.get("link_version").toString();
+
+        String serial = "SN-UTF8-Ω-" + UUID.randomUUID();
+        String recordKey = "KEY-UTF8-Ω-" + UUID.randomUUID();
+        String evidence = "Commissioning verification \u00e9tanch\u00e9it\u00e9 \u03a9 validated: " + UUID.randomUUID();
+        String date = DAY.toString();
+        String intent = "INTENT-REG-" + UUID.randomUUID();
+
+        form.put("customerRef", customerRef);
+        form.put("productRef", productRef);
+        form.put("settingVersion", "2");
+        form.put("contact", contactRef);
+        form.put("linkVersion", linkVersion);
+        form.put("serial", serial);
+        form.put("key", recordKey);
+        form.put("date", date);
+        form.put("reason", evidence);
+        form.put("intent", intent);
+
+        var conflict = post(client, registerPath, form);
+        assertEquals(409, conflict.statusCode(), "Stale setting version must return 409 on the same form");
+
+        var retained = renderedForm(conflict.body(), "asset-register");
+        assertEquals(customerRef, retained.get("customerRef"));
+        assertEquals(productRef, retained.get("productRef"));
+        assertEquals("2", retained.get("settingVersion"), "Submitted stale settingVersion must be retained intact");
+        assertEquals(contactRef, retained.get("contact"));
+        assertEquals(linkVersion, retained.get("linkVersion"));
+        assertEquals(serial, retained.get("serial"));
+        assertEquals(recordKey, retained.get("key"));
+        assertEquals(date, retained.get("date"));
+        assertEquals(evidence, retained.get("reason"));
+        assertEquals(intent, retained.get("intent"));
+
+        assertLinkedFieldError(conflict.body(), "asset-register-customerRef-0");
+        assertLinkedFieldError(conflict.body(), "asset-register-productRef-0");
+        assertLinkedFieldError(conflict.body(), "asset-register-contact-0");
+        assertInlineFieldError(conflict.body(), "asset-register-settingVersion-0");
+        assertInlineFieldError(conflict.body(), "asset-register-linkVersion-0");
+
+        assertEquals(0, db.queryForObject("select count(*) from installed_instruments where workspace_id=? and (registration_key=? or serial=?)", Integer.class, c.workspace(), intent, serial));
+        assertEquals(0, db.queryForObject("select count(*) from installation_events where workspace_id=? and intent_key=?", Integer.class, c.workspace(), "registration:" + intent));
+        assertEquals(auditsBefore, db.queryForObject("select count(*) from audit_events where workspace_id=?", Integer.class, c.workspace()));
+
+        retained.put("settingVersion", "1");
+        var saved = post(client, registerPath, retained);
+        assertEquals(302, saved.statusCode(), "Corrected form submission must redirect on success");
+        String location = saved.headers().firstValue("Location").orElseThrow();
+        assertTrue(location.contains("/w/" + c.workspace() + "/e/" + c.entity() + "/service/assets/"));
+
+        var persisted = db.queryForMap("select * from installed_instruments where workspace_id=? and registration_key=?", c.workspace(), intent);
+        assertEquals(serial, persisted.get("serial"));
+        assertEquals(recordKey, persisted.get("record_key"));
+        assertEquals(evidence, persisted.get("legacy_evidence"));
+        assertEquals("LEGACY", persisted.get("origin"));
+        long assetId = ((Number) persisted.get("id")).longValue();
+        var event = db.queryForMap("select * from installation_events where workspace_id=? and asset_id=?", c.workspace(), assetId);
+        assertEquals(evidence, event.get("reason"));
+        assertEquals(evidence, event.get("completion_reference"));
+        assertEquals("registration:" + intent, event.get("intent_key"));
+        assertEquals(DAY, ((java.sql.Date)event.get("business_date")).toLocalDate());
+        assertEquals(1, db.queryForObject("select count(*) from asset_operator_links where workspace_id=? and asset_id=?", Integer.class, c.workspace(), assetId));
+
+        var duplicate = post(client, registerPath, retained);
+        assertEquals(302, duplicate.statusCode(), "Replay of exact intent must redirect without extra effects");
+        assertEquals(location, duplicate.headers().firstValue("Location").orElseThrow());
+        assertEquals(1, db.queryForObject("select count(*) from installed_instruments where workspace_id=? and registration_key=?", Integer.class, c.workspace(), intent));
+        assertEquals(1, db.queryForObject("select count(*) from installation_events where workspace_id=? and asset_id=?", Integer.class, c.workspace(), assetId));
+        assertEquals(1, db.queryForObject("select count(*) from asset_operator_links where workspace_id=? and asset_id=?", Integer.class, c.workspace(), assetId));
+
+        var altered = new LinkedHashMap<>(retained);
+        String alteredSerial = "SN-ALTERED-Ω-" + UUID.randomUUID();
+        altered.put("serial", alteredSerial);
+        var alteredConflict = post(client, registerPath, altered);
+        assertEquals(409, alteredConflict.statusCode(), "Altered payload with same intent must return 409 conflict");
+        var alteredRetained = renderedForm(alteredConflict.body(), "asset-register");
+        assertEquals(alteredSerial, alteredRetained.get("serial"), "Altered form redisplay must retain the newly entered serial");
+        assertEquals(intent, alteredRetained.get("intent"));
+        assertInlineFieldError(alteredConflict.body(), "asset-register-intent-0");
+        assertEquals(0, db.queryForObject("select count(*) from installed_instruments where workspace_id=? and serial=?", Integer.class, c.workspace(), alteredSerial));
+
+        var unprivileged = peer(c, "INSIDE_SALES");
+        HttpClient unprivilegedClient = signedIn(unprivileged.login());
+        var unprivValues = new LinkedHashMap<String, String>();
+        unprivValues.put("_csrf", csrf(get(unprivilegedClient, "/workspaces").body()));
+        unprivValues.put("_form", "asset-register");
+        unprivValues.put("customerRef", customerRef);
+        unprivValues.put("productRef", productRef);
+        unprivValues.put("settingVersion", "1");
+        unprivValues.put("contact", contactRef);
+        unprivValues.put("linkVersion", linkVersion);
+        unprivValues.put("serial", "UNPRIV-SN-" + UUID.randomUUID());
+        unprivValues.put("key", "UNPRIV-KEY-" + UUID.randomUUID());
+        unprivValues.put("date", date);
+        unprivValues.put("reason", "Leak probe");
+        unprivValues.put("intent", "UNPRIV-INTENT-" + UUID.randomUUID());
+
+        var unprivResp = post(unprivilegedClient, registerPath, unprivValues);
+        assertEquals(403, unprivResp.statusCode());
+        assertFalse(unprivResp.body().contains("asset-register"), "Forbidden POST must not redisplay form or leak controller state");
+        assertFalse(unprivResp.body().contains("UNPRIV-SN-"));
+        assertFalse(unprivResp.body().contains("UNPRIV-KEY-"));
+
+        var foreign = context("EUR", "FINANCE", "OPERATIONS");
+        baseline.initialize(foreign.workspace(), foreign.entity(), "FULL_OPERATIONS", 1);
+        String foreignPath = "/w/" + foreign.workspace() + "/e/" + foreign.entity() + "/service/assets/register";
+        var foreignValues = new LinkedHashMap<String, String>();
+        foreignValues.put("_csrf", csrf(get(client, "/workspaces").body()));
+        foreignValues.put("_form", "asset-register");
+        foreignValues.put("customerRef", customerRef);
+        foreignValues.put("productRef", productRef);
+        foreignValues.put("settingVersion", "1");
+        foreignValues.put("contact", contactRef);
+        foreignValues.put("linkVersion", linkVersion);
+        foreignValues.put("serial", "FOREIGN-SN-" + UUID.randomUUID());
+        foreignValues.put("key", "FOREIGN-KEY-" + UUID.randomUUID());
+        foreignValues.put("date", date);
+        foreignValues.put("reason", "Foreign scope probe");
+        foreignValues.put("intent", "FOREIGN-INTENT-" + UUID.randomUUID());
+
+        var foreignResp = post(client, foreignPath, foreignValues);
+        assertTrue(List.of(403, 404).contains(foreignResp.statusCode()), "Foreign-scope request must fail closed with 403 or 404");
+        assertFalse(foreignResp.body().contains("asset-register"), "Foreign scope response must not render consumer form");
+        assertFalse(foreignResp.body().contains("FOREIGN-SN-"));
+        assertFalse(foreignResp.body().contains("FOREIGN-KEY-"));
+    }
+
+    private Map<String, String> termStatuses(HttpClient client, long workspaceId, long entityId, long contractId) throws Exception {
+        var resp = get(client, "/w/" + workspaceId + "/e/" + entityId + "/service/contracts/" + contractId);
+        assertEquals(200, resp.statusCode());
+        var matcher = Pattern.compile("<tr>\\s*<td>([^<]+)</td>\\s*<td>[^<]*</td>\\s*<td>[^<]*</td>\\s*<td>[^<]*</td>\\s*<td>([^<]+)</td>", Pattern.CASE_INSENSITIVE).matcher(resp.body());
+        var statuses = new LinkedHashMap<String, String>();
+        while (matcher.find()) {
+            statuses.put(matcher.group(1).trim(), matcher.group(2).trim());
+        }
+        return statuses;
+    }
+
+    @Test void renewalScanBooksAdjacentSuccessorScheduledThenActiveOnClockAndPreventsPrematureActivationOrOverlap() throws Exception {
+        var c = context("EUR", "FINANCE", "INSIDE_SALES", "SALES_MANAGER");
+        baseline.initialize(c.workspace(), c.entity(), "FULL_OPERATIONS", 1);
+
+        long predecessorTermId = db.queryForObject("select id from service_contract_terms where workspace_id=? and source_kind='OPENING'", Long.class, c.workspace());
+        var predTerm = db.queryForMap("select record_key, coverage_start, coverage_end, asset_id from service_contract_terms where id=?", predecessorTermId);
+        String predTermKey = (String) predTerm.get("record_key");
+        long assetId = ((Number)predTerm.get("asset_id")).longValue();
+        assertEquals(LocalDate.of(2026, 4, 15), ((java.sql.Date)predTerm.get("coverage_start")).toLocalDate());
+        assertEquals(LocalDate.of(2027, 4, 15), ((java.sql.Date)predTerm.get("coverage_end")).toLocalDate());
+        long customerAccount = db.queryForObject("select a.id from customer_entity_accounts a join customers p on p.id=a.customer_id where a.workspace_id=? and p.code='RGA-CUST-001'", Long.class, c.workspace());
+
+        long ownerVersion = db.queryForObject("select security_version from app_users where id=?", Long.class, c.user());
+        long wsVersion = db.queryForObject("select version from scenario_workspaces where id=?", Long.class, c.workspace());
+        var scanResult = serviceRenewals.scan(c.workspace(), c.entity(), wsVersion, c.user(), ownerVersion);
+        assertEquals(1, scanResult.created().size());
+        long renewalIntentId = scanResult.created().get(0);
+        var intentRow = db.queryForMap("select * from renewal_intents where id=?", renewalIntentId);
+        assertEquals("OPEN", intentRow.get("status"));
+        assertEquals(LocalDate.of(2027, 4, 15), ((java.sql.Date)intentRow.get("target_start")).toLocalDate());
+        long oppId = ((Number)intentRow.get("opportunity_id")).longValue();
+        long intentVersion = ((Number)intentRow.get("version")).longValue();
+        long contractId = ((Number)intentRow.get("contract_id")).longValue();
+
+        long oppVersion = db.queryForObject("select version from crm_opportunities where id=?", Long.class, oppId);
+        var handoverRequest = crmOpportunities.changeStage(c.workspace(), c.entity(), oppId, oppVersion, "WON", "Customer agreed to renew", "HANDOVER-REQ-" + UUID.randomUUID());
+        assertNotNull(handoverRequest);
+        assertEquals("BLOCKED", handoverRequest.status(), "Won opportunity must not book itself; handover request stays BLOCKED without accepted quote");
+        assertEquals(0, db.queryForObject("select count(*) from sales_orders where workspace_id=?", Integer.class, c.workspace()), "Won opportunity must never create an order itself");
+        assertEquals(1, db.queryForObject("select count(*) from service_contract_terms where workspace_id=?", Integer.class, c.workspace()), "No new contract term can be created simply by winning an opportunity");
+
+        long planProduct = fixtureId(c, "products", "sku", "RGA-SVC-BASE12");
+        long deviceProduct = fixtureId(c, "products", "sku", "RGA-UNIT-TR120");
+        long book = priceBooks.save(c.workspace(), c.entity(), null, null, "PB-RENEWAL-" + UUID.randomUUID(), "Renewal approved price book", "EUR", DAY, null);
+        priceBooks.line(c.workspace(), c.entity(), book, 1, planProduct, 1, null, new BigDecimal("1800.00"));
+        var checker = peer(c, "SALES_MANAGER");
+        actor(checker.user());
+        priceBooks.approve(c.workspace(), c.entity(), book, 2);
+        actor(c.user());
+
+        var p = products.get(c.workspace(), c.entity(), planProduct);
+        var unit = configuration.get(c.workspace(), c.entity(), ConfigurationService.Kind.UOM, p.uomId());
+        long tax = db.queryForObject("select v.id from tax_versions v join tax_codes t on t.workspace_id=v.workspace_id and t.entity_id=v.entity_id and t.id=v.tax_code_id where t.workspace_id=? and t.code='SIM-VAT7'", Long.class, c.workspace());
+        long profile = db.queryForObject("select id from service_product_versions where workspace_id=? and entity_id=? and product_id=?", Long.class, c.workspace(), c.entity(), planProduct);
+        long matrix = db.queryForObject("select id from product_compatibilities where workspace_id=? and entity_id=? and device_id=? and component_id=?", Long.class, c.workspace(), c.entity(), deviceProduct, planProduct);
+
+        var target = new dev.labtrial.salestools.service.ServiceObligationService.TargetInput(
+                1, profile, matrix, 1,
+                assetId, 1L, null, null,
+                "RENEWAL", null, null,
+                renewalIntentId, intentVersion
+        );
+        var lineInput = new dev.labtrial.salestools.order.QuoteService.LineInput(
+                "PLAN", planProduct, 1, 1, unit.version(), book, 3, 1,
+                BigDecimal.ONE, null, null, null, tax, 1, List.of(target)
+        );
+        long quote = salesQuotes.save(c.workspace(), c.entity(), null, null, new dev.labtrial.salestools.order.QuoteService.Draft(
+                "LOCAL_CRM", customerAccount, 1, oppId, DAY, DAY.plusDays(30), 1, null, null, 1L, List.of(lineInput)));
+        salesQuotes.submit(c.workspace(), c.entity(), quote, 1);
+        salesQuotes.accept(c.workspace(), c.entity(), quote, 2, DAY, "ACCEPT-RENEWAL-PO");
+        var q = salesQuotes.quote(c.workspace(), c.entity(), quote);
+        long order = salesHandover.execute(c.workspace(), c.entity(), quote,
+                ((Number)q.get("revision_id")).longValue(), ((Number)q.get("version")).longValue(), "HANDOVER-EXEC-" + UUID.randomUUID()).orderId();
+
+        var successor = db.queryForMap("select * from service_contract_terms where workspace_id=? and renewal_intent_id=?", c.workspace(), renewalIntentId);
+        long successorTermId = ((Number)successor.get("id")).longValue();
+        String succTermKey = (String) successor.get("record_key");
+        assertEquals(predecessorTermId, ((Number)successor.get("predecessor_term_id")).longValue());
+        assertEquals(LocalDate.of(2027, 4, 15), ((java.sql.Date)successor.get("coverage_start")).toLocalDate());
+        assertEquals(LocalDate.of(2028, 4, 15), ((java.sql.Date)successor.get("coverage_end")).toLocalDate());
+        assertEquals("VALIDATED", successor.get("status"));
+        assertEquals("CONVERTED", db.queryForObject("select status from renewal_intents where id=?", String.class, renewalIntentId));
+
+        HttpClient client = signedIn(c.login());
+
+        var statusesBefore = termStatuses(client, c.workspace(), c.entity(), contractId);
+        assertEquals("ACTIVE", statusesBefore.get(predTermKey), "Predecessor term must be ACTIVE before its end date");
+        assertEquals("SCHEDULED", statusesBefore.get(succTermKey), "Successor term must be SCHEDULED before its start date");
+
+        setBusinessDate(c, LocalDate.of(2027, 4, 15));
+
+        var statusesAfter = termStatuses(client, c.workspace(), c.entity(), contractId);
+        assertEquals("EXPIRED", statusesAfter.get(predTermKey), "Predecessor term must be EXPIRED once business clock reaches coverage end");
+        assertEquals("ACTIVE", statusesAfter.get(succTermKey), "Successor term must transition to ACTIVE once business clock reaches coverage start");
+
+        var opening = db.queryForMap("select net_fee, billed, earned from service_opening_balances where workspace_id=?", c.workspace());
+        assertEquals(new BigDecimal("1800.00"), opening.get("net_fee"));
+        assertEquals(new BigDecimal("1800.00"), opening.get("billed"));
+        assertEquals(new BigDecimal("1350.00"), opening.get("earned"));
+        assertEquals(9, db.queryForObject("select count(*) from service_opening_periods where workspace_id=?", Integer.class, c.workspace()));
+        assertEquals(0, db.queryForObject("select count(*) from shipments where workspace_id=? and order_id=?", Integer.class, c.workspace(), order));
+        assertEquals(new BigDecimal("13100.00"), db.queryForObject("select sum(value) from inventory_valuation_pools where workspace_id=?", BigDecimal.class, c.workspace()));
+        assertEquals("IN_STOCK", db.queryForObject("select status from instrument_serials where workspace_id=? and serial='SIM-RGA-TR120-00002'", String.class, c.workspace()));
+
+        setBusinessDate(c, DAY);
+
+        var successorFixture = new ServiceFixture(c, checker, order, assetId, successorTermId, customerAccount, 0);
+        long invoice = serviceInvoice(successorFixture, DAY, BigDecimal.ZERO, new BigDecimal("1800.00"));
+
+        var statusesPrebill = termStatuses(client, c.workspace(), c.entity(), contractId);
+        assertEquals("SCHEDULED", statusesPrebill.get(succTermKey), "Prebilling a renewal term while scheduled must not activate coverage prematurely");
+
+        salesInvoices.reverse(c.workspace(), c.entity(), invoice, DAY, "Prebill reversal", "REV-PREBILL-" + UUID.randomUUID());
+
+        var statusesReversal = termStatuses(client, c.workspace(), c.entity(), contractId);
+        assertEquals("SCHEDULED", statusesReversal.get(succTermKey), "Reversing prebill must leave coverage in SCHEDULED status");
+
+        long convertedVersion = db.queryForObject("select version from renewal_intents where id=?", Long.class, renewalIntentId);
+        String quoteRoot = "/w/" + c.workspace() + "/e/" + c.entity() + "/sales/quotes";
+        var reusedForm = renderedForm(get(client, quoteRoot + "/new").body(), "quote-save");
+        reusedForm.put("origin", "LOCAL_CRM");
+        reusedForm.put("customerRef", customerAccount + ":1");
+        reusedForm.put("opportunityId", Long.toString(oppId));
+        reusedForm.put("businessDate", DAY.toString());
+        reusedForm.put("validUntil", DAY.plusDays(30).toString());
+        reusedForm.put("configVersion", "1");
+        reusedForm.put("serviceConfigVersion", "1");
+        reusedForm.put("lineKey", "REUSED-RENEWAL");
+        reusedForm.put("productRef", planProduct + ":1:1:" + unit.version());
+        reusedForm.put("bookRef", book + ":3:1:" + planProduct);
+        reusedForm.put("quantity", "1");
+        reusedForm.put("taxRef", tax + ":1");
+        reusedForm.put("targetLineKey", "REUSED-RENEWAL");
+        reusedForm.put("targetUnit", "1");
+        reusedForm.put("targetProfile", Long.toString(profile));
+        reusedForm.put("targetMatrix", matrix + ":1");
+        reusedForm.put("targetAsset", assetId + ":1");
+        reusedForm.put("targetBasis", "RENEWAL");
+        reusedForm.put("targetRenewal", renewalIntentId + ":" + convertedVersion);
+        int quoteCount = db.queryForObject("select count(*) from quotes where workspace_id=?", Integer.class, c.workspace());
+        var rejectedReuse = post(client, quoteRoot + "/save", reusedForm);
+        assertEquals(409, rejectedReuse.statusCode());
+        assertEquals(reusedForm.get("targetRenewal"), renderedControlValue(rejectedReuse.body(), "quote-save-targetRenewal-0"));
+        assertEquals("REUSED-RENEWAL", renderedControlValue(rejectedReuse.body(), "quote-save-lineKey-0"));
+        assertEquals(quoteCount, db.queryForObject("select count(*) from quotes where workspace_id=?", Integer.class, c.workspace()));
+        assertEquals(successorTermId, db.queryForObject("select accepted_term_id from renewal_intents where id=?", Long.class, renewalIntentId));
+
+        var overlapTarget = new dev.labtrial.salestools.service.ServiceObligationService.TargetInput(
+                1, profile, matrix, 1,
+                assetId, 1L, null, null,
+                "EXPLICIT", LocalDate.of(2027, 6, 1), LocalDate.of(2027, 12, 1),
+                null, null
+        );
+        var overlapLine = new dev.labtrial.salestools.order.QuoteService.LineInput(
+                "PLAN", planProduct, 1, 1, unit.version(), book, 3, 1,
+                BigDecimal.ONE, null, null, null, tax, 1, List.of(overlapTarget)
+        );
+        long overlapQuote = salesQuotes.save(c.workspace(), c.entity(), null, null, new dev.labtrial.salestools.order.QuoteService.Draft(
+                "DIRECT_ERP", customerAccount, 1, null, DAY, DAY.plusDays(30), 1, null, null, 1L, List.of(overlapLine)));
+        salesQuotes.submit(c.workspace(), c.entity(), overlapQuote, 1);
+        salesQuotes.accept(c.workspace(), c.entity(), overlapQuote, 2, DAY, "ACCEPT-OVERLAP-PO");
+        var overlapQ = salesQuotes.quote(c.workspace(), c.entity(), overlapQuote);
+        denied(409, () -> salesHandover.execute(c.workspace(), c.entity(), overlapQuote,
+                ((Number)overlapQ.get("revision_id")).longValue(), ((Number)overlapQ.get("version")).longValue(), "OVERLAP-HANDOVER-" + UUID.randomUUID()));
+    }
+
+    @Test void monthEndLeapAndNonstandardScheduleBoundariesFollowOriginalStartWithoutRoundingDrift() {
+        LocalDate jan31 = LocalDate.of(2027, 1, 31);
+        LocalDate apr30 = LocalDate.of(2027, 4, 30);
+        var fJan = serviceFixture(false, new BigDecimal("300.00"), jan31, apr30);
+        var periodsJan = db.queryForList("""
+                select l.period_no, l.period_start, l.period_end, l.amount
+                from revenue_schedule_lines l join revenue_schedules s on s.id=l.schedule_id
+                where s.workspace_id=? and s.term_id=? order by l.period_no
+                """, fJan.actor().workspace(), fJan.term());
+        assertEquals(3, periodsJan.size());
+        assertEquals(LocalDate.of(2027, 1, 31), ((java.sql.Date)periodsJan.get(0).get("period_start")).toLocalDate());
+        assertEquals(LocalDate.of(2027, 2, 28), ((java.sql.Date)periodsJan.get(0).get("period_end")).toLocalDate());
+        assertEquals(LocalDate.of(2027, 2, 28), ((java.sql.Date)periodsJan.get(1).get("period_start")).toLocalDate());
+        assertEquals(LocalDate.of(2027, 3, 31), ((java.sql.Date)periodsJan.get(1).get("period_end")).toLocalDate());
+        assertEquals(LocalDate.of(2027, 3, 31), ((java.sql.Date)periodsJan.get(2).get("period_start")).toLocalDate());
+        assertEquals(LocalDate.of(2027, 4, 30), ((java.sql.Date)periodsJan.get(2).get("period_end")).toLocalDate());
+        for (var p : periodsJan) assertEquals(new BigDecimal("100.00"), p.get("amount"));
+        assertEquals(new BigDecimal("300.00"), periodsJan.stream().map(p -> (BigDecimal)p.get("amount")).reduce(BigDecimal.ZERO, BigDecimal::add));
+
+        LocalDate leapJan31 = LocalDate.of(2028, 1, 31);
+        LocalDate leapApr30 = LocalDate.of(2028, 4, 30);
+        var fLeap = serviceFixture(false, new BigDecimal("300.00"), leapJan31, leapApr30);
+        var periodsLeap = db.queryForList("""
+                select l.period_no, l.period_start, l.period_end, l.amount
+                from revenue_schedule_lines l join revenue_schedules s on s.id=l.schedule_id
+                where s.workspace_id=? and s.term_id=? order by l.period_no
+                """, fLeap.actor().workspace(), fLeap.term());
+        assertEquals(3, periodsLeap.size());
+        assertEquals(LocalDate.of(2028, 1, 31), ((java.sql.Date)periodsLeap.get(0).get("period_start")).toLocalDate());
+        assertEquals(LocalDate.of(2028, 2, 29), ((java.sql.Date)periodsLeap.get(0).get("period_end")).toLocalDate(), "Leap year February boundary must clamp to Feb 29");
+        assertEquals(LocalDate.of(2028, 2, 29), ((java.sql.Date)periodsLeap.get(1).get("period_start")).toLocalDate());
+        assertEquals(LocalDate.of(2028, 3, 31), ((java.sql.Date)periodsLeap.get(1).get("period_end")).toLocalDate());
+        assertEquals(LocalDate.of(2028, 3, 31), ((java.sql.Date)periodsLeap.get(2).get("period_start")).toLocalDate());
+        assertEquals(LocalDate.of(2028, 4, 30), ((java.sql.Date)periodsLeap.get(2).get("period_end")).toLocalDate());
+        for (var p : periodsLeap) assertEquals(new BigDecimal("100.00"), p.get("amount"));
+        assertEquals(new BigDecimal("300.00"), periodsLeap.stream().map(p -> (BigDecimal)p.get("amount")).reduce(BigDecimal.ZERO, BigDecimal::add));
+
+        LocalDate start = LocalDate.of(2027, 1, 31);
+        LocalDate nonstandardEnd = LocalDate.of(2027, 3, 15);
+        var fClamp = serviceFixture(false, new BigDecimal("100.01"), start, nonstandardEnd);
+        var periodsClamp = db.queryForList("""
+                select l.period_no, l.period_start, l.period_end, l.amount
+                from revenue_schedule_lines l join revenue_schedules s on s.id=l.schedule_id
+                where s.workspace_id=? and s.term_id=? order by l.period_no
+                """, fClamp.actor().workspace(), fClamp.term());
+        assertEquals(2, periodsClamp.size());
+        assertEquals(LocalDate.of(2027, 1, 31), ((java.sql.Date)periodsClamp.get(0).get("period_start")).toLocalDate());
+        assertEquals(LocalDate.of(2027, 2, 28), ((java.sql.Date)periodsClamp.get(0).get("period_end")).toLocalDate());
+        assertEquals(LocalDate.of(2027, 2, 28), ((java.sql.Date)periodsClamp.get(1).get("period_start")).toLocalDate());
+        assertEquals(LocalDate.of(2027, 3, 15), ((java.sql.Date)periodsClamp.get(1).get("period_end")).toLocalDate(), "Final boundary must clamp to nonstandard coverage end");
+        assertEquals(new BigDecimal("50.01"), periodsClamp.get(0).get("amount"));
+        assertEquals(new BigDecimal("50.00"), periodsClamp.get(1).get("amount"));
+        assertEquals(new BigDecimal("100.01"), periodsClamp.stream().map(p -> (BigDecimal)p.get("amount")).reduce(BigDecimal.ZERO, BigDecimal::add));
+    }
+
+    @Test void zeroFeeScheduleGeneratesZeroLinesAndDoesNotPostZeroJournal() {
+        var fZero = serviceFixture(false, BigDecimal.ZERO.setScale(2));
+        var periodsZero = db.queryForList("""
+                select l.period_no, l.amount
+                from revenue_schedule_lines l join revenue_schedules s on s.id=l.schedule_id
+                where s.workspace_id=? and s.term_id=? order by l.period_no
+                """, fZero.actor().workspace(), fZero.term());
+        assertEquals(12, periodsZero.size());
+        for (var p : periodsZero) assertEquals(new BigDecimal("0.00"), p.get("amount"));
+        assertEquals(new BigDecimal("0.00"), periodsZero.stream().map(p -> (BigDecimal)p.get("amount")).reduce(BigDecimal.ZERO, BigDecimal::add));
+
+        setBusinessDate(fZero.actor(), DAY.plusMonths(1));
+        serviceRevenue.recognize(fZero.actor().workspace(), fZero.actor().entity(), DAY.plusMonths(1), "REC-ZERO-01");
+
+        var recRow = db.queryForMap("""
+                select r.amount, r.journal_id from revenue_recognitions r join revenue_schedule_lines l on l.id=r.schedule_line_id
+                where l.workspace_id=? and l.schedule_id=(select id from revenue_schedules where term_id=?)
+                """, fZero.actor().workspace(), fZero.term());
+        assertEquals(new BigDecimal("0.00"), recRow.get("amount"));
+        assertNull(recRow.get("journal_id"), "Zero-amount recognition journal_id must be null");
+        assertEquals(0, db.queryForObject("select count(*) from journal_lines where workspace_id=? and debit=0 and credit=0", Integer.class, fZero.actor().workspace()));
+    }
+
+    @Test void concurrentServiceInvoicePostingAndRevenueRecognitionPreserveSourceTimelineBalances() throws Exception {
+        var f = serviceFixture(false, new BigDecimal("1800.00"));
+        var c = f.actor();
+        setBusinessDate(c, DAY.plusMonths(1));
+
+        long invoice = salesInvoices.save(c.workspace(), c.entity(), null, 0,
+                new dev.labtrial.salestools.finance.SalesInvoiceService.Draft("CONCURRENT-INV-" + UUID.randomUUID(), DAY.plusMonths(1),
+                        List.of(new dev.labtrial.salestools.finance.SalesInvoiceService.Line("TERM",
+                                dev.labtrial.salestools.finance.SalesInvoiceService.SourceType.SERVICE_TERM, f.term(), BigDecimal.ZERO, new BigDecimal("1800.00")))));
+
+        assertEquals(List.of(200, 200), competing(c,
+                () -> salesInvoices.post(c.workspace(), c.entity(), invoice, 1),
+                () -> serviceRevenue.recognize(c.workspace(), c.entity(), DAY.plusMonths(1), "CONCURRENT-REC-" + UUID.randomUUID())));
+
+        actor(c.user());
+        assertEquals(1, db.queryForObject("select count(*) from sales_invoices where workspace_id=? and id=? and status='POSTED'", Integer.class, c.workspace(), invoice));
+        assertEquals(1, db.queryForObject("""
+                select count(*) from revenue_recognitions r join revenue_schedule_lines l on l.id=r.schedule_line_id
+                join revenue_schedules s on s.id=l.schedule_id where s.workspace_id=? and s.term_id=?
+                """, Integer.class, c.workspace(), f.term()));
+
+        long invoiceJournal = ((Number)salesInvoices.detail(c.workspace(), c.entity(), invoice).get("journal_id")).longValue();
+
+        long recJournal = db.queryForObject("""
+                select r.journal_id from revenue_recognitions r join revenue_schedule_lines l on l.id=r.schedule_line_id
+                where l.workspace_id=? and l.schedule_id=(select id from revenue_schedules where term_id=?) and r.journal_id is not null
+                """, Long.class, c.workspace(), f.term());
+
+        assertEquals(new BigDecimal("1926.00"), accountNet(invoiceJournal, c, "AR").add(accountNet(recJournal, c, "AR")));
+        assertEquals(new BigDecimal("-126.00"), accountNet(invoiceJournal, c, "TAX_OUTPUT").add(accountNet(recJournal, c, "TAX_OUTPUT")));
+        assertEquals(new BigDecimal("-150.00"), accountNet(invoiceJournal, c, "SERVICE_REVENUE").add(accountNet(recJournal, c, "SERVICE_REVENUE")));
+        assertEquals(new BigDecimal("-1650.00"), accountNet(invoiceJournal, c, "DEFERRED").add(accountNet(recJournal, c, "DEFERRED")));
+        assertEquals(0, accountNet(invoiceJournal, c, "UNBILLED").add(accountNet(recJournal, c, "UNBILLED")).signum());
+
+        assertEquals(new BigDecimal("0.00"), db.queryForObject(
+                "select coalesce(sum(unbilled_delta),0) from service_balance_postings where workspace_id=? and term_id=?",
+                BigDecimal.class, c.workspace(), f.term()));
+        assertEquals(new BigDecimal("1650.00"), db.queryForObject(
+                "select coalesce(sum(deferred_delta),0) from service_balance_postings where workspace_id=? and term_id=?",
+                BigDecimal.class, c.workspace(), f.term()));
+        assertEquals("VALIDATED", db.queryForObject("select status from service_contract_terms where id=?", String.class, f.term()));
+    }
+
+    @Test void draftInvoiceCanReplaceCancelledServiceSourceWithoutRevalidatingInactiveHistory() {
+        var f=serviceFixture(false,new BigDecimal("1800.00"),DAY.plusDays(1),DAY.plusYears(1).plusDays(1)); var c=f.actor();
+        var oldLine=new dev.labtrial.salestools.finance.SalesInvoiceService.Line("OLD",
+                dev.labtrial.salestools.finance.SalesInvoiceService.SourceType.SERVICE_TERM,f.term(),BigDecimal.ZERO,new BigDecimal("100.00"));
+        String reference="DRAFT-REPLACE-"+UUID.randomUUID();
+        long invoice=salesInvoices.save(c.workspace(),c.entity(),null,0,
+                new dev.labtrial.salestools.finance.SalesInvoiceService.Draft(reference,DAY,List.of(oldLine)));
+        var orderLine=db.queryForMap("select id,version from sales_order_lines where order_id=?",f.order());
+        fulfillment.cancel(c.workspace(),c.entity(),f.order(),
+                db.queryForObject("select version from sales_orders where id=?",Long.class,f.order()),
+                ((Number)orderLine.get("id")).longValue(),((Number)orderLine.get("version")).longValue(),
+                BigDecimal.ONE,"Unbilled service no longer required","CANCEL-DRAFT-SOURCE");
+        assertEquals("CANCELLED",db.queryForObject("select status from service_contract_terms where id=?",String.class,f.term()));
+        long replacement=db.queryForObject("select id from service_contract_terms where workspace_id=? and record_key='RGA-TERM-001'",Long.class,c.workspace());
+        var newLine=new dev.labtrial.salestools.finance.SalesInvoiceService.Line("NEW",
+                dev.labtrial.salestools.finance.SalesInvoiceService.SourceType.SERVICE_TERM,replacement,BigDecimal.ZERO,new BigDecimal("100.00"));
+        salesInvoices.save(c.workspace(),c.entity(),invoice,1,
+                new dev.labtrial.salestools.finance.SalesInvoiceService.Draft(reference,DAY,List.of(newLine)));
+        assertEquals(replacement,((Number)salesInvoices.lines(c.workspace(),c.entity(),invoice).getFirst().get("service_term_id")).longValue());
+        assertEquals(1,db.queryForObject("select count(*) from sales_invoice_lines where invoice_id=? and service_term_id=? and not active",Integer.class,invoice,f.term()));
+        denied(404,()->salesInvoices.save(c.workspace(),c.entity(),invoice,2,
+                new dev.labtrial.salestools.finance.SalesInvoiceService.Draft(reference,DAY,List.of(oldLine))));
+        assertEquals(replacement,((Number)salesInvoices.lines(c.workspace(),c.entity(),invoice).getFirst().get("service_term_id")).longValue());
+        assertEquals("DRAFT",salesInvoices.detail(c.workspace(),c.entity(),invoice).get("status"));
+        assertEquals(0,db.queryForObject("select count(*) from service_balance_postings where term_id=? and event_kind='INVOICE'",Integer.class,f.term()));
+    }
+
+    @Test void staleOperatorContactAndRemovedOwnerLinkRetainTokensUntilExplicitRecovery() throws Exception {
+        var f=serviceFixture(false,new BigDecimal("1800.00")); var c=f.actor();
+        long owner=db.queryForObject("select customer_id from customer_entity_accounts where id=?",Long.class,f.customer());
+        long other=customers.save(c.workspace(),c.entity(),null,null,
+                new CustomerService.Input("OTHER-OWNER","Different operator owner","","","",null,null));
+        customerAccounts.assign(c.workspace(),c.entity(),other,1,"OTHER-OWNER-ERP");
+        var client=signedIn(c.login());
+        String path="/w/"+c.workspace()+"/e/"+c.entity()+"/service/assets/"+f.asset()+"/operators";
+        for (boolean changeContact:List.of(true,false)) {
+            String code="OP-"+UUID.randomUUID();
+            long contact=contacts.save(c.workspace(),c.entity(),null,null,code,"Synthetic","Operator","","LEAD");
+            contacts.link(c.workspace(),c.entity(),owner,1,contact,1,null,"Operator",true);
+            var form=renderedForm(get(client,path).body(),"asset-operator");
+            form.put("contact",contact+":1"); form.put("linkVersion","1");
+            long count=db.queryForObject("select count(*) from asset_operator_links where asset_id=?",Long.class,f.asset());
+            if(changeContact) contacts.save(c.workspace(),c.entity(),contact,1L,code,"Changed","Operator","","LEAD");
+            else {
+                contacts.link(c.workspace(),c.entity(),other,1,contact,1,null,"Other owner",true);
+                contacts.link(c.workspace(),c.entity(),owner,1,contact,1,1L,"Operator",false);
+            }
+            var conflict=post(client,path,form);
+            assertEquals(409,conflict.statusCode());
+            var retained=renderedForm(conflict.body(),"asset-operator");
+            assertEquals(contact+":1",retained.get("contact"));
+            assertEquals("1",retained.get("linkVersion"));
+            assertEquals(form.get("version"),retained.get("version"));
+            assertEquals(409,post(client,path,retained).statusCode());
+            assertEquals(count,db.queryForObject("select count(*) from asset_operator_links where asset_id=?",Long.class,f.asset()));
+            if(changeContact) retained.put("contact",contact+":2");
+            else {
+                contacts.link(c.workspace(),c.entity(),owner,1,contact,1,2L,"Operator",true);
+                retained.put("linkVersion","3");
+            }
+            assertEquals(302,post(client,path,retained).statusCode());
+            assertEquals(1,db.queryForObject("select count(*) from asset_operator_links where asset_id=? and contact_id=?",Integer.class,f.asset(),contact));
+        }
+    }
+
+    @Test void onboardingPrebillDefersUntilExplicitCompletionAndCompletionReleasesDeferred() {
+        var f=serviceFixture(true,new BigDecimal("1800.00"),DAY,DAY.plusYears(1),false); var c=f.actor();
+        assertEquals(0,f.term());
+        assertEquals("READY",db.queryForObject("select status from sales_service_obligations where id=?",String.class,f.onboarding()));
+        long invoice=salesInvoices.save(c.workspace(),c.entity(),null,0,
+                new dev.labtrial.salestools.finance.SalesInvoiceService.Draft("PRECOMPLETION-"+UUID.randomUUID(),DAY,List.of(
+                new dev.labtrial.salestools.finance.SalesInvoiceService.Line("ONBOARDING",
+                dev.labtrial.salestools.finance.SalesInvoiceService.SourceType.SERVICE_OBLIGATION,f.onboarding(),BigDecimal.ZERO,new BigDecimal("1200.00")))));
+        salesInvoices.post(c.workspace(),c.entity(),invoice,1);
+        long prebill=((Number)salesInvoices.detail(c.workspace(),c.entity(),invoice).get("journal_id")).longValue();
+        assertEquals(new BigDecimal("-1200.00"),accountNet(prebill,c,"DEFERRED"));
+        assertEquals(0,accountNet(prebill,c,"IMPLEMENTATION_REVENUE").signum());
+        assertEquals(0,db.queryForObject("select count(*) from installation_events where asset_id=?",Integer.class,f.asset()));
+        serviceAssets.complete(c.workspace(),c.entity(),f.asset(),
+                db.queryForObject("select version from installed_instruments where id=?",Long.class,f.asset()),
+                f.onboarding(),DAY,DAY,"PREBILLED-COMPLETION","Actual synthetic completion after prebilling","PREBILLED-COMPLETE");
+        long journal=db.queryForObject("select journal_id from service_balance_postings where obligation_id=? and event_kind='COMPLETION'",Long.class,f.onboarding());
+        assertEquals(new BigDecimal("1200.00"),accountNet(journal,c,"DEFERRED"));
+        assertEquals(new BigDecimal("-1200.00"),accountNet(journal,c,"IMPLEMENTATION_REVENUE"));
+        assertEquals(0,accountNet(journal,c,"UNBILLED").signum());
+        assertEquals("COMPLETED",db.queryForObject("select status from sales_service_obligations where id=?",String.class,f.onboarding()));
+        assertEquals(1,db.queryForObject("select count(*) from installation_events where asset_id=?",Integer.class,f.asset()));
+    }
+
+    @Test void fullRenderedQuoteCreateAndEditPreserveServiceTargetsWithinFiniteRequestBound() throws Exception {
+        var f = serviceFixture(false, new BigDecimal("1800.00"));
+        var c = f.actor();
+        var client = signedIn(c.login());
+        String root = "/w/" + c.workspace() + "/e/" + c.entity() + "/sales/quotes";
+        long originalQuote = db.queryForObject("select quote_id from sales_orders where id=?", Long.class, f.order());
+        var source = salesQuotes.lines(c.workspace(), c.entity(), originalQuote).getFirst();
+        var target = salesQuotes.targets(c.workspace(), c.entity(), originalQuote).getFirst();
+        var form = renderedFormValues(get(client, root + "/new").body(), "quote-save");
+        form.put("customerRef", new ArrayList<>(List.of(f.customer() + ":1")));
+        form.put("businessDate", new ArrayList<>(List.of(DAY.toString())));
+        form.put("validUntil", new ArrayList<>(List.of(DAY.plusDays(30).toString())));
+        form.get("lineKey").set(0, "FULL-FORM-PLAN");
+        form.get("productRef").set(0, source.get("product_id") + ":" + source.get("product_version") + ":" + source.get("product_setting_version") + ":" + source.get("uom_version"));
+        form.get("bookRef").set(0, source.get("price_book_id") + ":" + source.get("price_book_version") + ":" + source.get("price_book_line_version") + ":" + source.get("product_id"));
+        form.get("quantity").set(0, "1");
+        form.get("taxRef").set(0, source.get("tax_version_id") + ":" + source.get("tax_version_version"));
+        form.get("targetLineKey").set(0, "FULL-FORM-PLAN");
+        form.get("targetUnit").set(0, "1");
+        form.get("targetProfile").set(0, target.get("service_product_version_id").toString());
+        form.get("targetMatrix").set(0, target.get("compatibility_id") + ":" + target.get("compatibility_version"));
+        form.get("targetAsset").set(0, f.asset() + ":1");
+        form.get("targetBasis").set(0, "EXPLICIT");
+        form.get("targetStart").set(0, DAY.plusYears(1).toString());
+        form.get("targetEnd").set(0, DAY.plusYears(2).toString());
+        for (int attempt = 0; attempt < 2; attempt++) {
+            String body = form.entrySet().stream().flatMap(entry -> entry.getValue().stream()
+                    .map(value -> encode(entry.getKey()) + "=" + encode(value))).collect(java.util.stream.Collectors.joining("&"));
+            var response = client.send(HttpRequest.newBuilder(uri(root + "/save"))
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .POST(HttpRequest.BodyPublishers.ofString(body)).build(), HttpResponse.BodyHandlers.ofString());
+            assertEquals(302, response.statusCode());
+            String location = response.headers().firstValue("Location").orElseThrow();
+            long quote = Long.parseLong(location.substring(location.lastIndexOf('/') + 1));
+            var savedLine = salesQuotes.lines(c.workspace(), c.entity(), quote).getFirst();
+            assertEquals("FULL-FORM-PLAN", savedLine.get("line_key"));
+            assertEquals(new BigDecimal("1800.00"), savedLine.get("net"));
+            var savedTarget = salesQuotes.targets(c.workspace(), c.entity(), quote).getFirst();
+            assertEquals(f.asset(), ((Number)savedTarget.get("target_asset_id")).longValue());
+            assertEquals(DAY.plusYears(2), ((java.sql.Date)savedTarget.get("coverage_end")).toLocalDate());
+            if (attempt == 0) form = renderedFormValues(get(client, root + "/" + quote + "/edit").body(), "quote-save");
+        }
     }
 
     private void sqlDenied(Connection connection, String statement) throws Exception {

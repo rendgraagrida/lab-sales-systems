@@ -113,7 +113,7 @@ public class CustomerReceiptService {
     }
     @Transactional
     public boolean post(long w,long e,long id,long version) {
-        var scope=access.requireContext(w,e,true,"FINANCE"); var p=row(w,e,id); String intent=hash(id+":"+version);
+        var scope=access.requireContext(w,e,true,"FINANCE"); lockEntity(w,e); var p=row(w,e,id); String intent=hash(id+":"+version);
         if("POSTED".equals(p.get("status"))) { if(intent.equals(p.get("posting_hash"))) return true; throw new DomainException(409,"Receipt already posted with different intent"); }
         if(n(p.get("version"))!=version) throw new DomainException(409,"Receipt changed");
         var accounts=config.require(scope);
@@ -148,7 +148,7 @@ public class CustomerReceiptService {
     }
     @Transactional
     public void reverse(long w,long e,long id,LocalDate when,String reason,String reversalKey) {
-        var scope=access.requireContext(w,e,true,"FINANCE"); var p=row(w,e,id);
+        var scope=access.requireContext(w,e,true,"FINANCE"); lockEntity(w,e); var p=row(w,e,id);
         if(when==null || reason==null || reason.isBlank() || reason.length()>500 || reversalKey==null || reversalKey.isBlank() || reversalKey.length()>120) throw new DomainException(400,"Reversal key, date and reason required");
         String key=reversalKey.trim(), intent=hash("RECEIPT:"+id+":"+when+":"+reason.trim());
         var prior=db.queryForList("select payload_hash from sales_reversals where workspace_id=? and entity_id=? and reversal_key=?",w,e,key);
@@ -159,5 +159,9 @@ public class CustomerReceiptService {
         var result=posting.reverse(scope,n(p.get("journal_id")),"customer-receipt-reversal:"+id,when,reason.trim());
         db.update("insert into sales_reversals(workspace_id,entity_id,source_type,receipt_id,reversal_date,reversal_key,payload_hash,reason,journal_id,created_by) values (?,?,'RECEIPT',?,?,?,?,?,?,?)",w,e,id,when,key,intent,reason.trim(),result.journalId(),scope.actor().id());
         audit.record(scope.actor(),w,e,"REVERSE","CUSTOMER_RECEIPT",Long.toString(id),n(p.get("version")),"SUCCESS",reason.trim());
+    }
+    private void lockEntity(long w,long e) {
+        if (db.queryForList("select id from legal_entities where workspace_id=? and id=? and active for update",w,e).size()!=1)
+            throw new DomainException(404,"Entity not found");
     }
 }

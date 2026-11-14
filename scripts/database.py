@@ -26,7 +26,7 @@ REVISION = re.compile(r'(?:[0-9a-f]{40}|[0-9a-f]{64}|content:[0-9a-f]{64})\Z')
 PG_BIN = ROOT / '.tools' / 'postgres' / 'pgsql' / 'bin'
 JAVA_HOME = (Path(os.environ['JAVA_HOME']) if os.environ.get('GITHUB_ACTIONS') == 'true'
              else ROOT / '.tools' / 'jdk' / 'jdk-21.0.13+9')
-SCHEMA_VERSIONS = ('1', '2', '3', '4', '5')
+SCHEMA_VERSIONS = ('1', '2', '3', '4', '5', '6', '7')
 READ_ONLY = ('roles', 'flyway_schema_history')
 INSERT_ONLY = ('setup_receipts', 'audit_events', 'journal_lines', 'stock_movements', 'scenario_baseline_versions',
                'opening_balance_sources', 'purchase_request_contributors', 'purchase_order_contributors',
@@ -36,9 +36,12 @@ INSERT_ONLY = ('setup_receipts', 'audit_events', 'journal_lines', 'stock_movemen
                'crm_reactivation_rules', 'crm_reactivation_evaluations', 'crm_reactivation_events',
                'crm_opportunity_events', 'crm_lifecycle_events', 'inventory_reservation_events',
                'sales_order_cancellations', 'sales_reversals', 'quote_contributors', 'quote_events',
-               'sales_handover_requests', 'sales_handover_executions', 'product_compatibilities',
+               'sales_handover_requests', 'sales_handover_executions',
                'bundle_components', 'party_addresses', 'party_address_versions', 'document_address_snapshots',
-               'product_contributors', 'product_publications')
+               'product_contributors', 'product_publications', 'service_coverage_types', 'service_product_versions',
+               'asset_operator_links', 'installation_events', 'service_contracts', 'service_contract_assets',
+               'revenue_posting_runs', 'revenue_recognitions', 'service_completions', 'service_opening_balances',
+               'service_opening_periods', 'service_balance_postings', 'revenue_schedule_lines')
 MUTABLE = ('app_users', 'scenario_workspaces', 'workspace_memberships', 'user_roles', 'legal_entities',
            'entity_memberships', 'customers', 'contacts', 'suppliers', 'uoms', 'products',
            'customer_contact_links', 'customer_entity_accounts', 'supplier_entity_accounts',
@@ -54,7 +57,9 @@ MUTABLE = ('app_users', 'scenario_workspaces', 'workspace_memberships', 'user_ro
            'crm_reactivation_cases', 'inventory_reservations', 'shipments', 'shipment_lines',
            'shipment_line_tracking', 'sales_invoices', 'sales_invoice_lines', 'customer_receipts',
            'customer_receipt_allocations', 'quotes', 'quote_revisions', 'quote_lines',
-           'sales_orders', 'sales_order_lines')
+           'sales_orders', 'sales_order_lines', 'product_compatibilities', 'service_posting_config',
+           'installed_instruments', 'quote_service_targets', 'sales_service_obligations', 'service_contract_terms',
+           'renewal_intents', 'revenue_schedules')
 TRIGGER_FUNCTIONS = ('reject_audit_mutation', 'journal_entry_immutable', 'journal_line_immutable',
                      'journal_balance_guard', 'legal_entity_currency_guard',
                      'protect_approved_price_book', 'protect_approved_price_lines',
@@ -62,7 +67,9 @@ TRIGGER_FUNCTIONS = ('reject_audit_mutation', 'journal_entry_immutable', 'journa
                      'm3_fulfillment_header_guard', 'm3_fulfillment_child_guard', 'm3_reservation_guard',
                      'm3_receivables_document_guard', 'm3_receivables_child_guard',
                      'commercial_order_guard', 'commercial_order_sealed_check', 'commercial_quote_guard',
-                     'm3_price_approval_guard', 'm3_product_publication_guard', 'm3_product_source_guard')
+                     'm3_price_approval_guard', 'm3_product_publication_guard', 'm3_product_source_guard',
+                     'm4_serial_guard', 'm4_source_guard', 'm4_mutable_guard', 'm4_order_snapshot_guard',
+                     'm4_deferred_guard', 'm4_lineage_guard')
 
 
 class OperationError(Exception):
@@ -395,11 +402,12 @@ def migrate(state, database):
                          "OR type NOT IN ('SQL','SCHEMA') OR (type='SQL' AND "
                          "(version IS NULL OR script IS NULL OR checksum IS NULL OR (version,script) NOT IN "
                          "(('1','V1__identity.sql'),('2','V2__masters.sql'),('3','V3__finance.sql'),"
-                         "('4','V4__procurement_inventory_ap.sql'),('5','V5__local_crm_goods_o2c.sql'))));", database)
-        if versions not in ('1,2,3,4', '1,2,3,4,5') or bad != '0':
+                         "('4','V4__procurement_inventory_ap.sql'),('5','V5__local_crm_goods_o2c.sql'),"
+                         "('6','V6__assets_service_contracts.sql'),('7','V7__draft_service_invoice_source_guard.sql'))));", database)
+        if versions not in ('1,2,3,4', '1,2,3,4,5', '1,2,3,4,5,6', '1,2,3,4,5,6,7') or bad != '0':
             raise OperationError('Partial or unexpected Flyway history; refusing migration.')
-        if versions == '1,2,3,4':
-            maven(state, ['-Dflyway.target=4', 'flyway:validate'], database)
+        if versions in ('1,2,3,4', '1,2,3,4,5', '1,2,3,4,5,6'):
+            maven(state, ['-Dflyway.target=' + versions[-1], 'flyway:validate'], database)
         else:
             maven(state, ['flyway:validate'], database)
     else:
@@ -468,7 +476,7 @@ def main(argv=None):
                     print('Stopped only the identity-verified project cluster; data retained.')
                 elif args.command == 'migrate':
                     migrate(state, state['database'])
-                    state['phase'] = 'M3_SCHEMA_MIGRATED'
+                    state['phase'] = 'M4_SCHEMA_MIGRATED'
                     save(state)
                 elif args.command == 'verify':
                     test_database = state['database'] + '_test_' + uuid.uuid4().hex[:8]

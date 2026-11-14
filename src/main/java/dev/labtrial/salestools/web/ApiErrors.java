@@ -33,7 +33,7 @@ public class ApiErrors {
         if (status != 400 && status != 401 && status != 403 && status != 404 && status != 409) {
             return unexpected(error);
         }
-        if (status == 400) return invalidForm(request, handler, error.getMessage(), error.fields());
+        if (status == 400 || status == 409) return formFailure(status, request, handler, error.getMessage(), error.fields());
         return page(status, error.getMessage(), null);
     }
 
@@ -44,12 +44,12 @@ public class ApiErrors {
         if (error instanceof MissingServletRequestParameterException missing) fields = List.of(missing.getParameterName());
         else if (error instanceof MethodArgumentTypeMismatchException mismatch) fields = List.of(mismatch.getName());
         else if (error instanceof BindException binding) fields = binding.getFieldErrors().stream().map(field -> field.getField()).distinct().toList();
-        return invalidForm(request, handler, "Review the required fields, dates, amounts and references. No invalid action was saved.", fields);
+        return formFailure(400, request, handler, "Review the required fields, dates, amounts and references. No invalid action was saved.", fields);
     }
 
     @ExceptionHandler({IllegalStateException.class, DataIntegrityViolationException.class})
-    ModelAndView conflict(Exception error) {
-        return page(409, "The action conflicts with the persisted state or a data constraint. Refresh and review before submitting again.", null);
+    ModelAndView conflict(Exception error, HttpServletRequest request, HandlerMethod handler) {
+        return formFailure(409, request, handler, "The action conflicts with the persisted state or a data constraint. Review the submitted values and current references before submitting again.", List.of());
     }
 
     @ExceptionHandler(AccessDeniedException.class)
@@ -69,25 +69,25 @@ public class ApiErrors {
         return page(500, "Unexpected server failure. No success is claimed; contact the local operator with the reference.", reference);
     }
 
-    private ModelAndView invalidForm(HttpServletRequest request, HandlerMethod handler, String message, List<String> fields) {
+    private ModelAndView formFailure(int responseStatus, HttpServletRequest request, HandlerMethod handler, String message, List<String> fields) {
         if (!"POST".equals(request.getMethod()) || handler == null
                 || !(handler.getBean() instanceof FormController controller)) {
-            return page(400, message, null);
+            return page(responseStatus, message, null);
         }
         var model = new ExtendedModelMap();
-        context.context(model, SecurityContextHolder.getContext().getAuthentication(), request);
-        model.addAttribute("contactMode", false);
-        model.addAttribute("supplierMode", false);
-        model.addAttribute("productMode", false);
-        model.addAttribute("priceMode", false);
-        model.addAttribute("feedback", FormFeedback.rejected(request, message, fields));
         try {
+            context.context(model, SecurityContextHolder.getContext().getAuthentication(), request);
+            model.addAttribute("contactMode", false);
+            model.addAttribute("supplierMode", false);
+            model.addAttribute("productMode", false);
+            model.addAttribute("priceMode", false);
+            model.addAttribute("feedback", FormFeedback.rejected(request, message, fields));
             // The failed transaction has unwound. Rebuild only the authorized GET/read model.
             String view = controller.redisplayForm(request, model);
             if (view == null || view.startsWith("redirect:") || view.startsWith("forward:")) {
                 throw new IllegalStateException("Form recovery must return a read-only view");
             }
-            return new ModelAndView(view, model.asMap(), HttpStatusCode.valueOf(400));
+            return new ModelAndView(view, model.asMap(), HttpStatusCode.valueOf(responseStatus));
         } catch (DomainException denied) {
             int status = denied.status();
             if (status != 400 && status != 401 && status != 403 && status != 404 && status != 409) return unexpected(denied);
