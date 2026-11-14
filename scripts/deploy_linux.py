@@ -13,6 +13,7 @@ import json
 import os
 import pwd
 import re
+import stat
 import shutil
 import socket
 import subprocess
@@ -79,6 +80,31 @@ def validate_ancestors_root_owned(path):
             break
         if curr.is_symlink() or st.st_uid != 0 or (st.st_mode & 0o022):
             fail(f'Untrusted path component: {curr}')
+
+
+def validate_migration_user(cfg):
+    name = cfg.get('migration_user')
+    if not isinstance(name, str) or not ROLE_PATTERN.fullmatch(name):
+        fail('Invalid migration user')
+    try:
+        migration = pwd.getpwnam(name)
+        service = pwd.getpwnam(cfg['service_user'])
+    except (KeyError, TypeError):
+        fail('Migration or service user does not exist on host')
+    if (migration.pw_uid == 0 or migration.pw_gid == 0
+            or migration.pw_uid == service.pw_uid or migration.pw_gid == service.pw_gid):
+        fail('Migration user must have a non-root UID and GID distinct from the service user')
+    if migration.pw_shell not in {'/usr/sbin/nologin', '/bin/false', '/sbin/nologin', '/usr/bin/false'}:
+        fail('Migration user must have a non-login shell')
+    home = validate_clean_path(migration.pw_dir, 'Migration home')
+    validate_ancestors_root_owned(home.parent)
+    try:
+        st = home.lstat()
+    except OSError:
+        fail('Migration home must be an existing owned directory')
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != migration.pw_uid or st.st_mode & 0o022:
+        fail('Migration home must be owned by the migration user and not group/world writable')
+    return migration
 
 
 def parse_env_file(path, allowed_keys):
@@ -167,7 +193,7 @@ def validate_config(config_path, expected_env):
         fail('Config must be a JSON object')
 
     required_keys = {
-        'schema', 'project', 'environment', 'target_id', 'root', 'service_user',
+        'schema', 'project', 'environment', 'target_id', 'root', 'service_user', 'migration_user',
         'port', 'java_home', 'maven_home', 'pg_bin', 'pg_port', 'database',
         'owner_role', 'migrator_role', 'runtime_role', 'system_identifier',
         'machine_id', 'runtime_env_file', 'migration_env_file'
@@ -208,6 +234,7 @@ def validate_config(config_path, expected_env):
     non_login_shells = {'/usr/sbin/nologin', '/bin/false', '/sbin/nologin', '/usr/bin/false'}
     if pw.pw_shell not in non_login_shells:
         fail(f'service_user {user_name} must have a non-login shell, found {pw.pw_shell}')
+    validate_migration_user(cfg)
 
     # Ports
     if type(cfg['port']) is not int or not (1024 <= cfg['port'] <= 65535):
@@ -241,7 +268,7 @@ def validate_config(config_path, expected_env):
     for cmd, version in (([str(java_bin), '-version'], '21.0.13'),
                          ([str(mvn_bin), '-version'], '3.9.16'),
                          ([str(psql_bin), '--version'], '17.')):
-        result = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=30)
+        result = subprocess.run(cmd, env=env, cwd='/', capture_output=True, text=True, timeout=30)
         if result.returncode or version not in result.stdout + result.stderr:
             fail('Configured tool version does not match required pin')
 
@@ -541,6 +568,7 @@ def get_systemd_main_pid(unit_name):
 
 
 def action_migrate(cfg, release_dir, revision, run_id, manifest_sha):
+    validate_migration_user(cfg)
     paths = get_target_paths(cfg)
     verify_target_ownership(cfg)
 
@@ -621,6 +649,7 @@ def action_migrate(cfg, release_dir, revision, run_id, manifest_sha):
 
 
 def run_flyway(cfg, pom_path, goals):
+    migration = validate_migration_user(cfg)
     if not pom_path.is_file():
         fail(f"Migration pom.xml not found at {pom_path}")
 
@@ -632,7 +661,7 @@ def run_flyway(cfg, pom_path, goals):
     env = {
         'JAVA_HOME': cfg['java_home'],
         'PATH': f"{Path(cfg['java_home']) / 'bin'}:/usr/bin:/bin",
-        'HOME': '/root',
+        'HOME': migration.pw_dir,
         'LANG': 'C',
         'LAB_MIGRATION_DB_URL': mig_env_data['LAB_MIGRATION_DB_URL'],
         'LAB_MIGRATION_DB_USER': mig_env_data['LAB_MIGRATION_DB_USER'],
@@ -640,9 +669,17 @@ def run_flyway(cfg, pom_path, goals):
         'LAB_MIGRATION_OWNER': mig_env_data['LAB_MIGRATION_OWNER']
     }
 
-    mvn_bin = str(Path(cfg['maven_home']) / 'bin' / 'mvn')
-    cmd = [mvn_bin, '--batch-mode', '--no-transfer-progress', '-f', str(pom_path)] + goals
-    res = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=300)
+    java_bin = Path(cfg['java_home']) / 'bin' / 'java'
+    mvn_bin = Path(cfg['maven_home']) / 'bin' / 'mvn'
+    for binary in (java_bin, mvn_bin):
+        validate_clean_path(str(binary), 'Tool binary')
+        validate_ancestors_root_owned(binary)
+        if not binary.is_file() or not os.access(binary, os.X_OK):
+            fail(f'Tool binary not found or not executable: {binary}')
+    cmd = [str(mvn_bin), '--batch-mode', '--no-transfer-progress', '-f', str(pom_path)] + goals
+    res = subprocess.run(cmd, env=env, cwd=migration.pw_dir, user=migration.pw_uid,
+                         group=migration.pw_gid, extra_groups=[],
+                         capture_output=True, text=True, timeout=300)
     if res.returncode != 0:
         fail(f"Flyway command failed (code {res.returncode})")
 
