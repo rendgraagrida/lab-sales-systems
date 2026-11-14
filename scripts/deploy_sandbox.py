@@ -202,7 +202,7 @@ def _arguments(cfg, purpose, unit, timeout):
     args = ['/usr/bin/systemd-run', '--wait', '--pipe', '--collect', '--quiet', '--service-type=exec',
             '--expand-environment=no', '--unit=' + unit]
     for directive in unit_dependencies(spec) + unit_directives(spec, cfg['target_id'], purpose):
-        args.append('--property=' + directive)
+        args.append('--property=' + directive.replace('\\', '\\\\'))
     args.append('--property=RuntimeMaxSec=' + str(timeout))
     return args
 
