@@ -51,7 +51,7 @@ def allocate_free_port():
 def run_psql_stdin(pg_port, sql_text, db_name='postgres', timeout=30):
     """Execute SQL via psql using STDIN to prevent credentials appearing in argv."""
     cmd = [
-        'runuser', '-u', 'postgres', '--',
+        '/usr/sbin/runuser', '-u', 'postgres', '--',
         '/usr/lib/postgresql/17/bin/psql',
         '-X', '-w',
         '-h', '/var/run/postgresql',
@@ -247,7 +247,7 @@ class DeployRecoveryRegressionTests(unittest.TestCase):
         def cleanup_cluster():
             if (pg_cluster_dir / 'postmaster.pid').exists():
                 result = subprocess.run(
-                    ['runuser', '-u', 'postgres', '--',
+                    ['/usr/sbin/runuser', '-u', 'postgres', '--',
                      '/usr/lib/postgresql/17/bin/pg_ctl', '-D', str(pg_cluster_dir),
                      '-m', 'fast', '-w', '-t', '30', 'stop'], capture_output=True, timeout=45)
                 self.assertEqual(0, result.returncode, 'Owned native cluster did not stop')
@@ -262,7 +262,7 @@ class DeployRecoveryRegressionTests(unittest.TestCase):
         self.addCleanup(password_file.unlink, missing_ok=True)
 
         initdb_res = subprocess.run(
-            ['runuser', '-u', 'postgres', '--',
+            ['/usr/sbin/runuser', '-u', 'postgres', '--',
              '/usr/lib/postgresql/17/bin/initdb',
              '-D', str(pg_cluster_dir),
              '-A', 'scram-sha-256',
@@ -289,7 +289,7 @@ class DeployRecoveryRegressionTests(unittest.TestCase):
         os.chown(hba_path, postgres_pw.pw_uid, postgres_pw.pw_gid)
 
         pg_ctl_start = subprocess.run(
-            ['runuser', '-u', 'postgres', '--',
+            ['/usr/sbin/runuser', '-u', 'postgres', '--',
              '/usr/lib/postgresql/17/bin/pg_ctl',
              '-D', str(pg_cluster_dir),
              '-l', str(pg_cluster_dir / 'postgres.log'),
