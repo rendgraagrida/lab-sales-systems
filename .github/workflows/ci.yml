@@ -71,7 +71,7 @@ jobs:
       - name: Exercise native deployment privilege boundaries
         env:
           PYTHON_BINARY: ${{ steps.python.outputs.python-path }}
-        run: sudo -- "$PYTHON_BINARY" -m unittest discover -s tests -p 'test_deploy_*.py'
+        run: sudo -- env GITHUB_ACTIONS="$GITHUB_ACTIONS" RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" "$PYTHON_BINARY" -m unittest discover -s tests -p 'test_deploy_*.py'
       - name: Verify actual application with isolated PostgreSQL
         run: python scripts/ci_database.py
       - name: Package artifact

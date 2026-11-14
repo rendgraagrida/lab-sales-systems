@@ -68,7 +68,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
                                       (expected.replace('|50', '|51'), '0', False), (expected, '1', False)):
             with self.subTest(actual=actual, bad=bad), \
                     mock.patch.object(deploy_linux.release, 'schema_identity', return_value=expected), \
-                    mock.patch.object(deploy_linux, 'run_psql', side_effect=[actual, bad]):
+                    mock.patch.object(deploy_linux, 'run_migrator_psql', side_effect=[actual, bad]):
                 if accepted:
                     deploy_linux.require_schema_compatible(cfg, '/release')
                 else:
@@ -91,7 +91,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with mock.patch.object(deploy_linux, 'verify_unit_ownership'), \
                     mock.patch.object(deploy_linux.release, 'verify_release'), \
                     mock.patch.object(deploy_linux.release, 'schema_identity', return_value='1|v1|1,2|v2|2,3|v3|3,4|v4|4'), \
-                    mock.patch.object(deploy_linux, 'run_psql', side_effect=['1|v1|1,2|v2|2,3|v3|3,4|v4|4,5|v5|5', '0']), \
+                    mock.patch.object(deploy_linux, 'run_migrator_psql', side_effect=['1|v1|1,2|v2|2,3|v3|3,4|v4|4,5|v5|5', '0']), \
                     mock.patch.object(deploy_linux, 'systemctl') as systemctl:
                 with self.assertRaises(deploy_linux.DeployError):
                     deploy_linux.rollback_on_failed_deploy(cfg, paths, journal)
@@ -124,7 +124,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
         cfg = {'database': 'lab'}
         old = '1|v1|1,2|v2|2,3|v3|3,4|v4|4,5|v5|5'
         with mock.patch.object(deploy_linux.release, 'schema_identity', return_value=old), \
-                mock.patch.object(deploy_linux, 'run_psql', side_effect=[old + ',6|v6|6', '0']):
+                mock.patch.object(deploy_linux, 'run_migrator_psql', side_effect=[old + ',6|v6|6', '0']):
             with self.assertRaises(deploy_linux.DeployError):
                 deploy_linux.require_schema_compatible(cfg, '/release')
 
@@ -135,7 +135,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
                      'unit_name': 'lab.service', 'releases': root, 'state': root}
             cfg = {'database': 'lab', 'target_id': 'target', 'environment': 'staging',
                    'system_identifier': '123'}
-            history = ['t', '1,2,3,4', '0', '0']
+            history = ['1,2,3,4', '0']
             for service, permitted in (((0, 'inactive'), True), ((8, 'active'), False),
                                        ((0, 'activating'), False)):
                 with self.subTest(service=service), \
@@ -148,7 +148,8 @@ class SchemaCompatibilityTests(unittest.TestCase):
                         mock.patch.object(deploy_linux, 'verify_unit_ownership'), \
                         mock.patch.object(deploy_linux.release, 'verify_release', return_value={'schema_versions': ['1', '2', '3', '4', '5', '6', '7']}), \
                         mock.patch.object(deploy_linux, 'get_systemd_main_pid', return_value=service), \
-                        mock.patch.object(deploy_linux, 'run_psql', side_effect=history), \
+                        mock.patch.object(deploy_linux, 'run_psql', side_effect=['t', '0']), \
+                        mock.patch.object(deploy_linux, 'run_migrator_psql', side_effect=history), \
                         mock.patch.object(deploy_linux, 'copy_release_immutable'), \
                         mock.patch.object(deploy_linux, 'run_flyway') as flyway, \
                         mock.patch.object(deploy_linux, 'require_schema_compatible'), \

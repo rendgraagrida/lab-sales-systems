@@ -1,6 +1,8 @@
 #!/usr/bin/python3 -I
 """Administrator-installed, policy-pinned staging deployment gateway."""
 import argparse
+from contextlib import contextmanager
+import fcntl
 import importlib.util
 import hashlib
 import json
@@ -8,6 +10,7 @@ import os
 from pathlib import Path
 import pwd
 import re
+import shutil
 import stat
 import sys
 import tempfile
@@ -150,10 +153,37 @@ def read_source(parent, name, uid, limit):
     return os.fdopen(fd, 'rb')
 
 
+@contextmanager
+def promotion_lock(policy):
+    root = os.open(policy['promotion_root'], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(root)
+        if info.st_uid != os.geteuid() or info.st_mode & 0o022:
+            raise GatewayError('untrusted promotion directory')
+        fd = os.open('.gateway-promotion.lock',
+                     os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=root)
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                    or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600):
+                raise GatewayError('untrusted promotion lock')
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise GatewayError('promotion already in progress') from error
+            yield
+        finally:
+            os.close(fd)
+    finally:
+        os.close(root)
+
+
+@contextmanager
 def promote(request, policy, uid, release_module):
     match = UPLOAD.fullmatch(request['release_dir'])
     tmp = os.open('/tmp', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     opened = [tmp]
+    destination = None
     try:
         info = os.fstat(tmp)
         if info.st_uid != 0 or not info.st_mode & stat.S_ISVTX:
@@ -218,16 +248,24 @@ def promote(request, policy, uid, release_module):
                 raise GatewayError('upload digest mismatch')
             os.chmod(destination / name, 0o644)
         release_module.verify_release(destination, request['revision'], request['run_id'], request['manifest_sha256'])
-        return str(destination)
+        yield str(destination)
     finally:
-        for fd in reversed(opened):
-            os.close(fd)
+        try:
+            if destination is not None:
+                shutil.rmtree(destination)
+        finally:
+            for fd in reversed(opened):
+                os.close(fd)
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--policy', required=True)
     parser.add_argument('--request', required=True)
+    argv = sys.argv[1:] if argv is None else argv
+    if argv not in (['--help'], ['-h']) and (
+            len(argv) != 4 or argv[0] != '--policy' or argv[2] != '--request'):
+        parser.error('expected --policy PATH --request JSON')
     args = parser.parse_args(argv)
     try:
         if os.geteuid() != 0 or len(args.request.encode('utf-8')) > MAX_MANIFEST:
@@ -242,13 +280,15 @@ def main(argv=None):
         import deploy_linux
         adapter_args = [request['action'], '--config', policy['target_config'], '--environment', policy['environment']]
         if request['action'] in ('migrate', 'deploy'):
-            try:
-                ci.candidate(request['revision'], request['run_id'])
-                promoted = promote(request, policy, uid, release)
-            except (ci.CheckError, release.ReleaseError) as error:
-                raise GatewayError('release rejected') from error
-            adapter_args += ['--release-dir', promoted, '--revision', request['revision'],
-                             '--run-id', request['run_id'], '--manifest-sha256', request['manifest_sha256']]
+            with promotion_lock(policy):
+                try:
+                    ci.candidate(request['revision'], request['run_id'])
+                    with promote(request, policy, uid, release) as promoted:
+                        adapter_args += ['--release-dir', promoted, '--revision', request['revision'],
+                                         '--run-id', request['run_id'], '--manifest-sha256', request['manifest_sha256']]
+                        return deploy_linux.main(adapter_args)
+                except (ci.CheckError, release.ReleaseError) as error:
+                    raise GatewayError('release rejected') from error
         return deploy_linux.main(adapter_args)
     except (GatewayError, OSError, ValueError, KeyError, TypeError, RecursionError) as error:
         print('error: gateway: ' + str(error), file=sys.stderr)
