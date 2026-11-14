@@ -1,4 +1,6 @@
 """Disposable native sandbox integration fixture; never use on a VPS."""
+import ctypes
+import errno
 import json
 import os
 from pathlib import Path
@@ -6,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 import uuid
@@ -74,7 +77,7 @@ class SandboxFixture:
             self.__exit__(*sys.exc_info())
             raise
 
-    def run_controller_probe(self, source):
+    def run_controller_probe(self, source, *, timeout=120, on_started=None):
         """Run test-owned source inside a real disposable controller unit."""
         if not isinstance(source, str):
             raise TypeError('probe source must be text')
@@ -98,9 +101,18 @@ class SandboxFixture:
             'assert sandbox.in_controller(cfg["sandbox"], cfg["target_id"])\n'
             + source + '\n')
         unit = f'lab-sales-{self.target_id}-control-{uuid.uuid4().hex}.service'
-        args = sandbox._arguments(self.cfg, 'controller', unit, 120)
-        return subprocess.run(args + ['--', '/usr/bin/python3', '-I', str(probe)],
-                              capture_output=True, text=True, check=False, timeout=150)
+        args = sandbox._arguments(self.cfg, 'controller', unit, timeout)
+        args += ['--', '/usr/bin/python3', '-I', str(probe)]
+        with subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
+            try:
+                if on_started is not None:
+                    on_started(unit)
+                stdout, stderr = process.communicate(timeout=timeout + 30)
+            except BaseException:
+                subprocess.run(['/usr/bin/systemctl', 'stop', unit], capture_output=True, check=False)
+                process.communicate(timeout=30)
+                raise
+            return subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
 
     def __exit__(self, exc_type, exc, tb):
         if self.units_created:
@@ -179,6 +191,80 @@ class NativeSandboxTests(unittest.TestCase):
             self.assertEqual(0, probe.returncode, probe.stderr)
             child = json.loads(probe.stdout)
             self.assertEqual(0, child['status'], child['stderr'])
+
+    def test_controller_loss_stops_child_and_descendant_before_completion(self):
+        def live(pid):
+            try:
+                return (Path('/proc') / str(pid) / 'stat').read_text().split()[2] != 'Z'
+            except FileNotFoundError:
+                return False
+
+        for failure in ('sigkill', 'deadline'):
+            with self.subTest(failure=failure), SandboxFixture() as fixture:
+                ready = fixture.home / 'ready.json'
+                child_source = (
+                    'import json,os,signal,subprocess,sys,time\n'
+                    'from pathlib import Path\n'
+                    'signal.signal(signal.SIGTERM, signal.SIG_IGN)\n'
+                    'child=subprocess.Popen(["/bin/sleep","60"])\n'
+                    'Path(sys.argv[1]).write_text(json.dumps([os.getpid(),child.pid]))\n'
+                    'time.sleep(60)\n')
+                source = (
+                    'sandbox.run_child(cfg, ["/usr/bin/python3", "-c", ' + repr(child_source)
+                    + ', ' + repr(str(ready)) + '], uid=migration_uid, gid=migration_gid, '
+                    'home=str(home), purpose="migration", timeout=30)\n')
+                pids = []
+
+                def interrupt(unit):
+                    deadline = time.monotonic() + 10
+                    while not ready.exists():
+                        if time.monotonic() >= deadline:
+                            self.fail('child never became ready')
+                        time.sleep(0.02)
+                    pids.extend(json.loads(ready.read_text()))
+                    self.assertTrue(all(live(pid) for pid in pids))
+                    if failure == 'sigkill':
+                        native('/usr/bin/systemctl', 'kill', '--kill-whom=main', '--signal=KILL', unit)
+
+                result = fixture.run_controller_probe(
+                    source, timeout=5 if failure == 'deadline' else 30, on_started=interrupt)
+                self.assertNotEqual(0, result.returncode)
+                # No grace wait here: request completion must follow child cleanup.
+                self.assertEqual([False, False], [live(pid) for pid in pids])
+
+    def test_private_ipc_does_not_publish_child_semaphore_to_host(self):
+        libc = ctypes.CDLL(None, use_errno=True)
+        key = (uuid.uuid4().int & 0x7fffffff) or 1
+        self.assertEqual(-1, libc.semget(key, 0, 0))
+        self.assertEqual(errno.ENOENT, ctypes.get_errno())
+        host_namespace = os.readlink('/proc/self/ns/ipc')
+        with SandboxFixture() as fixture:
+            child_source = (
+                'import ctypes,json,os,sys\n'
+                'namespace=os.readlink("/proc/self/ns/ipc")\n'
+                'assert namespace not in sys.argv[1:3]\n'
+                'libc=ctypes.CDLL(None,use_errno=True)\n'
+                f'semaphore=libc.semget({key},1,0o1000|0o2000|0o600)\n'
+                'assert semaphore >= 0, ctypes.get_errno()\n'
+                'print(json.dumps({"namespace":namespace,"pid":os.getpid()}))\n')
+            source = (
+                'import os\n'
+                'namespace=os.readlink("/proc/self/ns/ipc")\n'
+                'result=sandbox.run_child(cfg, ["/usr/bin/python3","-c", '
+                + repr(child_source) + ', ' + repr(host_namespace) + ', namespace], '
+                'uid=migration_uid,gid=migration_gid,home=str(home),purpose="migration")\n'
+                'print(json.dumps({"status":result.returncode,"stdout":result.stdout,'
+                '"stderr":result.stderr,"controllerNamespace":namespace}))\n')
+            result = fixture.run_controller_probe(source)
+            self.assertEqual(0, result.returncode, result.stderr)
+            child = json.loads(result.stdout)
+            self.assertEqual(0, child['status'], child['stderr'])
+            sentinel = json.loads(child['stdout'])
+            self.assertNotEqual(host_namespace, child['controllerNamespace'])
+            self.assertNotEqual(child['controllerNamespace'], sentinel['namespace'])
+            self.assertFalse((Path('/proc') / str(sentinel['pid'])).exists())
+            self.assertEqual(-1, libc.semget(key, 0, 0))
+            self.assertEqual(errno.ENOENT, ctypes.get_errno())
 
     def test_missing_slice_and_mount_fail_closed(self):
         with SandboxFixture() as fixture:

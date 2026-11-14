@@ -141,7 +141,7 @@ def unit_directives(spec, target_id, purpose):
                   'MemorySwapMax=0', f"CPUQuota={spec['cpu_quota_percent']}%",
                   f"TasksMax={spec['tasks_max']}", 'KillMode=control-group',
                   'NoNewPrivileges=yes', 'ProtectSystem=strict', 'ReadOnlyPaths=/run', 'ProtectHome=yes',
-                  'PrivateDevices=yes', 'ProtectKernelTunables=yes', 'ProtectKernelModules=yes',
+                  'PrivateDevices=yes', 'PrivateIPC=yes', 'ProtectKernelTunables=yes', 'ProtectKernelModules=yes',
                   'ProtectControlGroups=yes', 'RestrictSUIDSGID=yes',
                   f'LogNamespace=lab-sales-{target_id}']
     for path in ('/tmp', '/var/tmp', '/dev/shm'):
@@ -151,27 +151,35 @@ def unit_directives(spec, target_id, purpose):
     return directives
 
 
+def _controller_group(spec, target_id):
+    lines = Path('/proc/self/cgroup').read_text().splitlines()
+    matching = [line for line in lines if line.startswith('0::')]
+    if len(matching) != 1:
+        return None
+    parts = matching[0][3:].strip('/').split('/')
+    prefix = f'lab-sales-{target_id}-control-'
+    if (len(parts) < 2 or parts[-2] != spec['slice']
+            or not re.fullmatch(re.escape(prefix) + r'[0-9a-f]{32}\.service', parts[-1])):
+        return None
+    return parts
+
+
 def in_controller(spec, target_id):
     validate(spec, target_id)
     try:
-        lines = Path('/proc/self/cgroup').read_text().splitlines()
-        prefix = f'lab-sales-{target_id}-control-'
-        matching = [line for line in lines if line.startswith('0::')]
-        if len(matching) != 1:
-            return False
-        parts = matching[0][3:].strip('/').split('/')
-        if (len(parts) < 2 or parts[-2] != spec['slice'] or not parts[-1].startswith(prefix)
-                or not re.fullmatch(re.escape(prefix) + r'[0-9a-f]{32}\.service', parts[-1])):
+        parts = _controller_group(spec, target_id)
+        if parts is None:
             return False
         props = _properties(parts[-1], ['Slice', 'MemoryMax', 'MemorySwapMax', 'TasksMax',
                             'CPUQuotaPerSecUSec', 'NoNewPrivileges', 'ProtectSystem', 'ProtectHome',
-                            'PrivateDevices', 'ProtectKernelTunables', 'ProtectKernelModules',
+                            'PrivateDevices', 'PrivateIPC', 'ProtectKernelTunables', 'ProtectKernelModules',
                             'ProtectControlGroups', 'RestrictSUIDSGID', 'KillMode', 'LogNamespace'])
         if not (props['Slice'] == spec['slice'] and int(props['MemoryMax']) == spec['memory_max_bytes']
                 and int(props['MemorySwapMax']) == 0 and int(props['TasksMax']) == spec['tasks_max']
                 and props['CPUQuotaPerSecUSec'] == _cpu_usec(spec['cpu_quota_percent'])
                 and props['NoNewPrivileges'] == 'yes' and props['ProtectSystem'] == 'strict'
                 and props['ProtectHome'] == 'yes' and props['PrivateDevices'] == 'yes'
+                and props['PrivateIPC'] == 'yes'
                 and props['ProtectKernelTunables'] == 'yes' and props['ProtectKernelModules'] == 'yes'
                 and props['ProtectControlGroups'] == 'yes' and props['RestrictSUIDSGID'] == 'yes'
                 and props['KillMode'] == 'control-group'
@@ -185,6 +193,8 @@ def in_controller(spec, target_id):
                 or quota == 'max' or int(quota) * 100 != int(period) * spec['cpu_quota_percent']):
             return False
         if not os.statvfs('/run').f_flag & os.ST_RDONLY:
+            return False
+        if os.stat('/proc/self/ns/ipc').st_ino == os.stat('/proc/1/ns/ipc').st_ino:
             return False
         mounts = Path('/proc/self/mountinfo').read_text().splitlines()
         for path in ('/tmp', '/var/tmp', '/dev/shm'):
@@ -201,11 +211,28 @@ def in_controller(spec, target_id):
         return False
 
 
-def _arguments(cfg, purpose, unit, timeout):
+def _arguments(cfg, purpose, unit, timeout, controller=None):
     spec = validate(cfg['sandbox'], cfg['target_id'])
     args = ['/usr/bin/systemd-run', '--wait', '--pipe', '--collect', '--quiet', '--service-type=exec',
             '--expand-environment=no', '--unit=' + unit]
-    for directive in unit_dependencies(spec) + unit_directives(spec, cfg['target_id'], purpose):
+    directives = unit_dependencies(spec) + unit_directives(spec, cfg['target_id'], purpose)
+    controller_pattern = re.escape(f"lab-sales-{cfg['target_id']}-control-") + r'([0-9a-f]{32})\.service'
+    if purpose == 'controller':
+        match = re.fullmatch(controller_pattern, unit)
+        if not match:
+            raise SandboxError('invalid controller unit')
+        children = f"lab-sales-{cfg['target_id']}-child-{match[1]}-*.service"
+        # PID1 waits for this hook before the request's --wait returns and its
+        # supervisor releases the lock, even after controller SIGKILL/OOM.
+        directives += ['ExecStopPost=/usr/bin/systemctl stop -- ' + children, 'TimeoutStopSec=20s']
+    elif purpose in ('migration', 'bootstrap'):
+        if controller is None or not re.fullmatch(controller_pattern, controller):
+            raise SandboxError('invalid child controller')
+        directives = [value + ' ' + controller if value.startswith(('BindsTo=', 'After='))
+                      else value for value in directives]
+        # Requisite refuses a delayed child start once its owner is gone.
+        directives += ['Requisite=' + controller, 'TimeoutStopSec=5s']
+    for directive in directives:
         args.append('--property=' + directive.replace('\\', '\\\\'))
     args.append('--property=RuntimeMaxSec=' + str(timeout))
     return args
@@ -261,8 +288,10 @@ def run_child(cfg, command, *, uid, gid, home, purpose, environment=None, enviro
         raise SandboxError('child path unavailable') from error
     if type(timeout) is not int or not 0 < timeout <= 3600:
         raise SandboxError('invalid child timeout')
-    unit = f"lab-sales-{cfg['target_id']}-{purpose}-{uuid.uuid4().hex}.service"
-    args = _arguments(cfg, purpose, unit, timeout)
+    controller = _controller_group(cfg['sandbox'], cfg['target_id'])[-1]
+    owner = controller.removeprefix(f"lab-sales-{cfg['target_id']}-control-").removesuffix('.service')
+    unit = f"lab-sales-{cfg['target_id']}-child-{owner}-{purpose}-{uuid.uuid4().hex}.service"
+    args = _arguments(cfg, purpose, unit, timeout, controller=controller)
     args.append('--property=ReadWritePaths=' + home)
     args.append('--property=WorkingDirectory=' + home)
     if environment_file is not None:
