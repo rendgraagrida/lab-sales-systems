@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
-"""Transport controller for deploying Lab Sales Systems to remote Linux hosts via SSH/SCP.
-
-Handles local release verification, secure transport, and exit status propagation.
-"""
+"""Stream a verified release to the fixed remote deployment entrypoint."""
 
 import argparse
 import json
-import os
+import hashlib
 from pathlib import Path
 import re
-import shlex
+import struct
 import subprocess
 import sys
 
@@ -20,9 +17,10 @@ ACTIONS = ('migrate', 'deploy', 'status', 'stop', 'rollback', 'recover')
 ENVIRONMENTS = ('staging', 'production')
 SSH_HOST_RE = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_.-]*\Z')
 SSH_USER_RE = re.compile(r'^[a-zA-Z0-9_][a-zA-Z0-9_.-]*\Z')
-UPLOAD_DIR_RE = re.compile(r'^/tmp/crm-upload-[A-Za-z0-9._-]+\Z')
-CONTROLLER_DEPENDENCIES = ('ci.py', 'release.py', 'database.py', 'deploy_linux.py', 'deploy_gateway.py')
-GATEWAY = '/opt/lab-sales-systems/controller/deploy_gateway.py'
+CONTROLLER_DEPENDENCIES = ('ci.py', 'release.py', 'database.py', 'deploy_linux.py',
+                           'deploy_gateway.py', 'deploy_entry.py', 'deploy_sandbox.py')
+MAX_MANIFEST = 1024 * 1024
+CHUNK_SIZE = 1024 * 1024
 
 
 class DeployError(Exception):
@@ -90,31 +88,24 @@ def build_ssh_base_cmds(ssh_host, ssh_user=None, ssh_port=None, ssh_config=None,
         '-o', 'StrictHostKeyChecking=yes',
         '-o', 'ConnectTimeout=15',
     ]
-    scp_cmd = [
-        'scp',
-        '-o', 'BatchMode=yes',
-        '-o', 'StrictHostKeyChecking=yes',
-        '-o', 'ConnectTimeout=15',
-    ]
 
     if config_path is not None:
         posix_p = config_path.resolve().as_posix()
         ssh_cmd.extend(['-F', posix_p])
-        scp_cmd.extend(['-F', posix_p])
+
     if known_hosts_path is not None:
         posix_p = known_hosts_path.resolve().as_posix()
         ssh_cmd.extend(['-o', f'UserKnownHostsFile={posix_p}'])
-        scp_cmd.extend(['-o', f'UserKnownHostsFile={posix_p}'])
+
     if identity_path is not None:
         posix_p = identity_path.resolve().as_posix()
         ssh_cmd.extend(['-i', posix_p])
-        scp_cmd.extend(['-i', posix_p])
+
     if port is not None:
         ssh_cmd.extend(['-p', str(port)])
-        scp_cmd.extend(['-P', str(port)])
 
     target = f'{user}@{host}' if user else host
-    return ssh_cmd, scp_cmd, target
+    return ssh_cmd, target
 
 
 def deploy_transport(action, environment, remote_config, ssh_host, ssh_user=None,
@@ -130,55 +121,80 @@ def deploy_transport(action, environment, remote_config, ssh_host, ssh_user=None
             value is not None for value in (release_dir, revision, run_id, manifest_sha256)):
         raise DeployError('release arguments are not allowed for this action')
 
+    manifest = None
+    raw_manifest = None
     if action in ('migrate', 'deploy'):
         if not (release_dir and revision and run_id and manifest_sha256):
             raise DeployError(f'action {action} requires --release-dir, --revision, --run-id, --manifest-sha256')
         ci.candidate(revision, run_id)
         if not isinstance(manifest_sha256, str) or not ci.HASH.fullmatch(manifest_sha256):
-            raise DeployError('invalid manifest-sha256: expected 64 lowercase hex digits')
-        # Local verification must succeed before any remote transport
+            raise DeployError('invalid manifest-sha256')
         try:
-            release.verify_release(release_dir, revision, run_id, manifest_sha256)
-        except release.ReleaseError as err:
-            raise DeployError(f'local release verification failed: {err}') from err
+            manifest = release.verify_release(release_dir, revision, run_id, manifest_sha256)
+            with ci.open_regular(Path(release_dir) / 'release.json') as source:
+                raw_manifest = source.read(MAX_MANIFEST + 1)
+            if len(raw_manifest) > MAX_MANIFEST or hashlib.sha256(raw_manifest).hexdigest() != manifest_sha256:
+                raise DeployError('release manifest changed or is too large')
+            if manifest['schema_versions'] != [str(i) for i in range(1, len(release.SQL_NAMES) + 1)]:
+                raise DeployError('release must use current schema lineage')
+            total = 0
+            for name, item in manifest['files'].items():
+                limit = 512 * 1024 * 1024 if name == 'app/application.jar' else 4 * 1024 * 1024
+                if item['size'] > limit:
+                    raise DeployError('release file exceeds transport limit')
+                total += item['size']
+            if total > 576 * 1024 * 1024:
+                raise DeployError('release exceeds transport limit')
+        except (release.ReleaseError, OSError, ci.CheckError) as err:
+            raise DeployError('local release verification failed') from err
 
     scripts_dir = Path(__file__).resolve().parent
     entries = {}
     for dep in CONTROLLER_DEPENDENCIES:
         with ci.open_regular(scripts_dir / dep) as source:
             entries[dep] = ci.digest_file(source)['sha256']
-    remote_upload_dir = None
-
-    ssh_cmd, scp_cmd, target = build_ssh_base_cmds(
-        ssh_host, ssh_user, ssh_port, ssh_config, ssh_identity, ssh_known_hosts
-    )
-
-    if action in ('migrate', 'deploy'):
-        mktemp_cmd = 'sh -c "umask 077 && mktemp -d /tmp/crm-upload-XXXXXXXXXX"'
-        create_proc = subprocess.run(ssh_cmd + [target, mktemp_cmd], stdout=subprocess.PIPE,
-                                     stderr=None, text=True, check=False)
-        if create_proc.returncode:
-            return create_proc.returncode
-        remote_upload_dir = create_proc.stdout.strip()
-        if not UPLOAD_DIR_RE.fullmatch(remote_upload_dir):
-            raise DeployError('unexpected remote upload directory')
-        mkdir_cmd = 'mkdir -m 0700 ' + shlex.quote(remote_upload_dir + '/release')
-        result = subprocess.run(ssh_cmd + [target, mkdir_cmd])
-        if result.returncode:
-            return result.returncode
-        rel_root = ci.checked_path(release_dir)
-        rel_items = [str(rel_root / item) for item in ('app', 'migration', 'release.json')]
-        result = subprocess.run(scp_cmd + ['-r'] + rel_items + [f'{target}:{remote_upload_dir}/release/'])
-        if result.returncode:
-            return result.returncode
-    request = {'schema': 1, 'action': action, 'environment': environment,
-               'release_dir': remote_upload_dir + '/release' if remote_upload_dir else None,
+    ssh_cmd, target = build_ssh_base_cmds(
+        ssh_host, ssh_user, ssh_port, ssh_config, ssh_identity, ssh_known_hosts)
+    request = {'schema': 2, 'policy': clean_config, 'action': action, 'environment': environment,
                'revision': revision, 'run_id': run_id, 'manifest_sha256': manifest_sha256,
                'controller_sha256': entries}
-    command = ['sudo', '-n', '--', GATEWAY, '--policy', clean_config,
-               '--request', json.dumps(request, separators=(',', ':'))]
-    # Retain uniquely created staging directories; never recursively delete a caller path.
-    return subprocess.run(ssh_cmd + [target, ' '.join(shlex.quote(arg) for arg in command)]).returncode
+    header = json.dumps(request, separators=(',', ':'), ensure_ascii=True).encode('utf-8') + b'\n'
+    if len(header) > 65536:
+        raise DeployError('request header too large')
+    process = subprocess.Popen(ssh_cmd + [target, 'crm-deploy-v2'], stdin=subprocess.PIPE)
+    local_error = None
+    try:
+        process.stdin.write(header)
+        if manifest is not None:
+            process.stdin.write(struct.pack('>Q', len(raw_manifest)))
+            process.stdin.write(raw_manifest)
+            for name in sorted(manifest['files']):
+                meta = manifest['files'][name]
+                digest = hashlib.sha256()
+                count = 0
+                with ci.open_regular(Path(release_dir) / name) as source:
+                    while True:
+                        chunk = source.read(CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        count += len(chunk)
+                        if count > meta['size']:
+                            raise DeployError('release changed during streaming')
+                        digest.update(chunk)
+                        process.stdin.write(chunk)
+                if count != meta['size'] or digest.hexdigest() != meta['sha256']:
+                    raise DeployError('release changed during streaming')
+    except (BrokenPipeError, OSError, ci.CheckError, DeployError) as error:
+        local_error = error
+    finally:
+        try:
+            process.stdin.close()
+        except BrokenPipeError:
+            pass
+    status = process.wait()
+    if local_error is not None and status == 0:
+        raise DeployError('release streaming failed') from local_error
+    return status
 
 
 def main(argv=None):

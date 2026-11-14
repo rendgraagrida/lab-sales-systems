@@ -13,6 +13,7 @@ if sys.platform == 'linux':
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
     try:
         import deploy_linux
+        from test_deploy_sandbox import SandboxFixture
     finally:
         sys.path.pop(0)
 
@@ -170,20 +171,20 @@ class SchemaCompatibilityTests(unittest.TestCase):
 @unittest.skipUnless(sys.platform == 'linux', 'Native Linux deployment adapter')
 class MigrationIdentityTests(unittest.TestCase):
     def setUp(self):
-        if os.geteuid() != 0:
-            self.skipTest('Requires root to exercise the real UID/GID transition')
-        self.temp = tempfile.TemporaryDirectory(dir='/')
-        self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
-        self.root.chmod(0o755)
-        self.home = self.root / 'home'
-        self.home.mkdir(mode=0o700)
-        os.chown(self.home, 65534, 65534)
+        if not (os.geteuid() == 0 and os.environ.get('GITHUB_ACTIONS') == 'true'
+                and os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted'):
+            self.skipTest('Requires disposable GitHub-hosted root systemd fixture')
+        self.fixture = SandboxFixture()
+        self.fixture.__enter__()
+        self.addCleanup(self.fixture.__exit__, None, None, None)
+        self.root = self.fixture.storage / 'adapter-test'
+        self.root.mkdir(mode=0o755)
+        self.home = self.fixture.home
         self.migration = SimpleNamespace(pw_uid=65534, pw_gid=65534,
                                          pw_dir=str(self.home), pw_shell='/usr/sbin/nologin')
         self.service = SimpleNamespace(pw_uid=65533, pw_gid=65533,
                                        pw_dir='/nonexistent', pw_shell='/usr/sbin/nologin')
-        self.cfg = {'migration_user': 'migration', 'service_user': 'service'}
+        self.cfg = dict(self.fixture.cfg, migration_user='migration', service_user='service')
         self.accounts = mock.patch.object(deploy_linux.pwd, 'getpwnam',
                                           side_effect=lambda name: {'migration': self.migration,
                                                                     'service': self.service}[name])
@@ -212,6 +213,10 @@ class MigrationIdentityTests(unittest.TestCase):
             deploy_linux.validate_migration_user({'service_user': 'service'})
         os.chown(self.home, 65534, 65534)
         self.root.chmod(0o777)
+        nested = self.root / 'nested-home'
+        nested.mkdir(mode=0o700)
+        os.chown(nested, 65534, 65534)
+        self.migration.pw_dir = str(nested)
         with self.assertRaises(deploy_linux.DeployError):
             deploy_linux.validate_migration_user(self.cfg)
         self.root.chmod(0o755)
@@ -249,25 +254,102 @@ class MigrationIdentityTests(unittest.TestCase):
             '        readable.append(True)\n'
             '    except PermissionError:\n'
             '        readable.append(False)\n'
+            'try:\n'
+            f'    open({str(self.fixture.outside / "escape")!r}, "w").close()\n'
+            '    escaped = True\n'
+            'except OSError:\n'
+            '    escaped = False\n'
+            'with open("/tmp/adapter-probe", "w") as f:\n'
+            '    f.write("ok")\n'
             'with open(os.path.join(os.environ["HOME"], "result.json"), "w") as f:\n'
             '    json.dump({"uid": os.getuid(), "gid": os.getgid(), "groups": os.getgroups(), '
-            '"cwd": os.getcwd(), "home": os.environ["HOME"], "readable": readable, '
+            '"cwd": os.getcwd(), "home": os.environ["HOME"], "readable": readable, "escaped": escaped, '
             '"env": sorted(os.environ)}, f)\n', encoding='ascii')
         mvn.chmod(0o755)
         pom = self.root / 'pom.xml'
         pom.write_text('<project/>', encoding='ascii')
-        self.cfg.update(java_home=str(java_home), maven_home=str(maven_home),
-                        migration_env_file='/unused')
-        values = {'LAB_MIGRATION_DB_URL': 'url', 'LAB_MIGRATION_DB_USER': 'user',
-                  'LAB_MIGRATION_DB_PASSWORD': 'password', 'LAB_MIGRATION_OWNER': 'owner'}
-        with mock.patch.object(deploy_linux, 'parse_env_file', return_value=values):
-            deploy_linux.run_flyway(self.cfg, pom, ['flyway:validate'])
+        env_file = self.root / 'migration.env'
+        env_file.write_text('LAB_MIGRATION_DB_URL=url\nLAB_MIGRATION_DB_USER=user\n'
+                            'LAB_MIGRATION_DB_PASSWORD=password\nLAB_MIGRATION_OWNER=owner\n',
+                            encoding='ascii')
+        env_file.chmod(0o600)
+        probe = self.fixture.run_controller_probe(
+            'from pathlib import Path\n'
+            'import deploy_linux\n'
+            'from types import SimpleNamespace\n'
+            'from unittest import mock\n'
+            f'migration = SimpleNamespace(pw_uid=65534, pw_gid=65534, pw_dir={str(self.home)!r}, '
+            'pw_shell="/usr/sbin/nologin")\n'
+            'service = SimpleNamespace(pw_uid=65533, pw_gid=65533)\n'
+            f'cfg.update(migration_user="migration", service_user="service", java_home={str(java_home)!r}, '
+            f'maven_home={str(maven_home)!r}, migration_env_file={str(env_file)!r})\n'
+            'with mock.patch.object(deploy_linux.pwd, "getpwnam", '
+            'side_effect=lambda name: {"migration": migration, "service": service}[name]):\n'
+            f'    deploy_linux.run_flyway(cfg, Path({str(pom)!r}), ["flyway:validate"])\n')
+        self.assertEqual(0, probe.returncode, probe.stderr)
         result = json.loads((self.home / 'result.json').read_text(encoding='ascii'))
         self.assertEqual((65534, 65534, []), (result['uid'], result['gid'], result['groups']))
         self.assertEqual(str(self.home), result['home'])
         self.assertEqual(str(self.home), result['cwd'])
         self.assertEqual([False, False], result['readable'])
+        self.assertFalse(result['escaped'])
         self.assertNotIn('LAB_DB_PASSWORD', result['env'])
+
+    def test_bootstrap_uses_migration_identity_and_removes_private_environment(self):
+        state = self.root / 'state'
+        state.mkdir(mode=0o700)
+        releases = self.root / 'releases'
+        releases.mkdir()
+        java_home = self.root / 'java'
+        (java_home / 'bin').mkdir(parents=True)
+        java = java_home / 'bin' / 'java'
+        password = 'complex \\"quoted\\" password'
+        java.write_text(
+            '#!/usr/bin/python3\n'
+            'import json, os\n'
+            'with open(os.path.join(os.environ["HOME"], "bootstrap.json"), "w") as f:\n'
+            '    json.dump({"uid": os.getuid(), "gid": os.getgid(), "groups": os.getgroups(), '
+            f'"password_ok": os.environ["LAB_BOOTSTRAP_PASSWORD"] == {password!r}, '
+            '"db_ok": os.environ["LAB_DB_PASSWORD"] == "runtime-secret"}, f)\n',
+            encoding='utf-8')
+        java.chmod(0o755)
+        runtime_env = self.root / 'runtime.env'
+        runtime_env.write_text('LAB_DB_URL=url\nLAB_DB_USER=user\nLAB_DB_PASSWORD=runtime-secret\n',
+                               encoding='utf-8')
+        runtime_env.chmod(0o600)
+        intent = self.root / 'intent.json'
+        intent.write_text(json.dumps({'login': 'admin', 'password': password,
+                                      'workspace_code': 'W', 'workspace_name': 'Workspace',
+                                      'business_date': '2026-01-01'}), encoding='utf-8')
+        intent.chmod(0o600)
+        probe = self.fixture.run_controller_probe(
+            'import deploy_linux\n'
+            'from contextlib import nullcontext\n'
+            'from types import SimpleNamespace\n'
+            'from unittest import mock\n'
+            f'migration = SimpleNamespace(pw_uid=65534, pw_gid=65534, pw_dir={str(self.home)!r}, '
+            'pw_shell="/usr/sbin/nologin")\n'
+            'service = SimpleNamespace(pw_uid=65533, pw_gid=65533)\n'
+            f'cfg.update(migration_user="migration", service_user="service", root={str(self.root)!r}, '
+            f'java_home={str(java_home)!r}, runtime_env_file={str(runtime_env)!r}, '
+            'environment="staging", database="lab", system_identifier="123")\n'
+            'with mock.patch.object(deploy_linux.pwd, "getpwnam", '
+            'side_effect=lambda name: {"migration": migration, "service": service}[name]), '
+            'mock.patch.object(deploy_linux, "verify_target_ownership"), '
+            'mock.patch.object(deploy_linux, "target_lock", return_value=nullcontext()), '
+            'mock.patch.object(deploy_linux, "verify_db_cluster_and_ownership"), '
+            'mock.patch.object(deploy_linux, "check_receipt"), '
+            'mock.patch.object(deploy_linux, "copy_release_immutable"), '
+            'mock.patch.object(deploy_linux.release, "verify_release", return_value={}), '
+            'mock.patch.object(deploy_linux, "initial_admin_receipt", return_value={"ok": True}):\n'
+            f'    deploy_linux.action_bootstrap(cfg, {str(self.root)!r}, {"a" * 40!r}, "1", '
+            f'{"b" * 64!r}, {str(intent)!r})\n')
+        self.assertEqual(0, probe.returncode, probe.stderr)
+        result = json.loads((self.home / 'bootstrap.json').read_text(encoding='utf-8'))
+        self.assertEqual((65534, 65534, []), (result['uid'], result['gid'], result['groups']))
+        self.assertTrue(result['password_ok'])
+        self.assertTrue(result['db_ok'])
+        self.assertEqual([], list(state.glob('.bootstrap-*.env')))
 
 
 if __name__ == '__main__':
