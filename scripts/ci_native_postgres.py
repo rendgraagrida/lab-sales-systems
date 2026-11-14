@@ -22,7 +22,7 @@ KEY_URL = 'https://www.postgresql.org/media/keys/ACCC4CF8.asc'
 REPOSITORY = 'https://apt.postgresql.org/pub/repos/apt/'
 RUNTIME = Path('/opt/lab-sales-recovery-runtime')
 SOURCE = Path('/etc/apt/sources.list.d/lab-sales-recovery-pgdg.list')
-KEYRING = Path('/usr/share/keyrings/lab-sales-recovery-pgdg.gpg')
+KEYRING = Path('/var/lib/lab-sales-recovery-pgdg.gpg')
 POLICY = Path('/usr/sbin/policy-rc.d')
 CLUSTER_CONFIG = Path('/etc/postgresql-common/createcluster.conf')
 OPT = Path('/opt')
@@ -32,6 +32,14 @@ OPT_STATE = Path('/var/lib/lab-sales-recovery-opt.json')
 def run(*args, env=None):
     return subprocess.run(args, check=True, text=True, stdout=subprocess.PIPE,
                           stderr=subprocess.STDOUT, env=env).stdout
+
+
+def trusted_directory(path):
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+        raise RuntimeError(
+            f'Untrusted system directory: {path} '
+            f'(uid={info.st_uid}, gid={info.st_gid}, mode={oct(stat.S_IMODE(info.st_mode))})')
 
 
 def guard_host():
@@ -44,19 +52,18 @@ def guard_host():
     values = dict(line.split('=', 1) for line in os_release.splitlines() if '=' in line)
     if values.get('ID', '').strip('"') != 'ubuntu' or values.get('VERSION_ID', '').strip('"') != '24.04':
         raise RuntimeError('Ubuntu 24.04 is required')
-    if run('dpkg', '--print-architecture').strip() != 'amd64' or not Path('/run/systemd/system').is_dir():
-        raise RuntimeError('amd64 dpkg and active systemd are required')
-    run('systemctl', 'show-environment')
-    for path in (SOURCE.parent, KEYRING.parent, POLICY.parent,
-                 CLUSTER_CONFIG.parent, OPT_STATE.parent):
-        info = path.lstat()
-        if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
-            raise RuntimeError(f'Untrusted system directory: {path}')
+    # Restoration needs only the trusted receipt parent, not working APT/systemd.
+    trusted_directory(OPT_STATE.parent)
     if not stat.S_ISDIR(OPT.lstat().st_mode):
         raise RuntimeError('/opt must be a real directory, not a symlink')
 
 
 def guard_prepare():
+    if run('dpkg', '--print-architecture').strip() != 'amd64' or not Path('/run/systemd/system').is_dir():
+        raise RuntimeError('amd64 dpkg and active systemd are required')
+    run('systemctl', 'show-environment')
+    for path in (SOURCE.parent, KEYRING.parent, POLICY.parent, CLUSTER_CONFIG.parent):
+        trusted_directory(path)
     for path in (RUNTIME, SOURCE, KEYRING, OPT_STATE):
         if os.path.lexists(path):
             raise RuntimeError(f'Refusing pre-existing path: {path}')
