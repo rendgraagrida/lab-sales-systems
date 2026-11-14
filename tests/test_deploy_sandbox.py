@@ -134,8 +134,8 @@ class NativeSandboxTests(unittest.TestCase):
             sandbox.validate(fixture.sandbox, fixture.target_id)
             with self.assertRaises(sandbox.SandboxError):
                 sandbox.validate(dict(fixture.sandbox, filesystem_uuid='12345678-1234-1234-1234-123456789abc'), fixture.target_id)
-            command = ['/bin/sh', '-c', 'id -u; id -g; id -G; touch "$HOME/ok"; '
-                       'touch /tmp/ok; if touch "$1/no" 2>/dev/null; then exit 7; fi',
+            command = ['/bin/sh', '-ec', 'id -u; id -g; id -G; touch "$HOME/ok"; '
+                       'touch /tmp/ok /var/tmp/ok /dev/shm/ok; if touch "$1/no" 2>/dev/null; then exit 7; fi',
                        'fixture', str(fixture.outside)]
             with self.assertRaises(sandbox.SandboxError):
                 sandbox.run_child(fixture.cfg, command, uid=fixture.migration_uid,
@@ -154,18 +154,20 @@ class NativeSandboxTests(unittest.TestCase):
     def test_child_tmpfs_limit_and_cgroup_membership(self):
         with SandboxFixture() as fixture:
             code = (
-                'import os\n'
+                'import errno, os\n'
                 'from pathlib import Path\n'
                 'group=Path("/proc/self/cgroup").read_text().strip().split("::",1)[1]\n'
                 'base=Path("/sys/fs/cgroup") / group.lstrip("/")\n'
                 'assert int((base/"memory.max").read_text()) == 268435456\n'
                 'assert int((base/"pids.max").read_text()) == 64\n'
                 'assert os.getgroups() == []\n'
+                'for folder in ("/tmp", "/var/tmp", "/dev/shm"):\n'
+                '    Path(folder, "writable").write_bytes(b"ok")\n'
                 'try:\n'
                 '    with open("/tmp/large","wb") as f:\n'
                 '        for _ in range(20): f.write(b"x"*1048576)\n'
-                'except OSError:\n'
-                '    pass\n'
+                'except OSError as error:\n'
+                '    assert error.errno == errno.ENOSPC, error\n'
                 'else:\n'
                 '    raise AssertionError("tmpfs limit not enforced")\n')
             source = (

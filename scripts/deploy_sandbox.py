@@ -140,12 +140,12 @@ def unit_directives(spec, target_id, purpose):
     directives = [f"Slice={spec['slice']}", f"MemoryMax={spec['memory_max_bytes']}",
                   'MemorySwapMax=0', f"CPUQuota={spec['cpu_quota_percent']}%",
                   f"TasksMax={spec['tasks_max']}", 'KillMode=control-group',
-                  'NoNewPrivileges=yes', 'ProtectSystem=strict', 'ProtectHome=yes',
+                  'NoNewPrivileges=yes', 'ProtectSystem=strict', 'ReadOnlyPaths=/run', 'ProtectHome=yes',
                   'PrivateDevices=yes', 'ProtectKernelTunables=yes', 'ProtectKernelModules=yes',
                   'ProtectControlGroups=yes', 'RestrictSUIDSGID=yes',
                   f'LogNamespace=lab-sales-{target_id}']
     for path in ('/tmp', '/var/tmp', '/dev/shm'):
-        directives.append(f"TemporaryFileSystem={path}:rw,nosuid,nodev,size={spec['temporary_bytes']}")
+        directives.append(f"TemporaryFileSystem={path}:rw,nosuid,nodev,mode=1777,size={spec['temporary_bytes']}")
     if purpose == 'controller':
         directives.extend([f"ReadWritePaths={spec['storage_root']}", 'ReadWritePaths=/etc/systemd/system'])
     return directives
@@ -184,6 +184,8 @@ def in_controller(spec, target_id):
                 or int((cgroup / 'pids.max').read_text()) != spec['tasks_max']
                 or quota == 'max' or int(quota) * 100 != int(period) * spec['cpu_quota_percent']):
             return False
+        if not os.statvfs('/run').f_flag & os.ST_RDONLY:
+            return False
         mounts = Path('/proc/self/mountinfo').read_text().splitlines()
         for path in ('/tmp', '/var/tmp', '/dev/shm'):
             entries = [line.split(' - ', 1) for line in mounts if line.split(' ')[4] == path]
@@ -191,6 +193,8 @@ def in_controller(spec, target_id):
                 return False
             fs = os.statvfs(path)
             if fs.f_blocks * fs.f_frsize > spec['temporary_bytes']:
+                return False
+            if stat.S_IMODE(os.stat(path).st_mode) != 0o1777:
                 return False
         return True
     except (OSError, ValueError, SandboxError):
