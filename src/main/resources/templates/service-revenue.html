@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en" xmlns:th="http://www.thymeleaf.org"><head th:replace="~{fragments :: head('Service revenue')}"></head>
+<body><header th:replace="~{fragments :: header('Service revenue')}"></header><main id="main">
+<h1>Service revenue recognition</h1>
+<p th:text="${'Business date: '+businessDate}"></p>
+<p>Recognize pending periods ending no later than the business and posting dates. A closed posting period is rejected. Opening-covered periods are not replayed.</p>
+<form method="post" th:action="${action}" th:with="form=${feedback.form('service-revenue',action)}">
+<section th:replace="~{fragments :: formErrors(${form})}"></section>
+<label>Posting date <input type="date" name="postingDate" required th:id="${form.id('postingDate')}" th:value="${form.value('postingDate',businessDate)}" th:attr="aria-invalid=${form.invalid('postingDate') ? 'true' : null},aria-describedby=${form.invalid('postingDate') ? form.errorId('postingDate') : null}"></label><p th:replace="~{fragments :: fieldError(${form},'postingDate',0)}"></p>
+<label>Run intent <input name="intentKey" maxlength="120" required th:id="${form.id('intentKey')}" th:value="${form.value('intentKey','')}" th:attr="aria-invalid=${form.invalid('intentKey') ? 'true' : null},aria-describedby=${form.invalid('intentKey') ? form.errorId('intentKey') : null}"></label><p th:replace="~{fragments :: fieldError(${form},'intentKey',0)}"></p>
+<button>Recognize eligible periods</button></form>
+<table><thead><tr><th>Term</th><th>Period</th><th>Start</th><th>End</th><th>Amount</th><th>State</th><th>Posting date</th></tr></thead><tbody><tr th:each="p : ${periods}"><td th:text="${p.record_key}"></td><td th:text="${p.period_no}"></td><td th:text="${p.period_start}"></td><td th:text="${p.period_end}"></td><td th:text="${p.amount}"></td><td th:text="${p.state}"></td><td th:text="${p.posting_date}"></td></tr></tbody></table>
+<section th:replace="~{fragments :: formFallback(${feedback})}"></section><a th:href="${contextBase+'/finance'}">Finance</a>
+</main><footer th:replace="~{fragments :: footer()}"></footer></body></html>

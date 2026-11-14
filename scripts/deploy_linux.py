@@ -566,8 +566,8 @@ def action_migrate(cfg, release_dir, revision, run_id, manifest_sha):
         applied_versions = ''
         if history_exists == 't':
             applied_versions = run_psql(cfg, "SELECT COALESCE(string_agg(version, ',' ORDER BY installed_rank), '') FROM app.flyway_schema_history WHERE success AND type='SQL';", db_name=cfg['database'])
-            bad = run_psql(cfg, "SELECT count(*) FROM app.flyway_schema_history WHERE NOT success OR type NOT IN ('SQL','SCHEMA') OR (type='SQL' AND (version IS NULL OR script IS NULL OR checksum IS NULL OR (version,script) NOT IN (('1','V1__identity.sql'),('2','V2__masters.sql'),('3','V3__finance.sql'),('4','V4__procurement_inventory_ap.sql'),('5','V5__local_crm_goods_o2c.sql'))));", db_name=cfg['database'])
-            if applied_versions not in ('1,2,3,4', '1,2,3,4,5') or bad != '0':
+            bad = run_psql(cfg, "SELECT count(*) FROM app.flyway_schema_history WHERE NOT success OR type NOT IN ('SQL','SCHEMA') OR (type='SQL' AND (version IS NULL OR script IS NULL OR checksum IS NULL OR (version,script) NOT IN (('1','V1__identity.sql'),('2','V2__masters.sql'),('3','V3__finance.sql'),('4','V4__procurement_inventory_ap.sql'),('5','V5__local_crm_goods_o2c.sql'),('6','V6__assets_service_contracts.sql'),('7','V7__draft_service_invoice_source_guard.sql'))));", db_name=cfg['database'])
+            if applied_versions not in ('1,2,3,4', '1,2,3,4,5', '1,2,3,4,5,6', '1,2,3,4,5,6,7') or bad != '0':
                 fail('Partial or unexpected Flyway history')
         else:
             objects = run_psql(cfg, "SELECT (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='app') + (SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='app') + (SELECT count(*) FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace WHERE n.nspname='app' AND t.typrelid=0);", db_name=cfg['database'])
@@ -582,18 +582,18 @@ def action_migrate(cfg, release_dir, revision, run_id, manifest_sha):
         )
         if foreign_schemas != '0':
             fail("Foreign or unowned tables found in database; refusing migration")
-        if applied_versions != '1,2,3,4,5' and (main_pid or state not in ('inactive', 'failed')):
+        if applied_versions != ','.join(database.SCHEMA_VERSIONS) and (main_pid or state not in ('inactive', 'failed')):
             fail('Service must be inactive for schema migration')
         dest = paths['releases'] / manifest_sha
         copy_release_immutable(Path(release_dir), dest)
         release.verify_release(str(dest), revision, run_id, manifest_sha)
         release_dir = str(dest)
 
-        if applied_versions == '1,2,3,4,5':
+        if applied_versions == ','.join(database.SCHEMA_VERSIONS):
             run_flyway(cfg, Path(release_dir) / 'migration' / 'pom.xml', ['flyway:validate'])
         else:
-            if applied_versions == '1,2,3,4':
-                run_flyway(cfg, Path(release_dir) / 'migration' / 'pom.xml', ['-Dflyway.target=4', 'flyway:validate'])
+            if applied_versions in ('1,2,3,4', '1,2,3,4,5', '1,2,3,4,5,6'):
+                run_flyway(cfg, Path(release_dir) / 'migration' / 'pom.xml', ['-Dflyway.target=' + applied_versions[-1], 'flyway:validate'])
             run_flyway(cfg, Path(release_dir) / 'migration' / 'pom.xml', ['flyway:migrate', 'flyway:validate'])
         require_schema_compatible(cfg, release_dir)
 

@@ -16,10 +16,11 @@ import org.springframework.stereotype.Component;
 
 @Component
 public final class SchemaState implements ApplicationRunner {
-    public static final int VERSION = 5;
+    public static final int VERSION = 7;
     private static final List<String> MIGRATIONS = List.of(
         "V1__identity.sql", "V2__masters.sql", "V3__finance.sql", "V4__procurement_inventory_ap.sql",
-        "V5__local_crm_goods_o2c.sql");
+        "V5__local_crm_goods_o2c.sql", "V6__assets_service_contracts.sql",
+        "V7__draft_service_invoice_source_guard.sql");
     private static final List<Integer> CHECKSUMS = MIGRATIONS.stream().map(SchemaState::checksum).toList();
     private final JdbcTemplate db;
     private final String revision;
@@ -51,7 +52,7 @@ public final class SchemaState implements ApplicationRunner {
             """, Boolean.class);
         if (!matchesMigrations(applied) || unexpected == null || unexpected != 0
                 || !Boolean.FALSE.equals(privileged)) {
-            throw new IllegalStateException("Expected M3 schema and non-owner runtime identity are required.");
+            throw new IllegalStateException("Expected M4 schema and non-owner runtime identity are required.");
         }
         Integer catalogue = db.queryForObject("select count(*) from app.roles where code in ('INSIDE_SALES','SALES_MANAGER','OPERATIONS','FINANCE','SYSTEM_ADMIN')", Integer.class);
         Integer routines = db.queryForObject("""
@@ -63,11 +64,12 @@ public final class SchemaState implements ApplicationRunner {
                 'crm_mutable_guard','crm_association_guard','m3_fulfillment_header_guard','m3_fulfillment_child_guard','m3_reservation_guard',
                 'm3_receivables_document_guard','m3_receivables_child_guard','commercial_order_guard',
                 'commercial_quote_guard','commercial_order_sealed_check','m3_price_approval_guard',
-                'm3_product_publication_guard','m3_product_source_guard')
+                'm3_product_publication_guard','m3_product_source_guard','m4_serial_guard','m4_source_guard',
+                'm4_mutable_guard','m4_order_snapshot_guard','m4_deferred_guard','m4_lineage_guard')
               and has_function_privilege(current_user,p.oid,'EXECUTE')
             """, Integer.class);
-        if (catalogue == null || catalogue != 5 || routines == null || routines != 22) {
-            throw new IllegalStateException("Expected M3 role catalogue and restricted invoker functions are required.");
+        if (catalogue == null || catalogue != 5 || routines == null || routines != 28) {
+            throw new IllegalStateException("Expected M4 role catalogue and restricted invoker functions are required.");
         }
         return Map.of("status", "UP", "application", "lab-sales-systems", "schemaVersion", VERSION,
                       "revision", revision, "mode", "LOCAL_SIMULATION");

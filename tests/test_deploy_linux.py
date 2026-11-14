@@ -60,7 +60,7 @@ class RollbackHistoryTests(unittest.TestCase):
 class SchemaCompatibilityTests(unittest.TestCase):
     def test_exact_lineage_and_checksum_required(self):
         cfg = {'database': 'lab'}
-        expected = '1|V1__identity.sql|10,2|V2__masters.sql|20,3|V3__finance.sql|30,4|V4__procurement_inventory_ap.sql|40,5|V5__local_crm_goods_o2c.sql|50'
+        expected = '1|V1__identity.sql|10,2|V2__masters.sql|20,3|V3__finance.sql|30,4|V4__procurement_inventory_ap.sql|40,5|V5__local_crm_goods_o2c.sql|50,6|V6__assets_service_contracts.sql|60,7|V7__draft_service_invoice_source_guard.sql|70'
         for actual, bad, accepted in ((expected, '0', True), (expected.rsplit(',', 1)[0], '0', False),
                                       (expected.replace('|50', '|51'), '0', False), (expected, '1', False)):
             with self.subTest(actual=actual, bad=bad), \
@@ -117,6 +117,14 @@ class SchemaCompatibilityTests(unittest.TestCase):
                 systemctl.assert_called_once_with('stop', 'lab.service')
             self.assertEqual('candidate unit', unit.read_text(encoding='ascii'))
 
+    def test_old_release_refused_against_schema6(self):
+        cfg = {'database': 'lab'}
+        old = '1|v1|1,2|v2|2,3|v3|3,4|v4|4,5|v5|5'
+        with mock.patch.object(deploy_linux.release, 'schema_identity', return_value=old), \
+                mock.patch.object(deploy_linux, 'run_psql', side_effect=[old + ',6|v6|6', '0']):
+            with self.assertRaises(deploy_linux.DeployError):
+                deploy_linux.require_schema_compatible(cfg, '/release')
+
     def test_v4_upgrade_requires_inactive_service_then_validates_before_migrating(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -134,7 +142,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
                         mock.patch.object(deploy_linux, 'verify_db_cluster_and_ownership'), \
                         mock.patch.object(deploy_linux, 'read_json', return_value={}), \
                         mock.patch.object(deploy_linux, 'verify_unit_ownership'), \
-                        mock.patch.object(deploy_linux.release, 'verify_release', return_value={'schema_versions': ['1', '2', '3', '4', '5']}), \
+                        mock.patch.object(deploy_linux.release, 'verify_release', return_value={'schema_versions': ['1', '2', '3', '4', '5', '6', '7']}), \
                         mock.patch.object(deploy_linux, 'get_systemd_main_pid', return_value=service), \
                         mock.patch.object(deploy_linux, 'run_psql', side_effect=history), \
                         mock.patch.object(deploy_linux, 'copy_release_immutable'), \

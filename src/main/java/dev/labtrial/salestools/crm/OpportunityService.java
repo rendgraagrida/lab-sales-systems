@@ -70,6 +70,41 @@ public class OpportunityService {
         if (value==null || value.isBlank() || value.trim().length()>max) throw new DomainException(400,"A valid "+field+" is required",field);
         return value.trim();
     }
+    @Transactional(propagation = org.springframework.transaction.annotation.Propagation.MANDATORY)
+    public long createRenewal(AccessControl.Scope scope,long renewalIntentId,long ownerId,long ownerSecurityVersion) {
+        long ws=scope.workspaceId(), entity=scope.entityId();
+        var authorized=access.requireContext(ws,entity,true,"INSIDE_SALES","SALES_MANAGER");
+        if(authorized.actor().id()!=scope.actor().id()) throw new DomainException(403,"Actor changed");
+        requireOwner(ws,entity,ownerId);
+        Boolean current=db.queryForObject("select exists(select 1 from app_users where id=? and active and security_version=?)",Boolean.class,ownerId,ownerSecurityVersion);
+        if(!Boolean.TRUE.equals(current)) throw new DomainException(409,"Owner security reference changed");
+        var sources=db.queryForList("""
+            select i.customer_account_id,i.opportunity_id,i.status,i.target_start,t.coverage_end,
+                   t.currency,p.sku,a.serial
+            from renewal_intents i
+            join service_contract_terms t on t.workspace_id=i.workspace_id and t.entity_id=i.entity_id and t.id=i.predecessor_term_id
+            join installed_instruments a on a.workspace_id=t.workspace_id and a.entity_id=t.entity_id and a.id=t.asset_id
+            join products p on p.workspace_id=t.workspace_id and p.id=t.plan_product_id
+            join service_contract_assets link on link.workspace_id=t.workspace_id and link.entity_id=t.entity_id and link.id=t.contract_asset_id and link.asset_id=t.asset_id and link.contract_id=i.contract_id
+            join service_contracts c on c.workspace_id=i.workspace_id and c.entity_id=i.entity_id and c.id=i.contract_id
+            join customer_entity_accounts ca on ca.workspace_id=i.workspace_id and ca.entity_id=i.entity_id and ca.id=i.customer_account_id and ca.active
+            join scenario_workspaces clock on clock.id=i.workspace_id
+            where i.workspace_id=? and i.entity_id=? and i.id=? and t.status='VALIDATED'
+              and c.customer_account_id=i.customer_account_id and a.customer_account_id=i.customer_account_id
+              and i.target_start=t.coverage_end and i.target_start>clock.business_date
+            for update of i,t
+            """,ws,entity,renewalIntentId);
+        if(sources.size()!=1) throw new DomainException(409,"Renewal source is unavailable or changed");
+        var source=sources.get(0);
+        if(source.get("opportunity_id")!=null) return ((Number)source.get("opportunity_id")).longValue();
+        if(!"OPEN".equals(source.get("status"))) throw new DomainException(409,"Renewal intent is not open");
+        String title="Renewal "+source.get("sku")+" / "+source.get("serial")+" / "+source.get("target_start");
+        String reason="Renewal intent "+renewalIntentId+"; currency "+source.get("currency");
+        long id=db.queryForObject("INSERT INTO crm_opportunities(workspace_id,entity_id,customer_account_id,title,pipeline,stage,owner_id,created_by) VALUES (?,?,?,?,'SERVICE_RENEWAL','QUALIFIED',?,?) RETURNING id",Long.class,ws,entity,source.get("customer_account_id"),title,ownerId,scope.actor().id());
+        db.update("INSERT INTO crm_opportunity_events(workspace_id,entity_id,opportunity_id,version,stage,reason,actor_id) VALUES (?,?,?,1,'QUALIFIED',?,?)",ws,entity,id,reason,scope.actor().id());
+        audit.record(scope.actor(),ws,entity,"QUALIFY","crm_opportunities",Long.toString(id),1,"SUCCESS",reason);
+        return id;
+    }
     @Transactional
     public long qualify(long ws,long entity,Qualification command) {
         var scope=access.requireContext(ws,entity,true,"INSIDE_SALES","SALES_MANAGER");

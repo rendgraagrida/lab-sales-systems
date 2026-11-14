@@ -23,7 +23,9 @@ POM = 'META-INF/maven/dev.labtrial/lab-sales-systems/pom.xml'
 SQL_PREFIX = 'BOOT-INF/classes/db/foundation/'
 LEGACY_SQL_NAMES = ('V1__identity.sql', 'V2__masters.sql', 'V3__finance.sql')
 V4_SQL_NAMES = LEGACY_SQL_NAMES + ('V4__procurement_inventory_ap.sql',)
-SQL_NAMES = V4_SQL_NAMES + ('V5__local_crm_goods_o2c.sql',)
+V5_SQL_NAMES = V4_SQL_NAMES + ('V5__local_crm_goods_o2c.sql',)
+V6_SQL_NAMES = V5_SQL_NAMES + ('V6__assets_service_contracts.sql',)
+SQL_NAMES = V6_SQL_NAMES + ('V7__draft_service_invoice_source_guard.sql',)
 NS = '{http://maven.apache.org/POM/4.0.0}'
 
 
@@ -50,7 +52,7 @@ def derived(jar):
                 selected[name] = archive.read(item)
         names = tuple(name for name in SQL_NAMES if SQL_PREFIX + name in selected)
         expected = {POM} | {SQL_PREFIX + name for name in names}
-        if set(selected) != expected or names not in (LEGACY_SQL_NAMES, V4_SQL_NAMES, SQL_NAMES):
+        if set(selected) != expected or names not in (LEGACY_SQL_NAMES, V4_SQL_NAMES, V5_SQL_NAMES, V6_SQL_NAMES, SQL_NAMES):
             raise ReleaseError('unexpected embedded migration lineage or POM')
     data = selected[POM]
     if b'<!DOCTYPE' in data.upper() or b'<!ENTITY' in data.upper():
@@ -178,6 +180,8 @@ def verify_release(directory, revision, run_id, manifest_sha256):
                 or manifest['run_id'] != run_id or manifest['schema_versions'] not in
                 ([str(i) for i in range(1, len(LEGACY_SQL_NAMES) + 1)],
                  [str(i) for i in range(1, len(V4_SQL_NAMES) + 1)],
+                 [str(i) for i in range(1, len(V5_SQL_NAMES) + 1)],
+                 [str(i) for i in range(1, len(V6_SQL_NAMES) + 1)],
                  [str(i) for i in range(1, len(SQL_NAMES) + 1)])):
             raise ReleaseError('invalid release manifest identity')
         names = SQL_NAMES[:len(manifest['schema_versions'])]

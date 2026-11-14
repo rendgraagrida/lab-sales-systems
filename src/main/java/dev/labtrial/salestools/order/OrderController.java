@@ -53,12 +53,16 @@ public class OrderController {
             from sales_invoices i where i.workspace_id=? and i.entity_id=? and i.status='POSTED' and i.invoice_date<=?
               and not exists (select 1 from sales_reversals r where r.workspace_id=i.workspace_id and r.entity_id=i.entity_id and r.invoice_id=i.id and r.reversal_date<=?)
               and exists (select 1 from sales_invoice_lines l
-                join shipment_lines sl on sl.workspace_id=l.workspace_id and sl.entity_id=l.entity_id and sl.id=l.shipment_line_id
-                join sales_order_lines ol on ol.workspace_id=sl.workspace_id and ol.entity_id=sl.entity_id and ol.id=sl.order_line_id
+                left join shipment_lines sl on sl.workspace_id=l.workspace_id and sl.entity_id=l.entity_id and sl.id=l.shipment_line_id
+                left join sales_service_obligations so on so.workspace_id=l.workspace_id and so.entity_id=l.entity_id and so.id=l.service_obligation_id
+                left join service_contract_terms st on st.workspace_id=l.workspace_id and st.entity_id=l.entity_id and st.id=l.service_term_id
+                left join sales_service_obligations sto on sto.workspace_id=st.workspace_id and sto.entity_id=st.entity_id and sto.id=st.source_obligation_id
+                join sales_order_lines ol on ol.workspace_id=l.workspace_id and ol.entity_id=l.entity_id and ol.id=coalesce(sl.order_line_id,so.order_line_id,sto.order_line_id)
                 where l.workspace_id=i.workspace_id and l.entity_id=i.entity_id and l.invoice_id=i.id and l.active and ol.order_id=?)
             order by i.invoice_date,i.id
             """,day,day,workspaceId,entityId,day,day,id) : java.util.List.<java.util.Map<String,Object>>of();
         model.addAttribute("invoices",invoices);
+        model.addAttribute("obligations",db.queryForList("select so.id,so.order_line_id,so.unit_no,so.kind,so.status,so.asset_id,st.id term_id from sales_service_obligations so join sales_order_lines l on l.workspace_id=so.workspace_id and l.entity_id=so.entity_id and l.id=so.order_line_id left join service_contract_terms st on st.workspace_id=so.workspace_id and st.entity_id=so.entity_id and st.source_obligation_id=so.id where l.workspace_id=? and l.entity_id=? and l.order_id=? order by l.id,so.unit_no",workspaceId,entityId,id));
         model.addAttribute("commercial",commercial);
         model.addAttribute("base",base(workspaceId,entityId)); model.addAttribute("root","/w/"+workspaceId+"/e/"+entityId); model.addAttribute("order",rows.get(0)); model.addAttribute("lines",lines); model.addAttribute("asOf",day); return "sales-order-detail";
     }

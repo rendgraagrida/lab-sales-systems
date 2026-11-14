@@ -25,7 +25,7 @@ public class PostingService {
     @Transactional(propagation = Propagation.MANDATORY)
     public Result post(AccessControl.Scope scope, String sourceType, String sourceId, String postingKey,
                        LocalDate date, String currency, String description, List<Ledger.Line> lines) {
-        return postInternal(scope, sourceType, sourceId, postingKey, date, currency, description, lines, null);
+        return postInternal(scope, sourceType, sourceId, postingKey, date, currency, description, lines, null, false);
     }
 
     @Transactional(propagation = Propagation.MANDATORY)
@@ -41,11 +41,32 @@ public class PostingService {
         if (date.isBefore(originalDate)) throw new DomainException(400, "Reversal predates original journal");
         var lines = db.query("select account_id,credit,debit from journal_lines where workspace_id=? and entity_id=? and journal_id=? order by id", (rs,n) -> new Ledger.Line(rs.getLong(1), rs.getBigDecimal(2), rs.getBigDecimal(3)), scope.workspaceId(), scope.entityId(), originalJournalId);
         return postInternal(scope, "REVERSAL", Long.toString(originalJournalId), postingKey, date,
-                (String) original[1], reason, lines, originalJournalId);
+                (String) original[1], reason, lines, originalJournalId, true);
+    }
+
+    @Transactional(propagation = Propagation.MANDATORY)
+    Result reverseAdjusted(AccessControl.Scope supplied, long originalJournalId, String postingKey,
+                           LocalDate date, String reason, List<Ledger.Line> lines) {
+        var scope=checkedScope(supplied);
+        if (originalJournalId<=0 || date==null || reason==null || reason.isBlank() || reason.length()>500)
+            throw new DomainException(400,"Invalid reversal");
+        var originals=db.query("select posting_date,currency from journal_entries where workspace_id=? and entity_id=? and id=? and state='POSTED' for update",
+                (rs,n)->new Object[]{rs.getObject(1,LocalDate.class),rs.getString(2)},scope.workspaceId(),scope.entityId(),originalJournalId);
+        if (originals.size()!=1) throw new DomainException(404,"Journal not found");
+        if (date.isBefore((LocalDate)originals.get(0)[0])) throw new DomainException(400,"Reversal predates original journal");
+        return postInternal(scope,"REVERSAL",Long.toString(originalJournalId),postingKey,date,
+                (String)originals.get(0)[1],reason,lines,originalJournalId, true);
+    }
+
+    @Transactional(propagation = Propagation.MANDATORY)
+    Result postServiceReclassification(AccessControl.Scope scope,String sourceId,String key,LocalDate date,
+                                       String currency,List<Ledger.Line> lines) {
+        return postInternal(scope,"SERVICE_RECLASSIFICATION",sourceId,key,date,currency,
+                "Service balance reclassification",lines,null,true);
     }
 
     private Result postInternal(AccessControl.Scope supplied, String sourceType, String sourceId, String postingKey,
-                                LocalDate date, String currency, String description, List<Ledger.Line> lines, Long reverseOf) {
+                                LocalDate date, String currency, String description, List<Ledger.Line> lines, Long reverseOf, boolean historical) {
         AccessControl.Scope scope = checkedScope(supplied);
         if (!text(sourceType, 80) || !text(sourceId, 120) || !text(postingKey, 160) || date == null || !text(currency, 3)
                 || description == null || description.length() > 500 || lines == null || lines.size() > 300)
@@ -70,13 +91,13 @@ public class PostingService {
         if (!currency.equals(entities.get(0).get("base_currency"))) throw new DomainException(400, "Currency must match entity");
         var periods = db.queryForList("select status from fiscal_periods where workspace_id=? and entity_id=? and ? between starts_on and ends_on for update", scope.workspaceId(), scope.entityId(), date);
         if (periods.size() != 1 || !"OPEN".equals(periods.get(0).get("status"))) throw new DomainException(409, "Posting requires an open fiscal period");
-        if (reverseOf == null) validateMappedAccountRoles(scope);
+        if (!historical) validateMappedAccountRoles(scope);
         if (debit.signum()==0) return new Result(null, false);
         if (reverseOf != null && !db.queryForList("select id from journal_entries where workspace_id=? and entity_id=? and reverse_of=?", scope.workspaceId(), scope.entityId(), reverseOf).isEmpty())
             throw new DomainException(409, "Journal already reversed");
         for (Ledger.Line line : lines) {
             if (line.debit().signum()==0 && line.credit().signum()==0) continue;
-            Integer count = db.queryForObject("select count(*) from chart_accounts where workspace_id=? and entity_id=? and id=?" + (reverseOf == null ? " and active" : ""), Integer.class, scope.workspaceId(), scope.entityId(), line.accountId());
+            Integer count = db.queryForObject("select count(*) from chart_accounts where workspace_id=? and entity_id=? and id=?" + (historical ? "" : " and active"), Integer.class, scope.workspaceId(), scope.entityId(), line.accountId());
             if (count == null || count != 1) throw new DomainException(400, "Invalid account");
         }
         db.update("insert into document_sequences(workspace_id,entity_id,document_type,next_value) values (?,?,'BUSINESS',1) on conflict (workspace_id,entity_id,document_type) do nothing", scope.workspaceId(), scope.entityId());
@@ -104,7 +125,14 @@ public class PostingService {
                     or exists(select 1 from procurement_posting_config p where p.workspace_id=s.workspace_id and p.entity_id=s.entity_id
                       and (p.inventory_account_id in (s.ar_account_id,s.unbilled_account_id) or p.adjustment_gain_account_id=s.revenue_account_id
                         or p.adjustment_loss_account_id=s.cogs_account_id or p.service_expense_account_id=s.cogs_account_id))))
-            """, Boolean.class, scope.workspaceId(), scope.entityId(), scope.workspaceId(), scope.entityId(), scope.workspaceId(), scope.entityId());
+              or exists(select 1 from service_posting_config s where s.workspace_id=? and s.entity_id=?
+                  and (exists(select 1 from procurement_posting_config p where p.workspace_id=s.workspace_id and p.entity_id=s.entity_id
+                        and (s.deferred_account_id in (p.ap_account_id,p.grni_account_id)
+                          or p.adjustment_gain_account_id in (s.implementation_revenue_account_id,s.service_revenue_account_id)))
+                    or exists(select 1 from tax_versions t where t.workspace_id=s.workspace_id and t.entity_id=s.entity_id and t.output_account_id=s.deferred_account_id)
+                    or exists(select 1 from sales_posting_config g where g.workspace_id=s.workspace_id and g.entity_id=s.entity_id
+                        and g.revenue_account_id in (s.implementation_revenue_account_id,s.service_revenue_account_id))))
+            """, Boolean.class, scope.workspaceId(), scope.entityId(), scope.workspaceId(), scope.entityId(), scope.workspaceId(), scope.entityId(), scope.workspaceId(), scope.entityId());
         if (Boolean.TRUE.equals(conflict))
             throw new DomainException(409, "Posting account roles conflict; correct configuration before creating new effects");
     }

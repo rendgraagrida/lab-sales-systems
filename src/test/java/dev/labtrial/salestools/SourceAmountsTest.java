@@ -66,4 +66,23 @@ class SourceAmountsTest {
         assertThrows(DomainException.class, () -> SourceAmounts.price(decimal("999999999999"), decimal("999999999999"), null, null, decimal("7"), 0));
         assertThrows(DomainException.class, () -> SourceAmounts.price(decimal("0"), decimal("1"), null, null, decimal("7"), 0));
     }
+    @Test void partialServiceFeeBillingPreservesDiscountAndTaxWithoutFractionalCoverage() {
+        var first=SourceAmounts.feeSlice(decimal("0.06"),decimal("0.02"),decimal("0.01"),decimal("0.00"),decimal("0.02"));
+        var middle=SourceAmounts.feeSlice(decimal("0.06"),decimal("0.02"),decimal("0.01"),decimal("0.02"),decimal("0.04"));
+        var last=SourceAmounts.feeSlice(decimal("0.06"),decimal("0.02"),decimal("0.01"),decimal("0.04"),decimal("0.06"));
+        amount("0.01",first.discount()); amount("0.00",middle.discount()); amount("0.01",last.discount());
+        amount("0.00",first.tax()); amount("0.01",middle.tax()); amount("0.00",last.tax());
+        amount("0.08",first.subtotal().add(middle.subtotal()).add(last.subtotal()));
+        amount("0.07",first.gross().add(middle.gross()).add(last.gross()));
+    }
+
+    @Test void serviceFeeCoordinatesUseMoneyCapacityAndRejectUnbillableOrUnsafeRanges() {
+        var lastCent=SourceAmounts.feeSlice(decimal("9999999999999999.99"),decimal("0"),decimal("0"),
+                decimal("9999999999999999.98"),decimal("9999999999999999.99"));
+        amount("0.01",lastCent.net());
+        assertThrows(DomainException.class,()->SourceAmounts.feeSlice(decimal("0"),decimal("0"),decimal("0"),decimal("0"),decimal("0.01")));
+        assertThrows(DomainException.class,()->SourceAmounts.feeSlice(decimal("1"),decimal("0"),decimal("0"),decimal("0"),decimal("1.01")));
+        assertThrows(DomainException.class,()->SourceAmounts.feeSlice(decimal("1"),decimal("0"),decimal("0"),decimal("0"),decimal("0.001")));
+        assertThrows(DomainException.class,()->SourceAmounts.feeSlice(decimal("1"),decimal("0"),decimal("0"),decimal("1e2147483647"),decimal("1")));
+    }
 }

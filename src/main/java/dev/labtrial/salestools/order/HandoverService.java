@@ -4,6 +4,7 @@ import dev.labtrial.salestools.core.AuditLog;
 import dev.labtrial.salestools.finance.SalesPostingConfigService;
 import dev.labtrial.salestools.core.DomainException;
 import dev.labtrial.salestools.identity.AccessControl;
+import dev.labtrial.salestools.service.ServiceObligationService;
 import java.util.ArrayList;
 import java.util.List;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -20,11 +21,13 @@ public class HandoverService {
     private final AccessControl access;
     private final AuditLog audit;
     private final SalesPostingConfigService postingConfig;
+    private final ServiceObligationService obligations;
 
-    public HandoverService(JdbcTemplate db, AccessControl access, AuditLog audit, SalesPostingConfigService postingConfig) {
+    public HandoverService(JdbcTemplate db, AccessControl access, AuditLog audit, SalesPostingConfigService postingConfig, ServiceObligationService obligations) {
         this.db = db;
         this.access = access;
         this.postingConfig = postingConfig;
+        this.obligations = obligations;
         this.audit = audit;
     }
 
@@ -104,8 +107,9 @@ public class HandoverService {
         long number=db.queryForObject("update document_sequences set next_value=next_value+1,version=version+1 where workspace_id=? and entity_id=? and document_type='SO' returning next_value-1",Long.class,w,e);
         long order=db.queryForObject("insert into sales_orders(workspace_id,entity_id,number,quote_id,quote_revision_id,customer_account_id,customer_account_version,currency,terms_days,business_date,accepted_reference,source_hash,config_version,created_by) select workspace_id,entity_id,?,quote_id,id,?,?,currency,terms_days,business_date,accepted_reference,payload_hash,config_version,? from quote_revisions where workspace_id=? and entity_id=? and id=? returning id",Long.class,
             "SO-"+number,roots.get(0)[1],revision.get("customer_account_version"),scope.actor().id(),w,e,revisionId);
-        db.update("insert into sales_order_lines(workspace_id,entity_id,order_id,quote_line_id,line_key,product_id,product_version,product_setting_version,uom_id,uom_version,tracking,quantity_scale,quantity,unit_price,subtotal,discount,net,tax,gross,tax_version_id,tax_rate_pct,output_account_id,ar_account_id,unbilled_account_id,revenue_account_id,cogs_account_id,inventory_account_id) select workspace_id,entity_id,?,id,line_key,product_id,product_version,product_setting_version,uom_id,uom_version,tracking,quantity_scale,quantity,unit_price,subtotal,discount,net,tax,gross,tax_version_id,tax_rate_pct,output_account_id,ar_account_id,unbilled_account_id,revenue_account_id,cogs_account_id,inventory_account_id from quote_lines where workspace_id=? and entity_id=? and revision_id=? and active order by ordinal,id",order,w,e,revisionId);
+        db.update("insert into sales_order_lines(workspace_id,entity_id,order_id,quote_line_id,line_key,product_id,product_version,product_setting_version,product_category,uom_id,uom_version,tracking,quantity_scale,quantity,unit_price,subtotal,discount,net,tax,gross,tax_version_id,tax_rate_pct,output_account_id,ar_account_id,unbilled_account_id,revenue_account_id,cogs_account_id,inventory_account_id,deferred_account_id,service_config_version,service_product_version_id) select workspace_id,entity_id,?,id,line_key,product_id,product_version,product_setting_version,product_category,uom_id,uom_version,tracking,quantity_scale,quantity,unit_price,subtotal,discount,net,tax,gross,tax_version_id,tax_rate_pct,output_account_id,ar_account_id,unbilled_account_id,revenue_account_id,cogs_account_id,inventory_account_id,deferred_account_id,service_config_version,service_product_version_id from quote_lines where workspace_id=? and entity_id=? and revision_id=? and active order by ordinal,id",order,w,e,revisionId);
         db.update("update sales_orders set sealed=true,version=version+1 where workspace_id=? and entity_id=? and id=? and not sealed",w,e,order);
+        obligations.createFromAcceptedOrder(scope,order);
         db.update("insert into sales_handover_executions(workspace_id,entity_id,intent,quote_id,quote_revision_id,order_id,created_by) values (?,?,?,?,?,?,?)",w,e,key,quoteId,revisionId,order,scope.actor().id());
         audit.record(scope.actor(),w,e,"BOOK","sales_orders",Long.toString(order),2,"SUCCESS","accepted quote");
         return new ExecuteResult(order,false);

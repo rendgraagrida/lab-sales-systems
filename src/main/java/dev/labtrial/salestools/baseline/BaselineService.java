@@ -3,10 +3,15 @@ package dev.labtrial.salestools.baseline;
 import dev.labtrial.salestools.core.AuditLog;
 import dev.labtrial.salestools.core.DomainException;
 import dev.labtrial.salestools.finance.Ledger;
+import dev.labtrial.salestools.finance.ServiceRevenueService;
 import dev.labtrial.salestools.identity.AccessControl;
+import dev.labtrial.salestools.service.AssetService;
+import dev.labtrial.salestools.service.TermService;
 import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.util.List;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -46,18 +51,42 @@ public class BaselineService {
         "SIM-VAT7","Synthetic VAT 7%",new BigDecimal("7"),"EUR-2027","EUR catalog","EUR",LocalDate.of(2027,1,15),
         "RGA-SUPPLIER-001","Nuvarek Components","ops@nuvarek.example","SIM-RGA-TR120-00002","SIM-LOT-CS080-001","O2C goods opening",0,6,
         new BigDecimal("1"),new BigDecimal("12000.00"),new BigDecimal("20"),new BigDecimal("55.00"),new BigDecimal("1800.00"));
+    private record ServiceFixture(List<Account> accounts,List<Integer> serviceProducts,int durationMonths,
+        String coverageCode,String coverageName,String legacySerial,String assetKey,String contractKey,String termKey,
+        LocalDate installationDate,LocalDate coverageStart,LocalDate coverageEnd,BigDecimal netFee,BigDecimal billed,
+        BigDecimal earned,String evidence,String billingReference,String settlementReference,String openingDescription) {}
+    private static final ServiceFixture SERVICES = new ServiceFixture(List.of(
+        new Account("AR","Customer receivables","ASSET"),new Account("UNBILLED","Unbilled revenue","ASSET"),
+        new Account("GOODS_REVENUE","Goods revenue","INCOME"),new Account("COGS","Cost of goods sold","EXPENSE"),
+        new Account("DEFERRED","Deferred service revenue","LIABILITY"),
+        new Account("IMPLEMENTATION_REVENUE","Implementation revenue","INCOME"),
+        new Account("SERVICE_REVENUE","Service revenue","INCOME"),
+        new Account("AP","Supplier payables","LIABILITY"),new Account("GRNI","Goods received not invoiced","LIABILITY"),
+        new Account("ADJUSTMENT_GAIN","Inventory adjustment gain","INCOME"),
+        new Account("ADJUSTMENT_LOSS","Inventory adjustment loss","EXPENSE"),
+        new Account("SERVICE_EXPENSE","Purchased service expense","EXPENSE")),
+        List.of(10,11,14),12,"ASSURANCE","Exclusive assurance coverage",
+        "SIM-RGA-TR120-00001","RGA-ASSET-001","RGA-CONTRACT-001","RGA-TERM-001",
+        LocalDate.of(2026,4,15),LocalDate.of(2026,4,15),LocalDate.of(2027,4,15),
+        new BigDecimal("1800.00"),new BigDecimal("1800.00"),new BigDecimal("1350.00"),
+        "Approved synthetic legacy installation statement; pre-cutoff transaction history is incomplete",
+        "SIM-LEGACY-BILLING-001","SIM-LEGACY-SETTLEMENT-001","Full operations opening");
     private final JdbcTemplate db; private final AccessControl access; private final AuditLog audit; private final Ledger ledger;
-    public BaselineService(JdbcTemplate db, AccessControl access, AuditLog audit, Ledger ledger) { this.db=db; this.access=access; this.audit=audit; this.ledger=ledger; }
+    private final AssetService assets; private final TermService terms;
+    public BaselineService(JdbcTemplate db, AccessControl access, AuditLog audit, Ledger ledger, AssetService assets, TermService terms) {
+        this.db=db; this.access=access; this.audit=audit; this.ledger=ledger; this.assets=assets; this.terms=terms;
+    }
 
     @Transactional
     public long initialize(long ws, long entity, String key, long expectedVersion) {
         var scope=access.requireContext(ws,entity,true,"FINANCE");
-        if (!"EMPTY".equals(key) && !"O2C_GOODS".equals(key)) throw new DomainException(400,"Invalid baseline","baselineKey");
+        if (!"EMPTY".equals(key) && !"O2C_GOODS".equals(key) && !"FULL_OPERATIONS".equals(key)) throw new DomainException(400,"Invalid baseline","baselineKey");
         var workspace=db.queryForList("select initialization_state,version,business_date from scenario_workspaces where id=? for update",ws);
         if (workspace.size()!=1) throw new DomainException(404,"Workspace not found");
         String currency=db.queryForObject("select base_currency from legal_entities where workspace_id=? and id=? and active=true for update",String.class,ws,entity);
-        if ("O2C_GOODS".equals(key) && !GOODS.currency().equals(currency)) throw new DomainException(400,"O2C goods requires a EUR entity","baselineKey");
-        String sourceHash=hash("O2C_GOODS".equals(key) ? GOODS.toString() : "EMPTY");
+        boolean full="FULL_OPERATIONS".equals(key);
+        if (!"EMPTY".equals(key) && !GOODS.currency().equals(currency)) throw new DomainException(400,"The selected fixture requires a EUR entity","baselineKey");
+        String sourceHash=full ? hash(GOODS.toString(),SERVICES.toString()) : hash("O2C_GOODS".equals(key) ? GOODS.toString() : "EMPTY");
         String payloadHash=hash(key,"1",Long.toString(ws),Long.toString(entity),workspace.get(0).get("business_date").toString(),currency,sourceHash);
         var prior=db.queryForList("select id,entity_id,baseline_key,baseline_version,source_hash,payload_hash from scenario_baseline_versions where workspace_id=?",ws);
         if (!prior.isEmpty()) {
@@ -67,7 +96,9 @@ public class BaselineService {
         }
         if (!"NEW".equals(workspace.get(0).get("initialization_state")) || ((Number)workspace.get(0).get("version")).longValue()!=expectedVersion) throw new DomainException(409,"Workspace changed");
         long actor=scope.actor().id();
-        if ("O2C_GOODS".equals(key)) seedGoods(ws,entity,actor);
+        if (full && ((java.sql.Date)workspace.get(0).get("business_date")).toLocalDate().isBefore(GOODS.cutoff()))
+            throw new DomainException(400,"FULL_OPERATIONS requires a business date on or after its opening cutoff "+GOODS.cutoff(),"baselineKey");
+        if (!"EMPTY".equals(key)) seedGoods(scope,full);
         Long receipt=db.queryForObject("insert into scenario_baseline_versions(workspace_id,entity_id,baseline_key,baseline_version,source_hash,payload_hash,receipt_key,status,created_by,approved_by) values (?,?,?,'1',?,?,?,'READY',?,?) returning id",Long.class,ws,entity,key,sourceHash,payloadHash,"workspace-"+ws,actor,actor);
         db.update("update scenario_workspaces set initialization_state='READY',baseline_key=?,baseline_version='1',version=version+1 where id=?",key,ws);
         audit.record(scope.actor(),ws,entity,"INITIALIZE","BASELINE",Long.toString(receipt),1,"SUCCESS",key);
@@ -84,12 +115,21 @@ public class BaselineService {
             return java.util.HexFormat.of().formatHex(digest.digest());
         } catch(java.security.NoSuchAlgorithmException ex) { throw new IllegalStateException(ex); }
     }
-    private void seedGoods(long w,long e,long a) {
+    private void seedGoods(AccessControl.Scope scope,boolean full) {
+        long w=scope.workspaceId(),e=scope.entityId(),a=scope.actor().id();
         for (String table : List.of("customers","contacts","suppliers","uoms","products","warehouses","payment_terms","price_books","chart_accounts","fiscal_periods","tax_codes","journal_entries")) {
             Integer count=db.queryForObject("select count(*) from "+table+" where workspace_id=?",Integer.class,w);
             if (count != null && count>0) throw new DomainException(409,"Workspace contains existing data");
         }
         for(String unit:GOODS.units()) db.update("insert into uoms(workspace_id,code,name,created_by) values (?,?,?,?)",w,unit,unit,a);
+        if (full) {
+            for (String table : List.of("service_coverage_types","service_product_versions","service_posting_config",
+                    "installed_instruments","service_contracts","renewal_intents","sales_posting_config",
+                    "procurement_posting_config","payment_posting_config")) {
+                Integer count=db.queryForObject("select count(*) from "+table+" where workspace_id=?",Integer.class,w);
+                if (count!=null && count>0) throw new DomainException(409,"Workspace contains existing configuration or service data");
+            }
+        }
         long warehouse=id("insert into warehouses(workspace_id,entity_id,code,name,created_by) values (?,?,?,?,?) returning id",w,e,GOODS.warehouseCode(),GOODS.warehouseName(),a);
         long terms=id("insert into payment_terms(workspace_id,entity_id,code,name,days,created_by) values (?,?,?,?,?,?) returning id",w,e,GOODS.termsCode(),GOODS.termsName(),GOODS.termsDays(),a);
         var accountIds=new java.util.ArrayList<Long>();
@@ -116,12 +156,70 @@ public class BaselineService {
         long supplier=id("insert into suppliers(workspace_id,code,name,email,created_by) values (?,?,?,?,?) returning id",w,GOODS.supplierCode(),GOODS.supplierName(),GOODS.supplierEmail(),a);
         db.update("insert into supplier_entity_accounts(workspace_id,entity_id,supplier_id,erp_code,terms_id) values (?,?,?,?,?)",w,e,supplier,GOODS.supplierCode(),terms);
         BigDecimal trValue=GOODS.trQuantity().multiply(GOODS.trCost()), csValue=GOODS.csQuantity().multiply(GOODS.csCost()), inventoryValue=trValue.add(csValue);
-        var opening=new Ledger.Opening("O2C_GOODS",1,GOODS.cutoff(),GOODS.currency(),GOODS.openingDescription(),List.of(new Ledger.Line(inventory,inventoryValue,BigDecimal.ZERO),new Ledger.Line(bank,GOODS.bank(),BigDecimal.ZERO),new Ledger.Line(equity,BigDecimal.ZERO,inventoryValue.add(GOODS.bank()))));
-        long source=ledger.postOpening(w,e,opening).sourceId();
+        Map<String,Long> serviceAccounts=full ? seedServiceConfiguration(w,e,a,productIds) : Map.of();
+        long source;
+        if (full) {
+            long customerAccount=db.queryForObject("select id from customer_entity_accounts where workspace_id=? and entity_id=? and customer_id=?",
+                    Long.class,w,e,customerIds.get(0));
+            source=seedServiceOpening(scope,productIds,customerAccount,inventory,bank,equity,inventoryValue,serviceAccounts);
+        } else {
+            var opening=new Ledger.Opening("O2C_GOODS",1,GOODS.cutoff(),GOODS.currency(),GOODS.openingDescription(),List.of(new Ledger.Line(inventory,inventoryValue,BigDecimal.ZERO),new Ledger.Line(bank,GOODS.bank(),BigDecimal.ZERO),new Ledger.Line(equity,BigDecimal.ZERO,inventoryValue.add(GOODS.bank()))));
+            source=ledger.postOpening(w,e,opening).sourceId();
+        }
         long serial=id("insert into instrument_serials(workspace_id,entity_id,product_id,warehouse_id,serial,status,opening_source_id) values (?,?,?,?,?,'IN_STOCK',?) returning id",w,e,tr,warehouse,GOODS.serial(),source);
         long lot=id("insert into inventory_lots(workspace_id,entity_id,product_id,warehouse_id,lot,opening_source_id) values (?,?,?,?,?,?) returning id",w,e,cs,warehouse,GOODS.lot(),source);
         stock(w,e,a,tr,warehouse,source,GOODS.trQuantity(),trValue,GOODS.products().get(GOODS.trProduct()).sku(),serial,null);
         stock(w,e,a,cs,warehouse,source,GOODS.csQuantity(),csValue,GOODS.products().get(GOODS.csProduct()).sku(),null,lot);
+        if (full) db.update("""
+                insert into procurement_posting_config(workspace_id,entity_id,inventory_account_id,ap_account_id,grni_account_id,
+                    adjustment_gain_account_id,adjustment_loss_account_id,service_expense_account_id,updated_by)
+                values (?,?,?,?,?,?,?,?,?)
+                """,w,e,inventory,serviceAccounts.get("AP"),serviceAccounts.get("GRNI"),serviceAccounts.get("ADJUSTMENT_GAIN"),
+                serviceAccounts.get("ADJUSTMENT_LOSS"),serviceAccounts.get("SERVICE_EXPENSE"),a);
+    }
+    private Map<String,Long> seedServiceConfiguration(long w,long e,long actor,List<Long> productIds) {
+        var accounts=new LinkedHashMap<String,Long>();
+        for (Account account:SERVICES.accounts())
+            accounts.put(account.code(),account(w,e,actor,account.code(),account.name(),account.type()));
+        db.update("""
+                insert into sales_posting_config(workspace_id,entity_id,ar_account_id,unbilled_account_id,revenue_account_id,cogs_account_id,updated_by)
+                values (?,?,?,?,?,?,?)
+                """,w,e,accounts.get("AR"),accounts.get("UNBILLED"),accounts.get("GOODS_REVENUE"),accounts.get("COGS"),actor);
+        db.update("""
+                insert into service_posting_config(workspace_id,entity_id,deferred_account_id,implementation_revenue_account_id,service_revenue_account_id,updated_by)
+                values (?,?,?,?,?,?)
+                """,w,e,accounts.get("DEFERRED"),accounts.get("IMPLEMENTATION_REVENUE"),accounts.get("SERVICE_REVENUE"),actor);
+        long coverage=id("insert into service_coverage_types(workspace_id,entity_id,code,name,created_by) values (?,?,?,?,?) returning id",
+                w,e,SERVICES.coverageCode(),SERVICES.coverageName(),actor);
+        for (int index:SERVICES.serviceProducts()) {
+            Product product=GOODS.products().get(index);
+            boolean plan="SERVICE_PLAN".equals(product.category());
+            db.update("""
+                    insert into service_product_versions(workspace_id,entity_id,product_id,revision,category_snapshot,coverage_type_id,duration_months,enabled,created_by)
+                    values (?,?,?,1,?,?,?,true,?)
+                    """,w,e,productIds.get(index),product.category(),plan ? coverage : null,plan ? SERVICES.durationMonths() : null,actor);
+            db.update("insert into product_compatibilities(workspace_id,entity_id,device_id,component_id,created_by) values (?,?,?,?,?)",
+                    w,e,productIds.get(GOODS.trProduct()),productIds.get(index),actor);
+        }
+        return accounts;
+    }
+    private long seedServiceOpening(AccessControl.Scope scope,List<Long> productIds,long customerAccount,long inventory,long bank,
+                                   long equity,BigDecimal inventoryValue,Map<String,Long> accounts) {
+        long w=scope.workspaceId(),e=scope.entityId();
+        long operator=db.queryForObject("select id from contacts where workspace_id=? and code=?",Long.class,w,GOODS.contacts().get(0).code());
+        long asset=assets.createOpeningAsset(scope,customerAccount,productIds.get(GOODS.trProduct()),SERVICES.legacySerial(),
+                SERVICES.assetKey(),SERVICES.installationDate(),SERVICES.evidence(),operator);
+        long profile=db.queryForObject("select id from service_product_versions where workspace_id=? and entity_id=? and product_id=? and revision=1",
+                Long.class,w,e,productIds.get(SERVICES.serviceProducts().get(0)));
+        long term=terms.createOpeningTerm(scope,new TermService.OpeningTerm(SERVICES.contractKey(),SERVICES.termKey(),asset,profile,
+                SERVICES.coverageStart(),SERVICES.coverageEnd(),SERVICES.netFee(),GOODS.currency(),"FULL_OPERATIONS:1"));
+        BigDecimal deferred=SERVICES.billed().subtract(SERVICES.earned());
+        var opening=new Ledger.Opening("FULL_OPERATIONS",1,GOODS.cutoff(),GOODS.currency(),SERVICES.openingDescription(),List.of(
+                new Ledger.Line(inventory,inventoryValue,BigDecimal.ZERO),new Ledger.Line(bank,GOODS.bank(),BigDecimal.ZERO),
+                new Ledger.Line(accounts.get("DEFERRED"),BigDecimal.ZERO,deferred),
+                new Ledger.Line(equity,BigDecimal.ZERO,inventoryValue.add(GOODS.bank()).subtract(deferred))));
+        return ledger.postServiceOpening(w,e,opening,List.of(new ServiceRevenueService.OpeningStatement(term,GOODS.cutoff(),
+                SERVICES.billed(),SERVICES.earned(),SERVICES.billingReference(),SERVICES.settlementReference()))).sourceId();
     }
     private long account(long w,long e,long a,String code,String name,String type) { return id("insert into chart_accounts(workspace_id,entity_id,code,name,account_type,created_by) values (?,?,?,?,?,?) returning id",w,e,code,name,type,a); }
     private long customer(long w,long e,long a,long terms,String code,String name,String segment,String territory,String domain,Long parent) {

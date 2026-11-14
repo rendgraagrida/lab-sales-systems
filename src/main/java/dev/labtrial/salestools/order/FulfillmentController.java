@@ -94,7 +94,7 @@ public class FulfillmentController implements FormController {
     }
     private String shipmentForm(long w,long e,long orderId,Long shipmentId,int count,Model model) {
         if(count<1 || count>100) throw new DomainException(400,"Choose between one and 100 rows");
-        access.requireContext(w,e,false,"OPERATIONS"); context(model,w,e); model.addAttribute("order",service.orderDetail(w,e,orderId)); model.addAttribute("lines",service.orderLines(w,e,orderId)); model.addAttribute("warehouses",service.warehouses(w,e));
+        access.requireContext(w,e,false,"OPERATIONS"); context(model,w,e); model.addAttribute("order",service.orderDetail(w,e,orderId)); model.addAttribute("lines",service.orderLines(w,e,orderId).stream().filter(line->Set.of("LAB_UNIT","LAB_SUPPLY","REPLACEMENT_PART").contains(line.get("product_category"))).toList()); model.addAttribute("warehouses",service.warehouses(w,e));
         var shipment=shipmentId==null?null:service.shipment(w,e,shipmentId);
         if(shipment!=null && !"DRAFT".equals(shipment.get("status"))) throw new DomainException(409,"Only draft shipments can be edited");
         var lines=shipmentId==null?List.<Map<String,Object>>of():service.shipmentLines(w,e,shipmentId);
