@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Prepare pinned native tools only on the disposable GitHub-hosted quality runner."""
+import argparse
 import hashlib
+import json
 import os
 from pathlib import Path
 import platform
@@ -23,6 +25,8 @@ SOURCE = Path('/etc/apt/sources.list.d/lab-sales-recovery-pgdg.list')
 KEYRING = Path('/usr/share/keyrings/lab-sales-recovery-pgdg.gpg')
 POLICY = Path('/usr/sbin/policy-rc.d')
 CLUSTER_CONFIG = Path('/etc/postgresql-common/createcluster.conf')
+OPT = Path('/opt')
+OPT_STATE = Path('/var/lib/lab-sales-recovery-opt.json')
 
 
 def run(*args, env=None):
@@ -30,7 +34,7 @@ def run(*args, env=None):
                           stderr=subprocess.STDOUT, env=env).stdout
 
 
-def guard():
+def guard_host():
     if (sys.platform != 'linux' or os.geteuid() != 0 or
             os.environ.get('GITHUB_ACTIONS') != 'true' or
             os.environ.get('RUNNER_ENVIRONMENT') != 'github-hosted' or
@@ -43,19 +47,85 @@ def guard():
     if run('dpkg', '--print-architecture').strip() != 'amd64' or not Path('/run/systemd/system').is_dir():
         raise RuntimeError('amd64 dpkg and active systemd are required')
     run('systemctl', 'show-environment')
-    for path in (RUNTIME, SOURCE, KEYRING):
-        if os.path.lexists(path):
-            raise RuntimeError(f'Refusing pre-existing path: {path}')
-    for path in (Path('/opt'), SOURCE.parent, KEYRING.parent, POLICY.parent, CLUSTER_CONFIG.parent):
+    for path in (SOURCE.parent, KEYRING.parent, POLICY.parent,
+                 CLUSTER_CONFIG.parent, OPT_STATE.parent):
         info = path.lstat()
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
             raise RuntimeError(f'Untrusted system directory: {path}')
+    if not stat.S_ISDIR(OPT.lstat().st_mode):
+        raise RuntimeError('/opt must be a real directory, not a symlink')
+
+
+def guard_prepare():
+    for path in (RUNTIME, SOURCE, KEYRING, OPT_STATE):
+        if os.path.lexists(path):
+            raise RuntimeError(f'Refusing pre-existing path: {path}')
     if not CLUSTER_CONFIG.is_file() or CLUSTER_CONFIG.is_symlink():
         raise RuntimeError('Existing PostgreSQL cluster policy is required')
     if os.path.lexists(POLICY) and (POLICY.is_symlink() or not POLICY.is_file()):
         raise RuntimeError('Cannot safely preserve existing service policy')
     if Path('/etc/postgresql/17').exists() or Path('/usr/lib/postgresql/17').exists():
         raise RuntimeError('Refusing an existing PostgreSQL 17 installation or cluster')
+
+
+def prepare_owned_opt():
+    """Owner-authorized temporary trust on this disposable runner only."""
+    fd = os.open(OPT, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(fd)
+        saved = {'schema': 1, 'device': info.st_dev, 'inode': info.st_ino,
+                 'uid': info.st_uid, 'gid': info.st_gid, 'mode': stat.S_IMODE(info.st_mode)}
+        state_fd = os.open(OPT_STATE, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(state_fd, 'w', encoding='ascii') as state:
+            json.dump(saved, state, sort_keys=True)
+            state.write('\n')
+            state.flush()
+            os.fsync(state.fileno())
+        os.fchown(fd, 0, 0)
+        os.fchmod(fd, 0o755)
+        trusted = os.fstat(fd)
+        if trusted.st_uid != 0 or trusted.st_gid != 0 or stat.S_IMODE(trusted.st_mode) != 0o755:
+            raise RuntimeError('Cannot establish temporary /opt trust')
+        print('Temporary runner /opt trust established; original uid/gid/mode:',
+              saved['uid'], saved['gid'], oct(saved['mode']), flush=True)
+    finally:
+        os.close(fd)
+
+
+def restore_owned_opt():
+    if not os.path.lexists(OPT_STATE):
+        print('No prepared runner /opt ownership state to restore', flush=True)
+        return
+    state_fd = os.open(OPT_STATE, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(state_fd, 'r', encoding='ascii') as state:
+        info = os.fstat(state.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o600:
+            raise RuntimeError('Untrusted runner /opt restoration receipt')
+        raw = state.read(4097)
+        if len(raw) > 4096:
+            raise RuntimeError('Oversized runner /opt restoration receipt')
+        saved = json.loads(raw)
+    if (not isinstance(saved, dict) or set(saved) !=
+            {'schema', 'device', 'inode', 'uid', 'gid', 'mode'} or saved['schema'] != 1
+            or any(type(value) is not int or value < 0 for value in saved.values())
+            or saved['mode'] > 0o7777):
+        raise RuntimeError('Invalid runner /opt restoration receipt')
+    fd = os.open(OPT, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        current = os.fstat(fd)
+        if (current.st_dev, current.st_ino) != (saved['device'], saved['inode']):
+            raise RuntimeError('Runner /opt identity changed; refusing restoration')
+        os.fchown(fd, saved['uid'], saved['gid'])
+        os.fchmod(fd, saved['mode'])
+        restored = os.fstat(fd)
+        if (restored.st_uid, restored.st_gid, stat.S_IMODE(restored.st_mode)) != (
+                saved['uid'], saved['gid'], saved['mode']):
+            raise RuntimeError('Runner /opt ownership restoration mismatch')
+    finally:
+        os.close(fd)
+    OPT_STATE.unlink()
+    print('Original runner /opt identity/owner/group/mode restored:', saved['uid'],
+          saved['gid'], oct(saved['mode']), flush=True)
 
 
 def replace_temporarily(path, data, mode):
@@ -176,9 +246,21 @@ def copy_runtimes():
 
 
 def main():
-    guard()
-    install_postgres()
-    copy_runtimes()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('action', choices=('prepare', 'restore'))
+    action = parser.parse_args().action
+    guard_host()
+    if action == 'restore':
+        restore_owned_opt()
+        return
+    guard_prepare()
+    try:
+        prepare_owned_opt()
+        install_postgres()
+        copy_runtimes()
+    except BaseException:
+        restore_owned_opt()
+        raise
 
 
 if __name__ == '__main__':

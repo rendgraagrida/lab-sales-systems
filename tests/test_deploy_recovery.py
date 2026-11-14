@@ -124,14 +124,24 @@ def app_data_digest(cfg):
     return len(names), hashlib.sha256(value.encode()).hexdigest()
 
 
-def stop_request(process):
+def stop_request(process, cfg):
     if process.poll() is None:
-        process.terminate()
+        # Stop the owned controller/children before DB/user teardown, not merely
+        # the waiting supervisor. The slice also owns this fixture's runtime.
+        result = subprocess.run(
+            ['/usr/bin/systemctl', 'stop', cfg['sandbox']['slice']],
+            capture_output=True, timeout=40)
+        if result.returncode:
+            raise AssertionError('Owned request slice did not stop')
         try:
             process.wait(timeout=20)
         except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=10)
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=10)
 
 
 @unittest.skipUnless(OPT_IN, 'Native recovery test requires opt-in via LAB_NATIVE_RECOVERY=1')
@@ -700,7 +710,7 @@ class DeployRecoveryRegressionTests(unittest.TestCase):
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             env={'PATH': '/usr/bin:/bin', 'LANG': 'C', 'SUDO_USER': t_a['dep_user']}
         )
-        self.addCleanup(stop_request, bad_proc)
+        self.addCleanup(stop_request, bad_proc, t_a['cfg'])
         bad_proc.stdin.write(bad_payload)
         bad_proc.stdin.close()
         bad_proc.stdin = None
