@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3 -I
 """Linux host deployment adapter for Lab Sales Systems.
 
 Handles root-owned target enrollment, migrations via Flyway, administrative
@@ -18,16 +18,21 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
+# Isolated Python excludes the script directory; import only the sibling bundle.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 
 # Sibling modules available alongside deploy_linux.py on target
 import ci
 import database
+import deploy_sandbox
 import release
 
 NAME_PATTERN = re.compile(r'^[a-z][a-z0-9-]{0,62}$')
@@ -97,6 +102,9 @@ def validate_migration_user(cfg):
     if migration.pw_shell not in {'/usr/sbin/nologin', '/bin/false', '/sbin/nologin', '/usr/bin/false'}:
         fail('Migration user must have a non-login shell')
     home = validate_clean_path(migration.pw_dir, 'Migration home')
+    storage = validate_clean_path(cfg['sandbox']['storage_root'], 'Storage root')
+    if home == storage or not home.is_relative_to(storage):
+        fail('Migration home must be inside bounded storage')
     validate_ancestors_root_owned(home.parent)
     try:
         st = home.lstat()
@@ -196,7 +204,7 @@ def validate_config(config_path, expected_env):
         'schema', 'project', 'environment', 'target_id', 'root', 'service_user', 'migration_user',
         'port', 'java_home', 'maven_home', 'pg_bin', 'pg_port', 'database',
         'owner_role', 'migrator_role', 'runtime_role', 'system_identifier',
-        'machine_id', 'runtime_env_file', 'migration_env_file'
+        'machine_id', 'runtime_env_file', 'migration_env_file', 'sandbox'
     }
     actual_keys = set(cfg.keys())
     if actual_keys != required_keys:
@@ -213,8 +221,14 @@ def validate_config(config_path, expected_env):
 
     if not NAME_PATTERN.match(cfg['target_id']):
         fail(f"Invalid target_id: {cfg['target_id']}")
+    cfg['sandbox'] = deploy_sandbox.validate(cfg['sandbox'], cfg['target_id'])
+    storage = validate_clean_path(cfg['sandbox']['storage_root'], 'Storage root')
+    if Path(__file__).resolve().is_relative_to(storage):
+        fail('Controller must be outside bounded storage')
 
     root_p = validate_clean_path(cfg['root'], 'Target root')
+    if root_p == storage or not root_p.is_relative_to(storage):
+        fail('Target root must be inside bounded storage')
     if root_p.is_symlink():
         fail(f'Target root cannot be a symlink: {root_p}')
     if not root_p.parent.is_dir() or Path(__file__).resolve().is_relative_to(root_p):
@@ -675,20 +689,13 @@ def run_flyway(cfg, pom_path, goals):
     if not pom_path.is_file():
         fail(f"Migration pom.xml not found at {pom_path}")
 
-    # Read migration env file
-    mig_env_data = parse_env_file(cfg['migration_env_file'], {
+    validate_ancestors_root_owned(cfg['migration_env_file'])
+    parse_env_file(cfg['migration_env_file'], {
         'LAB_MIGRATION_DB_URL', 'LAB_MIGRATION_DB_USER', 'LAB_MIGRATION_DB_PASSWORD', 'LAB_MIGRATION_OWNER'
     })
-
     env = {
         'JAVA_HOME': cfg['java_home'],
         'PATH': f"{Path(cfg['java_home']) / 'bin'}:/usr/bin:/bin",
-        'HOME': migration.pw_dir,
-        'LANG': 'C',
-        'LAB_MIGRATION_DB_URL': mig_env_data['LAB_MIGRATION_DB_URL'],
-        'LAB_MIGRATION_DB_USER': mig_env_data['LAB_MIGRATION_DB_USER'],
-        'LAB_MIGRATION_DB_PASSWORD': mig_env_data['LAB_MIGRATION_DB_PASSWORD'],
-        'LAB_MIGRATION_OWNER': mig_env_data['LAB_MIGRATION_OWNER']
     }
 
     java_bin = Path(cfg['java_home']) / 'bin' / 'java'
@@ -699,9 +706,10 @@ def run_flyway(cfg, pom_path, goals):
         if not binary.is_file() or not os.access(binary, os.X_OK):
             fail(f'Tool binary not found or not executable: {binary}')
     cmd = [str(mvn_bin), '--batch-mode', '--no-transfer-progress', '-f', str(pom_path)] + goals
-    res = subprocess.run(cmd, env=env, cwd=migration.pw_dir, user=migration.pw_uid,
-                         group=migration.pw_gid, extra_groups=[],
-                         capture_output=True, text=True, timeout=300)
+    res = deploy_sandbox.run_child(
+        cfg, cmd, uid=migration.pw_uid, gid=migration.pw_gid, home=migration.pw_dir,
+        purpose='migration', environment=env, environment_file=cfg['migration_env_file'],
+        timeout=300)
     if res.returncode != 0:
         fail(f"Flyway command failed (code {res.returncode})")
 
@@ -796,8 +804,6 @@ def action_bootstrap(cfg, release_dir, revision, run_id, manifest_sha, bootstrap
 
         rt_env_data = parse_env_file(cfg['runtime_env_file'], {'LAB_DB_URL', 'LAB_DB_USER', 'LAB_DB_PASSWORD'})
         boot_env = {
-            'JAVA_HOME': cfg['java_home'],
-            'PATH': f"{Path(cfg['java_home']) / 'bin'}:/usr/bin:/bin",
             'LAB_DB_URL': rt_env_data['LAB_DB_URL'],
             'LAB_DB_USER': rt_env_data['LAB_DB_USER'],
             'LAB_DB_PASSWORD': rt_env_data['LAB_DB_PASSWORD'],
@@ -809,18 +815,28 @@ def action_bootstrap(cfg, release_dir, revision, run_id, manifest_sha, bootstrap
             'LAB_BOOTSTRAP_BUSINESS_DATE': b_data['business_date']
         }
 
-        # Run as service user
+        migration = validate_migration_user(cfg)
         java_bin = str(Path(cfg['java_home']) / 'bin' / 'java')
-        pw = pwd.getpwnam(cfg['service_user'])
-
-        # Prepare safe subprocess execution
-        def demote():
-            os.setgroups([])
-            os.setgid(pw.pw_gid)
-            os.setuid(pw.pw_uid)
-
         cmd = [java_bin, '-Xmx384m', '-jar', str(jar_path), '--bootstrap-admin']
-        res = subprocess.run(cmd, env=boot_env, preexec_fn=demote, capture_output=True, text=True, timeout=120)
+        # EnvironmentFile is parsed by systemd, not a shell; double-quoted values
+        # preserve whitespace, quotes, backslashes and embedded newlines.
+        if any('\0' in value or '\r' in value for value in boot_env.values()):
+            fail('Bootstrap environment contains unsupported characters')
+        content = ''.join(
+            key + '="' + value.replace('\\', '\\\\').replace('"', '\\"') + '"\n'
+            for key, value in boot_env.items())
+        fd, env_path = tempfile.mkstemp(prefix='.bootstrap-', suffix='.env', dir=paths['state'])
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as env_file:
+                env_file.write(content)
+            res = deploy_sandbox.run_child(
+                cfg, cmd, uid=migration.pw_uid, gid=migration.pw_gid, home=migration.pw_dir,
+                purpose='bootstrap', environment={
+                    'JAVA_HOME': cfg['java_home'],
+                    'PATH': f"{Path(cfg['java_home']) / 'bin'}:/usr/bin:/bin",
+                }, environment_file=env_path, timeout=120)
+        finally:
+            os.unlink(env_path)
         if res.returncode != 0:
             fail(f"Bootstrap invocation failed (code {res.returncode})")
         setup_receipt = initial_admin_receipt(cfg)
@@ -866,6 +882,7 @@ def render_systemd_unit(cfg, release_jar_path, revision):
     return f"""[Unit]
 Description=Lab Sales Systems ({cfg['target_id']})
 After=network.target
+{chr(10).join(deploy_sandbox.unit_dependencies(cfg['sandbox']))}
 # TARGET_ID: {cfg['target_id']}
 
 [Service]
@@ -873,6 +890,7 @@ Type=simple
 User={cfg['service_user']}
 WorkingDirectory={working_dir}
 EnvironmentFile={env_file}
+{chr(10).join(deploy_sandbox.unit_directives(cfg['sandbox'], cfg['target_id'], 'runtime'))}
 Environment="LAB_REVISION={revision}"
 Environment="LAB_BIND_ADDRESS=127.0.0.1"
 Environment="LAB_PORT={cfg['port']}"
@@ -883,12 +901,6 @@ ExecStart="{java_bin}" -Xmx384m -jar "{str(release_jar_path)}"
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=20s
-KillMode=control-group
-
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
@@ -1274,6 +1286,13 @@ def main(argv=None):
                 fail("Action 'bootstrap' requires --bootstrap-file")
         elif args.bootstrap_file:
             fail('Bootstrap file is not valid for this action')
+        if not deploy_sandbox.in_controller(cfg['sandbox'], cfg['target_id']):
+            installed = '/opt/lab-sales-systems/controller/deploy_linux.py'
+            if Path(__file__).resolve() != Path(installed):
+                fail('Administrative adapter must be the fixed installed controller')
+            return deploy_sandbox.run_controller(
+                cfg, ['/usr/bin/python3', '-I', installed, *(sys.argv[1:] if argv is None else argv)])
+
 
         if args.action == 'enroll':
             return action_enroll(cfg)
@@ -1294,7 +1313,7 @@ def main(argv=None):
         else:
             fail(f"Unhandled action: {args.action}")
 
-    except DeployError as e:
+    except (DeployError, deploy_sandbox.SandboxError) as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
     except Exception:
