@@ -221,7 +221,9 @@ class DeployRecoveryRegressionTests(unittest.TestCase):
         controller_parent_existed = controller_root.parent.exists()
         if controller_parent_existed:
             gateway.trusted_directory(str(controller_root.parent))
-        controller_root.mkdir(parents=True, mode=0o755)
+        else:
+            controller_root.parent.mkdir(mode=0o755)
+        controller_root.mkdir(mode=0o755)
 
         def cleanup_controller():
             shutil.rmtree(controller_root)
