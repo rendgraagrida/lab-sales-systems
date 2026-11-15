@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Prepare pinned native tools only on the disposable GitHub-hosted quality runner."""
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -135,13 +136,18 @@ def restore_owned_opt():
           saved['gid'], oct(saved['mode']), flush=True)
 
 
+@contextmanager
 def replace_temporarily(path, data, mode):
+    """Restore the original even when replacement itself fails partway through."""
     existed = os.path.lexists(path)
     original = path.read_bytes() if existed else None
     info = path.stat() if existed else None
-    path.write_bytes(data)
-    path.chmod(mode)
-    return original, info
+    try:
+        path.write_bytes(data)
+        path.chmod(mode)
+        yield
+    finally:
+        restore(path, (original, info))
 
 
 def restore(path, saved):
@@ -184,18 +190,12 @@ def install_postgres():
             original_config = CLUSTER_CONFIG.read_text()
             config = re.sub(r'^[ \t]*create_main_cluster[ \t]*=.*$', '', original_config, flags=re.MULTILINE)
             config += '\ncreate_main_cluster = false\n'
-            cluster_saved = replace_temporarily(CLUSTER_CONFIG, config.encode(), 0o644)
-            try:
-                policy_saved = replace_temporarily(POLICY, b'#!/bin/sh\nexit 101\n', 0o755)
-                try:
+            with replace_temporarily(CLUSTER_CONFIG, config.encode(), 0o644):
+                with replace_temporarily(POLICY, b'#!/bin/sh\nexit 101\n', 0o755):
                     env = os.environ.copy()
                     env['DEBIAN_FRONTEND'] = 'noninteractive'
                     print(run('apt-get', 'install', '-y', '--no-install-recommends',
                               'postgresql-17=' + VERSION, 'postgresql-client-17=' + VERSION, env=env))
-                finally:
-                    restore(POLICY, policy_saved)
-            finally:
-                restore(CLUSTER_CONFIG, cluster_saved)
         finally:
             SOURCE.unlink(missing_ok=True)
             KEYRING.unlink(missing_ok=True)
