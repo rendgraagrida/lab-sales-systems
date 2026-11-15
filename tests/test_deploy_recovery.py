@@ -318,6 +318,13 @@ class DeployRecoveryRegressionTests(unittest.TestCase):
             shutil.rmtree(controller_root)
 
         self.addCleanup(cleanup_controller)
+        # Explicit acquisition mode also bounds inherited default ACLs; umask alone
+        # did not stop the hosted interpreter from creating this directory0777.
+        cache = controller_root / '__pycache__'
+        cache.mkdir(mode=0o755)
+        gateway.trusted_directory(str(cache))
+        print(f"[RECOVERY_TEST] Fresh owned cache mode={stat.S_IMODE(cache.stat().st_mode):04o}; "
+              f"parent_default_acl={'system.posix_acl_default' in os.listxattr(controller_root)}")
         for c_name in controller_files:
             dst_file = controller_root / c_name
             dst_file.write_bytes((root_dir / 'scripts' / c_name).read_bytes())
