@@ -23,7 +23,7 @@ permissions:
 jobs:
   quality:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:17.11-bookworm@sha256:665dc7b37ac52a17e298511414c21d23ffa4e6a6ef6225b3e5d59c7afb35e994
@@ -97,6 +97,26 @@ jobs:
         env:
           MANIFEST_SHA: ${{ steps.manifest.outputs.manifest-sha }}
         run: python scripts/release.py verify --release-dir ".releases/$REVISION" --revision "$REVISION" --run-id "$RUN_ID" --manifest-sha256 "$MANIFEST_SHA"
+      - name: Prepare pinned native recovery runtime
+        id: native_setup
+        run: sudo -- env GITHUB_ACTIONS="$GITHUB_ACTIONS" RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" JAVA_HOME="$JAVA_HOME" /usr/bin/python3 scripts/ci_native_postgres.py prepare
+      - name: Exercise actual native failed-readiness recovery
+        env:
+          PYTHON_BINARY: ${{ steps.python.outputs.python-path }}
+          LAB_NATIVE_RECOVERY: '1'
+        run: |
+          set -euo pipefail
+          RECOVERY_LOG=$(mktemp)
+          trap 'rm -f "$RECOVERY_LOG"' EXIT
+          sudo -- env GITHUB_ACTIONS="$GITHUB_ACTIONS" RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" \
+            JAVA_HOME=/opt/lab-sales-recovery-runtime/jdk \
+            LAB_NATIVE_RECOVERY="$LAB_NATIVE_RECOVERY" REVISION="$REVISION" RUN_ID="$RUN_ID" \
+            "$PYTHON_BINARY" -m unittest discover -s tests -p test_deploy_recovery.py -v 2>&1 | tee "$RECOVERY_LOG"
+          grep -Eq '^Ran 1 test in [0-9.]+s$' "$RECOVERY_LOG"
+          grep -qx 'OK' "$RECOVERY_LOG"
+      - name: Restore owned native runner parent
+        if: always() && steps.native_setup.outcome != 'skipped'
+        run: sudo -- env GITHUB_ACTIONS="$GITHUB_ACTIONS" RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" /usr/bin/python3 scripts/ci_native_postgres.py restore
       - name: Upload verified release
         id: upload-release
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
